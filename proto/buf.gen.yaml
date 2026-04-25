@@ -1,0 +1,38 @@
+# ============================================================
+# ShadowLink — Buf Code Generation Configuration
+# ============================================================
+# Usage: cd proto && buf generate
+#
+# Generates:
+#   Python:  ../shadowlink-ai/app/api/grpc/generated/
+#   Java:    ../shadowlink-server/shadowlink-ai-bridge/src/main/java/
+# ============================================================
+
+version: v2
+
+managed:
+  enabled: true
+  override:
+    - file_option: java_package_prefix
+      value: com.shadowlink.bridge.proto
+    - file_option: java_multiple_files
+      value: true
+
+plugins:
+  # ── Python gRPC stubs ──
+  - protoc_builtin: python
+    out: ../shadowlink-ai/app/api/grpc/generated
+
+  - protoc_builtin: grpc_python
+    out: ../shadowlink-ai/app/api/grpc/generated
+
+  - protoc_builtin: pyi
+    out: ../shadowlink-ai/app/api/grpc/generated
+
+  # ── Java gRPC stubs (if not using Maven protobuf plugin) ──
+  # Uncomment if generating outside Maven build:
+  # - protoc_builtin: java
+  #   out: ../shadowlink-server/shadowlink-ai-bridge/src/main/java
+  #
+  # - remote: buf.build/grpc/java
+  #   out: ../shadowlink-server/shadowlink-ai-bridge/src/main/java

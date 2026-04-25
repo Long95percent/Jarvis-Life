@@ -1,0 +1,158 @@
+[
+  {
+    "episode_id": "ep-dfc36eac",
+    "task": "Say hello in one sentence.",
+    "strategy": "direct",
+    "steps": [],
+    "outcome": "Hello, it's great to meet you!",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 7762.3954999871785
+    },
+    "timestamp": 1776346865.6961944
+  },
+  {
+    "episode_id": "ep-71fcff18",
+    "task": "What is the current time?",
+    "strategy": "react",
+    "steps": [],
+    "outcome": "The current time is **April 16, 2026, 13:41:26 UTC**.",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 14391.197300006752
+    },
+    "timestamp": 1776346888.2739382
+  },
+  {
+    "episode_id": "ep-7ff00c18",
+    "task": "Calculate 17 * 23, then tell me if the result is a prime number.",
+    "strategy": "plan_execute",
+    "steps": [],
+    "outcome": "**Summary of Results:**\n\n- **Step 0:** \\( 17 \\times 23 = 391 \\)\n- **Step 1:** \\( 391 \\) is **not** a prime number.  \n  (It is divisible by \\( 17 \\) and \\( 23 \\), since \\( 391 = 17 \\times 23 \\).)\n- **S",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 25865.1424000127
+    },
+    "timestamp": 1776347020.357599
+  },
+  {
+    "episode_id": "ep-fcdc22ab",
+    "task": "Write a Python fibonacci function and explain how it works.",
+    "strategy": "supervisor",
+    "steps": [],
+    "outcome": "**coder**:\n# Fibonacci Function in Python: Implementation and Explanation\n\n## Complete Python Implementation\n\n```python\ndef fibonacci(n):\n    \"\"\"\n    Returns the nth Fibonacci number using an iterativ",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 137602.72789999726
+    },
+    "timestamp": 1776347218.3297124
+  },
+  {
+    "episode_id": "ep-0549f768",
+    "task": "你好",
+    "strategy": "direct",
+    "steps": [],
+    "outcome": "你好！很高兴见到你！😊  \n有什么我可以帮助你的吗？",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 3430.803299997933
+    },
+    "timestamp": 1776350480.5867224
+  },
+  {
+    "episode_id": "ep-e86038b3",
+    "task": "你好，你是谁",
+    "strategy": "direct",
+    "steps": [],
+    "outcome": "你好！我是ShadowLink AI，一个乐于助人且多功能的智能助手。我可以回答你的问题、提供建议、协助处理各种任务，或陪你聊天。有什么我可以帮你的吗？ 😊",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 3965.0766999984626
+    },
+    "timestamp": 1776350866.7606354
+  },
+  {
+    "episode_id": "ep-d19e879e",
+    "task": "1+1=?",
+    "strategy": "direct",
+    "steps": [],
+    "outcome": "",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 22518.438300001435
+    },
+    "timestamp": 1776351066.8852818
+  },
+  {
+    "episode_id": "ep-7d641520",
+    "task": "你好",
+    "strategy": "direct",
+    "steps": [],
+    "outcome": "你好！我是ShadowLink AI，一个乐于助人的助手。有什么可以帮你的吗？",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 3049.330599998939
+    },
+    "timestamp": 1776351145.484698
+  },
+  {
+    "episode_id": "ep-8d246442",
+    "task": "你好",
+    "strategy": "direct",
+    "steps": [],
+    "outcome": "",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 8798.288699996192
+    },
+    "timestamp": 1776358439.550686
+  },
+  {
+    "episode_id": "ep-21969950",
+    "task": "你好",
+    "strategy": "direct",
+    "steps": [],
+    "outcome": "",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 8251.02510000579
+    },
+    "timestamp": 1776358474.80923
+  },
+  {
+    "episode_id": "ep-06d7be7f",
+    "task": "Error: LLM call failed:",
+    "strategy": "direct",
+    "steps": [],
+    "outcome": "看起来刚才的对话出现了连接问题。让我重新开始为您提供帮助。\n\n您好！我是ShadowLink AI，很高兴为您服务。请问有什么可以帮助您的吗？",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 3252.2048000100767
+    },
+    "timestamp": 1776358492.3141901
+  },
+  {
+    "episode_id": "ep-22c62e6e",
+    "task": "你好，好久不见",
+    "strategy": "direct",
+    "steps": [],
+    "outcome": "(◍•ᴗ•◍)✧ 好久不见呀！最近过得怎么样呀？有没有什么有趣的事情要分享给我听呢～",
+    "success": true,
+    "metadata": {
+      "mode_id": "general",
+      "latency_ms": 3720.6704999989597
+    },
+    "timestamp": 1776359138.9408617
+  }
+]

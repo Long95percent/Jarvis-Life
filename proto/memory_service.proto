@@ -1,0 +1,296 @@
+// ============================================================
+// ShadowLink — Memory Service Proto
+// Python AI ← gRPC → Java Backend
+//
+// Implements Letta-inspired 3-tier memory architecture:
+// - Short-term: sliding window within a session
+// - Long-term: persistent cross-session knowledge
+// - Episodic: agent execution history for replay/learning
+// ============================================================
+
+syntax = "proto3";
+
+package shadowlink.memory;
+
+option java_package = "com.shadowlink.bridge.proto.memory";
+option java_multiple_files = true;
+option java_outer_classname = "MemoryServiceProto";
+
+import "common.proto";
+import "google/protobuf/timestamp.proto";
+
+// ════════════════════════════════════════════
+// Service Definition
+// ════════════════════════════════════════════
+
+service MemoryService {
+
+  // ── Short-term Memory (session-scoped sliding window) ──
+
+  // Add a message to the session's short-term memory
+  rpc AddShortTermEntry (ShortTermEntry) returns (AddEntryResponse);
+
+  // Get the current sliding window for a session
+  rpc GetShortTermWindow (ShortTermWindowRequest) returns (ShortTermWindowResponse);
+
+  // Clear short-term memory for a session
+  rpc ClearShortTerm (ClearMemoryRequest) returns (ClearMemoryResponse);
+
+  // ── Long-term Memory (persistent, cross-session) ──
+
+  // Store a fact/knowledge entry
+  rpc StoreLongTerm (LongTermEntry) returns (AddEntryResponse);
+
+  // Search long-term memory by semantic similarity
+  rpc SearchLongTerm (LongTermSearchRequest) returns (LongTermSearchResponse);
+
+  // List all long-term entries (paginated)
+  rpc ListLongTerm (ListLongTermRequest) returns (ListLongTermResponse);
+
+  // Delete a long-term entry
+  rpc DeleteLongTerm (DeleteLongTermRequest) returns (DeleteLongTermResponse);
+
+  // ── Episodic Memory (execution history) ──
+
+  // Record an agent execution episode
+  rpc RecordEpisode (EpisodeEntry) returns (AddEntryResponse);
+
+  // Search past episodes by task similarity
+  rpc SearchEpisodes (EpisodeSearchRequest) returns (EpisodeSearchResponse);
+
+  // Get a specific episode by ID
+  rpc GetEpisode (GetEpisodeRequest) returns (EpisodeEntry);
+
+  // ── Cross-tier Operations ──
+
+  // Get a unified memory context for agent execution
+  // Combines short-term + relevant long-term + similar episodes
+  rpc GetMemoryContext (MemoryContextRequest) returns (MemoryContextResponse);
+
+  // Get memory statistics
+  rpc GetMemoryStats (MemoryStatsRequest) returns (MemoryStatsResponse);
+
+  // Health check
+  rpc HealthCheck (shadowlink.common.HealthCheckRequest)
+      returns (shadowlink.common.HealthCheckResponse);
+}
+
+// ════════════════════════════════════════════
+// Short-term Memory
+// ════════════════════════════════════════════
+
+message ShortTermEntry {
+  string session_id = 1;
+  string role       = 2;   // user | assistant | system | tool
+  string content    = 3;
+  int32  token_count = 4;
+  map<string, string> metadata = 5;
+  google.protobuf.Timestamp timestamp = 6;
+}
+
+message ShortTermWindowRequest {
+  string session_id = 1;
+  int32  max_entries = 2;    // 0 = use default (from settings)
+  int32  max_tokens  = 3;    // 0 = use default
+}
+
+message ShortTermWindowResponse {
+  repeated ShortTermEntry entries = 1;
+  int32  total_entries = 2;
+  int32  total_tokens  = 3;
+  int32  window_size   = 4;   // How many entries in window
+}
+
+// ════════════════════════════════════════════
+// Long-term Memory
+// ════════════════════════════════════════════
+
+message LongTermEntry {
+  string entry_id   = 1;   // Auto-generated if empty
+  string user_id    = 2;
+  string mode_id    = 3;   // Mode-scoped memory
+  string content    = 4;   // The knowledge/fact
+  string category   = 5;   // preference | fact | instruction | context
+  float  importance = 6;   // 0.0 ~ 1.0, for prioritization
+  map<string, string> metadata = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp accessed_at = 9;
+  int32 access_count = 10;
+}
+
+message LongTermSearchRequest {
+  string query    = 1;    // Semantic search query
+  string user_id  = 2;
+  string mode_id  = 3;    // Empty = search all modes
+  string category = 4;    // Empty = search all categories
+  int32  top_k    = 5;    // 0 = use default
+  float  min_score = 6;   // Minimum similarity threshold
+}
+
+message LongTermSearchResponse {
+  repeated LongTermResult results = 1;
+}
+
+message LongTermResult {
+  LongTermEntry entry = 1;
+  float score         = 2;   // Similarity score
+}
+
+message ListLongTermRequest {
+  string user_id  = 1;
+  string mode_id  = 2;
+  string category = 3;
+  shadowlink.common.PageRequest page = 4;
+}
+
+message ListLongTermResponse {
+  repeated LongTermEntry entries = 1;
+  shadowlink.common.PageMeta page = 2;
+}
+
+message DeleteLongTermRequest {
+  string entry_id = 1;
+}
+
+message DeleteLongTermResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+// ════════════════════════════════════════════
+// Episodic Memory
+// ════════════════════════════════════════════
+
+message EpisodeEntry {
+  string episode_id    = 1;
+  string session_id    = 2;
+  string user_id       = 3;
+  string mode_id       = 4;
+
+  // The original task
+  string input_message = 5;
+  string output_message = 6;
+
+  // Execution summary
+  shadowlink.common.AgentStrategy strategy = 7;
+  int32  step_count    = 8;
+  int32  total_tokens  = 9;
+  double total_latency_ms = 10;
+  bool   success       = 11;
+
+  // Compressed execution trace (for replay/learning)
+  repeated EpisodeStep steps = 12;
+
+  // Tools used
+  repeated string tools_used = 13;
+
+  // Quality metrics (for learning)
+  float  user_rating   = 14;  // 0.0 ~ 5.0 (0 = unrated)
+  string feedback      = 15;
+
+  google.protobuf.Timestamp created_at = 16;
+}
+
+message EpisodeStep {
+  string step_type = 1;
+  string summary   = 2;   // Compressed step description
+  string tool_name = 3;
+  bool   success   = 4;
+}
+
+message EpisodeSearchRequest {
+  string query    = 1;   // Semantic search for similar past tasks
+  string user_id  = 2;
+  string mode_id  = 3;
+  int32  top_k    = 4;
+  bool   only_successful = 5;  // Only return successful episodes
+}
+
+message EpisodeSearchResponse {
+  repeated EpisodeResult results = 1;
+}
+
+message EpisodeResult {
+  EpisodeEntry episode = 1;
+  float score          = 2;
+}
+
+message GetEpisodeRequest {
+  string episode_id = 1;
+}
+
+// ════════════════════════════════════════════
+// Cross-tier Operations
+// ════════════════════════════════════════════
+
+// Unified memory context for agent execution
+message MemoryContextRequest {
+  string session_id = 1;
+  string user_id    = 2;
+  string mode_id    = 3;
+  string query      = 4;   // Current user message for relevance search
+
+  // Control which tiers to include
+  bool include_short_term = 5;
+  bool include_long_term  = 6;
+  bool include_episodic   = 7;
+
+  // Limits
+  int32 max_short_term_entries = 8;
+  int32 max_long_term_entries  = 9;
+  int32 max_episodes           = 10;
+}
+
+message MemoryContextResponse {
+  repeated ShortTermEntry short_term = 1;
+  repeated LongTermResult long_term  = 2;
+  repeated EpisodeResult  episodes   = 3;
+
+  // Aggregated token count for context budget
+  int32 total_tokens = 4;
+
+  // Pre-formatted context string (ready to inject into prompt)
+  string formatted_context = 5;
+}
+
+// ════════════════════════════════════════════
+// Statistics
+// ════════════════════════════════════════════
+
+message MemoryStatsRequest {
+  string user_id = 1;
+  string mode_id = 2;  // Empty = all modes
+}
+
+message MemoryStatsResponse {
+  int32 short_term_sessions  = 1;
+  int32 short_term_entries   = 2;
+  int32 long_term_entries    = 3;
+  int32 episodic_count       = 4;
+  int64 total_storage_bytes  = 5;
+
+  // Per-mode breakdown
+  map<string, int32> entries_by_mode = 6;
+  map<string, int32> episodes_by_mode = 7;
+}
+
+// ════════════════════════════════════════════
+// Shared
+// ════════════════════════════════════════════
+
+message ClearMemoryRequest {
+  string session_id = 1;
+  shadowlink.common.MemoryTier tier = 2;
+}
+
+message ClearMemoryResponse {
+  bool   success        = 1;
+  int32  deleted_count  = 2;
+  string message        = 3;
+}
+
+message AddEntryResponse {
+  bool   success  = 1;
+  string entry_id = 2;
+  string message  = 3;
+}

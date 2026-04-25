@@ -1,0 +1,56 @@
+{
+  "name": "shadowlink-electron",
+  "private": true,
+  "version": "3.0.0",
+  "description": "ShadowLink AI Desktop — global hotkeys, system tray, clipboard integration, native AI assistant",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "dev": "tsc && electron .",
+    "build": "tsc && electron-builder",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "build": {
+    "appId": "com.shadowlink.ai",
+    "productName": "ShadowLink AI",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../assets/icons",
+        "to": "icons"
+      }
+    ],
+    "win": {
+      "target": ["nsis", "portable"],
+      "icon": "../assets/icons/app.ico"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "icon": "../assets/icons/app.ico",
+      "category": "public.app-category.productivity"
+    },
+    "linux": {
+      "target": ["AppImage"],
+      "category": "Utility"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "ShadowLink AI"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "electron": "^30.1.0",
+    "electron-builder": "^24.13.3",
+    "typescript": "~5.5.2"
+  }
+}

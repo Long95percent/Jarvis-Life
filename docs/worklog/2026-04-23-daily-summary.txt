@@ -1,0 +1,233 @@
+====================================================================
+    Jarvis · Be IronMan 项目 —— 阶段工作小结
+    日期：2026-04-23（周四）
+====================================================================
+
+【一句话总结】
+完成了从 ShadowLink 到 Jarvis · Be IronMan 的主体产品形态重构：
+落地了 6 个生活助手 agent + 5 个场景圆桌 + 主动关怀 + 自动升级 +
+本地数据聚合 + SQLite 持久化,并把所有新功能正确挂回原有 Java 三
+层网关架构。当日 30 次 commit、42 项单元与集成测试全绿。
+
+--------------------------------------------------------------------
+一、产品形态变化
+--------------------------------------------------------------------
+
+1. 品牌重构：ShadowLink → "Jarvis · Be IronMan"
+   - 前端标题、Logo、Sidebar 统一改名
+   - 原有 /chat、/brainstorm 页面折入 Jarvis 主页
+   - /knowledge、/settings 保留,可从 Jarvis 顶栏进入
+
+2. 核心隐喻：用户=老板,5+1 个专业智能体为你服务
+   - 🎩 Alfred  总管家
+   - 📋 Maxwell 秘书
+   - 🥗 Nora    营养师
+   - 🌸 Mira    心理师
+   - 🌟 Leo     生活顾问
+   - 👁 Shadow  偏好学习器(静默观察,不发声)
+
+3. 6 个装甲模式(Ambient Modes)重新生活化
+   general → 🎩 生活总管       code-dev → ⚡ 全速工作
+   paper-reading → 📚 深度学习  creative-writing → 🎨 创意迸发
+   data-analysis → 🌿 恢复静养  project-management → 🏃 活力健康
+
+--------------------------------------------------------------------
+二、功能模块(按完成顺序)
+--------------------------------------------------------------------
+
+【早上 · 核心后端(Tasks 4-11)】
+
+* Shadow Roundtable 引擎
+  - 后台多 agent 讨论,产出 JSON action 决策
+  - 从 BrainstormExecutor 适配而来,但用户不可见
+
+* Proactive Trigger Engine
+  - 5 条触发规则(stress_spike / schedule_overload / sleep_poor /
+    free_window_detected / mood_declining)
+  - Cooldown 机制 + interrupt budget(每 agent 每日最多 N 次)
+
+* Preference Learner (Shadow)
+  - 静默观察用户与各 agent 的对话
+  - 每 5 次互动调用 LLM 提取一次用户偏好
+
+* JARVIS API Router + Lifespan 集成
+  - REST + SSE 端点齐备
+  - ProactiveEngine 启动时 asyncio.create_task 拉起
+
+* 前端 Zustand Store + 5 组件 + JarvisPage
+  - 三栏布局:agents / 生活状态 / 主动消息
+  - 修复了早期提示词不兼容的问题
+
+* MCP 适配器:weather(Open-Meteo 免 key)+ calendar(in-memory)
+
+
+【中午 · 大重构(R1-R4)】
+
+* 场景圆桌系统
+  - 5 个预设场景:今日日程协调、本地生活活动、情绪压力疏导、
+    周末恢复规划、工作头脑风暴
+  - 前 4 个使用 Jarvis roster,第 5 个复用原 BrainstormExecutor
+
+* Jarvis 主页重写
+  - 删除顶部 Mode 选择器(和场景重复)
+  - /brainstorm /chat 路由删除,功能折入 Jarvis
+  - Sidebar 精简为 Jarvis + Knowledge + Settings
+
+* 剧场式全屏圆桌
+  - 从"聊天列表"升级为"圆桌会议厅":4 agent 围坐中心桌,
+    当前发言者放大+发光+悬浮气泡
+  - framer-motion 动画,SVG 连线,阶段指示器
+  - 修复一个 bug:framer-motion 的 animate 会覆盖 CSS
+    transform,导致所有 agent 堆在中心 —— 拆成 3 层 div 解决
+
+
+【下午 · 用户参与 & 设置(RT1-RT2 + S1-S2)】
+
+* 多轮圆桌 + 用户插话
+  - POST /roundtable/continue 端点
+  - 底部输入框,用户以金色🟡"你·老板"气泡加入讨论
+  - 每个 agent 都能看到完整 transcript
+
+* 设置页 Tab 化重构
+  - AI 模型(保留原 LLM provider 管理)
+  - 个人资料(名字/位置/作息/饮食/兴趣)
+  - 智能体(5 个开关+预算滑条+Shadow 总开关)
+  - 修了一个重要 bug:原来 settings-store 只存 localStorage
+    从不调后端 → UI 改 key 永不生效
+
+
+【傍晚 · 智能升级 & 本地数据(E1-L3)】
+
+* Auto-escalation 自动升级
+  - 私聊时后端评估 severity(压力/日程/情绪/周末/活动 关键词
+    + life context 阈值)
+  - 命中 → 响应带 escalation hint
+  - 前端 3 秒倒计时自动拉圆桌,可取消/立即开
+
+* Demo Proactive Trigger
+  - 顶栏 ⚡ Demo 下拉按钮,跳过 5 分钟轮询
+  - 直接 fire 任一 trigger,生成主动消息即时显示
+  - 比赛现场可控的"召唤魔法"
+
+* PreferenceLearner 接入对话流
+  - /chat 和 /roundtable/continue 都会 observe()
+  - 受 shadow_learner_enabled 总开关控制
+  - GET /shadow/profile 可读学到的偏好
+
+* 本地生活聚合服务
+  - RSS 新闻(HackerNews / BBC / 人民日报海外版)
+  - Overpass API 附近活动(公园/咖啡/餐厅/健身/博物馆)
+  - 10 分钟缓存,schedule_density 写回 LifeContextBus
+  - Leo 的圆桌 prompt 会注入附近活动 + 近期新闻
+
+
+【晚上 · 持久化 & 架构归位(P1-P2 + G1)】
+
+* SQLite 持久化
+  - roundtable_sessions / roundtable_turns / life_context_snapshots
+  - create_session_async / add_turn_async 写一份就进 DB
+  - Context bus update_fields 触发 fire-and-forget snapshot
+  - 启动时 rehydrate:最近 50 个 session + 最新 context
+  - 实测重启后 stress/mood 还在,session 可继续 /continue
+
+* Java Gateway 代理层(重大架构修复)
+  - 此前所有 /api/v1/jarvis/* 走 Vite 直连 Python :8000,
+    绕过了原有三层架构 —— 这是严重的架构失误
+  - JarvisProxyController:19 REST 路由 catch-all + 3 SSE 流
+    (messages/stream, roundtable/start, roundtable/continue)
+  - 复用已有 aiWebClient + SseEmitter 模式(对齐 ChatProxyController)
+  - 请求流线:Frontend :3000 → Java :8080 → Python :8000
+  - WHITE_LIST 放行 /api/v1/jarvis/**(L1 demo,免 JWT)
+
+
+【深夜 · 审计 & 修 bug】
+
+* 三路并发审计(Explore agent × 3)
+  - Python 后端 / React 前端 / 端到端
+  - 总健康度 7.5 / 10
+
+* 找出并修复的 bug
+  1. ProactiveEngine 不读用户 agent 开关(关了 Nora 照发)
+  2. SettingsLLM handleAddNew 异步竞态(用假 ID)
+  3. PATCH /agent-config/{id} 不校验 agent_id
+  4. 死代码清理(LifeContextPanel + 3 个空变量)
+  5. 意外泄露修复:llm_providers.json 从追踪移除 + gitignore
+
+--------------------------------------------------------------------
+三、技术亮点
+--------------------------------------------------------------------
+
+* 三层架构完整性:Frontend / Java Gateway / Python AI,所有
+  Jarvis 端点通过统一代理层,鉴权与观测一致
+
+* 场景即装甲:5 个场景对应不同 agent 组合 + 讨论引导语,
+  既可私聊单个 agent,也可一键拉圆桌
+
+* 剧场化交互:圆桌不只是聊天列表,而是圆形舞台 + 活跃发言
+  者放大+发光+悬浮气泡 + SVG 连接线的沉浸式视觉
+
+* 主动 vs 被动:
+  - 主动:ProactiveEngine 轮询触发规则
+  - 被动:用户聊天中被 escalation 自动拉圆桌
+  - 演示可控:顶栏 ⚡ Demo 按钮强制触发
+
+* 打扰预算 + cooldown + 用户开关:三重门控,避免 agent
+  反复打扰
+
+* SQLite 持久化:session / context / turns 重启不丢
+
+--------------------------------------------------------------------
+四、遇到的坑 & 解决
+--------------------------------------------------------------------
+
+1. git stash -u 把未 track 的 plan 文件和 brainstorm 模块一起
+   stash 走,第一个 subagent 找不到文件 —— 用 stash@{0}^3 恢复
+
+2. Plan 里的 PreferenceLearner 测试有时序 bug(_OBSERVE_EVERY_N=5
+   但测试只调 1 次 observe)—— 改成循环 5 次
+
+3. framer-motion animate 覆盖 CSS transform,圆桌 agent 全堆在
+   中心 —— 拆成 3 层 div 分别负责定位/居中/动画
+
+4. 设置页 h-screen(100vh)在 AppLayout 内超出可用高度,底部
+   兴趣爱好/偏好学习器被裁剪 —— 改 h-full
+
+5. 用户"配了 API key 但 agent 不响应":根本原因是 settings-store
+   只存 localStorage,从不调后端 —— 重写为真正 async CRUD,
+   还顺带发现 backend 返回 {success, data} 信封没解包
+
+6. llm_providers.json 含 API key 被意外 commit —— rm --cached +
+   gitignore 补救
+
+7. 架构失误:我早期偷懒用 Vite 直连 Python,绕过了 Java 网关。
+   下午用户发现后,立刻做 G1 补齐 —— Java 补上 19+3 个代理路由
+
+--------------------------------------------------------------------
+五、数据总览
+--------------------------------------------------------------------
+
+* 当日 commit 数:30
+* Python 新增模块数:14 个 (app/jarvis/*.py)
+* 前端新增组件数:10 个 (components/jarvis/ + components/settings/)
+* Java 新增控制器:1 个 (JarvisProxyController)
+* 单元测试 + 集成测试:42 项,全部通过
+* Python 路由数:56 (包含原有 + Jarvis 新增 22)
+
+--------------------------------------------------------------------
+六、未完成项 / 明日规划
+--------------------------------------------------------------------
+
+* Task 14 Electron 悬浮窗 Alt+Space 呼出(用户主动"缓一缓")
+* Session modes 形式化(topic_mode 枚举) - 目前通过 scenarios 间接实现
+* 更多场景模板(学术研究、家庭关系等) - 可根据 demo 再加
+* 演示脚本 & 彩排 - 建议赛前一天专门做
+
+--------------------------------------------------------------------
+七、一句话回顾
+--------------------------------------------------------------------
+
+把一个"多场景聊天机器人"变成了"懂你日程/情绪/饮食/作息的生活管
+家团队",每个 agent 主动关心你,互相协作,用户只管当老板。
+架构上三层归位,数据上持久化就位,演示上有可控开关。
+
+                                          — 2026-04-23 汇总

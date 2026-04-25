@@ -1,0 +1,211 @@
+// ============================================================
+// ShadowLink — Agent Service Proto
+// Python AI ← gRPC → Java Backend
+//
+// Covers: agent execution (streaming), strategy routing,
+// plan-and-execute, multi-agent delegation, session management
+// ============================================================
+
+syntax = "proto3";
+
+package shadowlink.agent;
+
+option java_package = "com.shadowlink.bridge.proto.agent";
+option java_multiple_files = true;
+option java_outer_classname = "AgentServiceProto";
+
+import "common.proto";
+import "google/protobuf/timestamp.proto";
+
+// ════════════════════════════════════════════
+// Service Definition
+// ════════════════════════════════════════════
+
+service AgentService {
+
+  // Stream agent execution events (main RPC — Java calls Python)
+  // Client sends a request, server streams back events until DONE/ERROR
+  rpc StreamChat (AgentRequest) returns (stream AgentEvent);
+
+  // Unary agent invocation (non-streaming fallback)
+  rpc Chat (AgentRequest) returns (AgentResponse);
+
+  // Cancel a running agent execution
+  rpc Cancel (CancelRequest) returns (CancelResponse);
+
+  // Get execution status for a running/completed session
+  rpc GetExecutionStatus (ExecutionStatusRequest) returns (ExecutionStatusResponse);
+
+  // Route a task to the optimal strategy (TaskComplexityRouter)
+  rpc ClassifyTask (TaskClassifyRequest) returns (TaskClassifyResponse);
+
+  // Health check
+  rpc HealthCheck (shadowlink.common.HealthCheckRequest)
+      returns (shadowlink.common.HealthCheckResponse);
+}
+
+// ════════════════════════════════════════════
+// Request / Response Messages
+// ════════════════════════════════════════════
+
+message AgentRequest {
+  string session_id = 1;
+  string mode_id    = 2;
+  string message    = 3;
+
+  // Strategy override (STRATEGY_AUTO = let router decide)
+  shadowlink.common.AgentStrategy strategy = 4;
+
+  // Execution parameters
+  int32 max_iterations = 5;           // Max ReAct/plan iterations (0 = use default)
+  bool  enable_reflection = 6;        // Enable Reflexion self-critique
+  bool  enable_rag = 7;               // Inject RAG context before execution
+
+  // Allowed tools (empty = all mode-default tools)
+  repeated string allowed_tools = 8;
+
+  // Additional context (e.g., selected text, screenshot OCR result)
+  map<string, string> context = 9;
+
+  // Mode-specific overrides
+  shadowlink.common.ModeContext mode_context = 10;
+}
+
+message AgentResponse {
+  string session_id = 1;
+  string answer     = 2;
+
+  shadowlink.common.AgentStrategy strategy_used = 3;
+  repeated AgentStep steps = 4;
+  PlanSummary plan         = 5;
+
+  shadowlink.common.TokenUsage     token_usage = 6;
+  shadowlink.common.LatencyMetrics latency     = 7;
+
+  string error_message = 8;  // Non-empty if execution failed
+}
+
+// Individual agent event in a streaming execution
+message AgentEvent {
+  shadowlink.common.StreamEventType event_type = 1;
+
+  string session_id  = 2;
+  string step_id     = 3;
+
+  // Content fields — populated based on event_type
+  string content     = 4;   // Token text, thought, observation, answer
+  string tool_name   = 5;   // For TOOL_CALL / TOOL_RESULT
+  string tool_input  = 6;   // JSON string of tool arguments
+  string tool_output = 7;   // JSON string of tool result
+
+  // Plan events
+  PlanStep plan_step = 8;                         // For STEP_START, STEP_RESULT
+  repeated PlanStep full_plan = 9;                // For PLAN event (entire plan)
+
+  // Multi-agent delegation
+  Delegation delegation = 10;                     // For DELEGATION event
+
+  // Metrics (populated on certain events)
+  int32  token_count = 11;
+  double latency_ms  = 12;
+
+  // Strategy assigned (populated on DONE)
+  shadowlink.common.AgentStrategy strategy_used = 13;
+
+  google.protobuf.Timestamp timestamp = 14;
+}
+
+// ════════════════════════════════════════════
+// Agent Execution Building Blocks
+// ════════════════════════════════════════════
+
+// Single step in agent execution
+message AgentStep {
+  string step_type   = 1;   // thought | action | observation | reflection | tool_call | rag
+  string content     = 2;
+  string tool_name   = 3;
+  string tool_input  = 4;   // JSON
+  string tool_output = 5;   // JSON
+  int32  token_count = 6;
+  double latency_ms  = 7;
+  google.protobuf.Timestamp timestamp = 8;
+}
+
+// Plan step (for plan-and-execute strategy)
+message PlanStep {
+  int32  index        = 1;
+  string description  = 2;
+  string tool         = 3;   // Suggested tool (optional)
+  repeated int32 dependencies = 4;  // Indices of prerequisite steps
+  shadowlink.common.StepStatus status = 5;
+  string output       = 6;   // Step execution result
+  string error        = 7;
+  double latency_ms   = 8;
+}
+
+// Plan summary (included in final AgentResponse)
+message PlanSummary {
+  repeated PlanStep steps = 1;
+  int32 completed_count   = 2;
+  int32 failed_count      = 3;
+  double total_latency_ms = 4;
+}
+
+// Multi-agent delegation record
+message Delegation {
+  string from_agent  = 1;
+  string to_agent    = 2;
+  string task        = 3;
+  string result      = 4;
+  double latency_ms  = 5;
+  bool   success     = 6;
+}
+
+// ════════════════════════════════════════════
+// Session & Status
+// ════════════════════════════════════════════
+
+message CancelRequest {
+  string session_id = 1;
+  string reason     = 2;
+}
+
+message CancelResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+message ExecutionStatusRequest {
+  string session_id = 1;
+}
+
+message ExecutionStatusResponse {
+  string session_id = 1;
+  bool   is_running = 2;
+
+  shadowlink.common.AgentStrategy strategy = 3;
+  int32  step_count    = 4;
+  int32  total_tokens  = 5;
+  double elapsed_ms    = 6;
+
+  // Current step info (if running)
+  string current_step_type = 7;
+  string current_tool      = 8;
+}
+
+// ════════════════════════════════════════════
+// Task Complexity Router
+// ════════════════════════════════════════════
+
+message TaskClassifyRequest {
+  string message   = 1;
+  string mode_id   = 2;
+  map<string, string> context = 3;
+}
+
+message TaskClassifyResponse {
+  shadowlink.common.AgentStrategy recommended_strategy = 1;
+  string  complexity_level = 2;   // simple | moderate | complex | expert
+  double  confidence       = 3;   // 0.0 ~ 1.0
+  string  reasoning        = 4;   // Explanation of the routing decision
+}

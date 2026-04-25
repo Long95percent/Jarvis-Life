@@ -1,0 +1,235 @@
+// ============================================================
+// ShadowLink — MCP & Tool Service Proto
+// Python AI ← gRPC → Java Backend
+//
+// Covers: tool discovery, execution, MCP server management,
+// plugin registry, mode-scoped tool restrictions
+// ============================================================
+
+syntax = "proto3";
+
+package shadowlink.mcp;
+
+option java_package = "com.shadowlink.bridge.proto.mcp";
+option java_multiple_files = true;
+option java_outer_classname = "McpServiceProto";
+
+import "common.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// ════════════════════════════════════════════
+// Service Definition
+// ════════════════════════════════════════════
+
+service MCPBridge {
+
+  // ── Tool Discovery ──
+
+  // List all available tools (filtered by mode)
+  rpc ListTools (ListToolsRequest) returns (ListToolsResponse);
+
+  // Get detailed schema for a specific tool
+  rpc GetToolSchema (GetToolSchemaRequest) returns (GetToolSchemaResponse);
+
+  // ── Tool Execution ──
+
+  // Execute a single tool call
+  rpc CallTool (ToolCallRequest) returns (ToolCallResponse);
+
+  // Execute multiple tool calls in parallel
+  rpc BatchCallTools (BatchToolCallRequest) returns (BatchToolCallResponse);
+
+  // ── MCP Server Management ──
+
+  // Register an external MCP server
+  rpc RegisterMCPServer (RegisterMCPServerRequest) returns (RegisterMCPServerResponse);
+
+  // List registered MCP servers
+  rpc ListMCPServers (ListMCPServersRequest) returns (ListMCPServersResponse);
+
+  // Remove an MCP server
+  rpc RemoveMCPServer (RemoveMCPServerRequest) returns (RemoveMCPServerResponse);
+
+  // ── Plugin Management ──
+
+  // List installed plugins
+  rpc ListPlugins (ListPluginsRequest) returns (ListPluginsResponse);
+
+  // Enable/disable a plugin
+  rpc SetPluginStatus (SetPluginStatusRequest) returns (SetPluginStatusResponse);
+
+  // Health check
+  rpc HealthCheck (shadowlink.common.HealthCheckRequest)
+      returns (shadowlink.common.HealthCheckResponse);
+}
+
+// ════════════════════════════════════════════
+// Tool Discovery
+// ════════════════════════════════════════════
+
+message ListToolsRequest {
+  string mode_id   = 1;   // Filter by mode (empty = all)
+  string category  = 2;   // Filter by category (empty = all)
+  bool   include_disabled = 3;
+}
+
+message ListToolsResponse {
+  repeated ToolInfo tools = 1;
+  int32 total_count       = 2;
+}
+
+message ToolInfo {
+  string name            = 1;
+  string description     = 2;
+  string category        = 3;   // search | file | code | web | data | custom
+  string source          = 4;   // builtin | mcp | plugin
+  bool   is_async        = 5;   // Whether tool runs asynchronously
+  bool   requires_confirmation = 6;  // Needs user approval before execution
+  bool   enabled         = 7;
+
+  // JSON Schema string for parameters
+  string parameters_schema = 8;
+
+  // Mode restrictions (empty = available in all modes)
+  repeated string allowed_modes = 9;
+
+  // MCP-specific fields
+  string mcp_server_id = 10;  // Which MCP server provides this tool
+}
+
+message GetToolSchemaRequest {
+  string tool_name = 1;
+}
+
+message GetToolSchemaResponse {
+  ToolInfo tool = 1;
+  // Full JSON Schema with examples and descriptions
+  string full_schema_json = 2;
+}
+
+// ════════════════════════════════════════════
+// Tool Execution
+// ════════════════════════════════════════════
+
+message ToolCallRequest {
+  string tool_name      = 1;
+  string arguments_json = 2;  // JSON string of tool arguments
+
+  // Execution context
+  string session_id = 3;
+  string mode_id    = 4;
+  string step_id    = 5;     // Link back to agent execution step
+
+  // Timeout override in milliseconds (0 = use default)
+  int32  timeout_ms = 6;
+
+  // User confirmation token (for tools requiring confirmation)
+  string confirmation_token = 7;
+}
+
+message ToolCallResponse {
+  bool   success      = 1;
+  string result_json  = 2;   // JSON string of tool result
+  string error        = 3;
+  double latency_ms   = 4;
+
+  // Tool execution metadata
+  string tool_name    = 5;
+  string step_id      = 6;
+  bool   was_cached   = 7;   // Result from cache vs fresh execution
+}
+
+message BatchToolCallRequest {
+  repeated ToolCallRequest calls = 1;
+  bool parallel = 2;  // Execute in parallel (true) or sequential (false)
+}
+
+message BatchToolCallResponse {
+  repeated ToolCallResponse results = 1;
+  double total_latency_ms = 2;
+  int32  success_count    = 3;
+  int32  failure_count    = 4;
+}
+
+// ════════════════════════════════════════════
+// MCP Server Management
+// ════════════════════════════════════════════
+
+message RegisterMCPServerRequest {
+  string server_id    = 1;   // Unique identifier
+  string name         = 2;   // Display name
+  string transport    = 3;   // stdio | sse | streamable-http
+  string uri          = 4;   // Connection URI or command
+  string description  = 5;
+  map<string, string> env = 6;  // Environment variables for stdio transport
+}
+
+message RegisterMCPServerResponse {
+  bool   success     = 1;
+  string server_id   = 2;
+  int32  tool_count  = 3;   // Number of tools discovered from this server
+  string message     = 4;
+}
+
+message ListMCPServersRequest {}
+
+message ListMCPServersResponse {
+  repeated MCPServerInfo servers = 1;
+}
+
+message MCPServerInfo {
+  string server_id   = 1;
+  string name        = 2;
+  string transport   = 3;
+  string uri         = 4;
+  string status      = 5;   // connected | disconnected | error
+  int32  tool_count  = 6;
+  google.protobuf.Timestamp registered_at = 7;
+  google.protobuf.Timestamp last_heartbeat = 8;
+}
+
+message RemoveMCPServerRequest {
+  string server_id = 1;
+}
+
+message RemoveMCPServerResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+// ════════════════════════════════════════════
+// Plugin Management
+// ════════════════════════════════════════════
+
+message ListPluginsRequest {
+  string category = 1;       // Filter by category
+  bool   include_disabled = 2;
+}
+
+message ListPluginsResponse {
+  repeated PluginInfo plugins = 1;
+}
+
+message PluginInfo {
+  string plugin_id    = 1;
+  string name         = 2;
+  string description  = 3;
+  string version      = 4;
+  string author       = 5;
+  string category     = 6;   // general | tool | mcp | retriever
+  string entry_point  = 7;
+  bool   enabled      = 8;
+  repeated string allowed_modes = 9;
+  google.protobuf.Struct config = 10;
+}
+
+message SetPluginStatusRequest {
+  string plugin_id = 1;
+  bool   enabled   = 2;
+}
+
+message SetPluginStatusResponse {
+  bool   success = 1;
+  string message = 2;
+}

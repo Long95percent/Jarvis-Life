@@ -1,0 +1,29 @@
+# ============================================================
+# ShadowLink — Buf Configuration
+# Proto lint, breaking change detection, and code generation
+# ============================================================
+# Install: https://buf.build/docs/installation
+# Usage:
+#   buf lint           — Lint proto files
+#   buf breaking       — Check for breaking changes
+#   buf generate       — Generate code (see buf.gen.yaml)
+# ============================================================
+
+version: v2
+
+modules:
+  - path: .
+
+lint:
+  use:
+    - STANDARD
+  except:
+    # Allow short package names
+    - PACKAGE_VERSION_SUFFIX
+  enum_zero_value_suffix: _UNSPECIFIED
+  rpc_allow_google_protobuf_empty_requests: true
+  rpc_allow_google_protobuf_empty_responses: true
+
+breaking:
+  use:
+    - FILE

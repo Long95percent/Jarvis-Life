@@ -1,0 +1,10 @@
+[
+    {
+        "mode_id": "project_docs",
+        "name": "Project Docs",
+        "repo_paths": [
+            "docs",
+            "README.md"
+        ]
+    }
+]

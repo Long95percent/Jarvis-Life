@@ -1,0 +1,170 @@
+// ============================================================
+// ShadowLink — Shared Proto Types
+// Cross-language common definitions for Java ↔ Python gRPC
+// ============================================================
+
+syntax = "proto3";
+
+package shadowlink.common;
+
+option java_package = "com.shadowlink.bridge.proto.common";
+option java_multiple_files = true;
+option java_outer_classname = "CommonProto";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// ════════════════════════════════════════════
+// Enums
+// ════════════════════════════════════════════
+
+// Agent execution strategy — mirrors Python AgentStrategy
+enum AgentStrategy {
+  STRATEGY_UNSPECIFIED  = 0;
+  STRATEGY_DIRECT       = 1;  // Single LLM call, no tool loop
+  STRATEGY_REACT        = 2;  // ReAct: Reason → Act → Observe loop
+  STRATEGY_PLAN_EXECUTE = 3;  // Plan then execute steps sequentially
+  STRATEGY_SUPERVISOR   = 4;  // Supervisor routes to expert agents
+  STRATEGY_HIERARCHICAL = 5;  // Multi-level agent hierarchy
+  STRATEGY_SWARM        = 6;  // Peer-to-peer agent collaboration
+  STRATEGY_HERMES       = 7;  // Self-describing agent protocol
+  STRATEGY_AUTO         = 8;  // TaskComplexityRouter decides
+}
+
+// Stream event type — mirrors Python StreamEventType
+enum StreamEventType {
+  EVENT_UNSPECIFIED  = 0;
+  EVENT_TOKEN        = 1;   // Incremental token from LLM
+  EVENT_THOUGHT      = 2;   // Agent's internal reasoning
+  EVENT_ACTION       = 3;   // Agent decides to act
+  EVENT_OBSERVATION  = 4;   // Tool/environment result
+  EVENT_PLAN         = 5;   // Full plan generated
+  EVENT_STEP_START   = 6;   // Plan step begins execution
+  EVENT_STEP_RESULT  = 7;   // Plan step completed
+  EVENT_TOOL_CALL    = 8;   // Tool invocation started
+  EVENT_TOOL_RESULT  = 9;   // Tool returned result
+  EVENT_RAG_CONTEXT  = 10;  // RAG context retrieved
+  EVENT_ERROR        = 11;  // Error occurred
+  EVENT_DONE         = 12;  // Execution completed
+  EVENT_HEARTBEAT    = 13;  // Keep-alive for long operations
+  EVENT_DELEGATION   = 14;  // Multi-agent task delegation
+  EVENT_REFLECTION   = 15;  // Reflexion self-critique
+}
+
+// Plan step execution status
+enum StepStatus {
+  STEP_PENDING   = 0;
+  STEP_RUNNING   = 1;
+  STEP_COMPLETED = 2;
+  STEP_FAILED    = 3;
+  STEP_SKIPPED   = 4;
+}
+
+// RAG query classification
+enum QueryClassification {
+  QUERY_UNSPECIFIED = 0;
+  QUERY_FACTUAL     = 1;
+  QUERY_ANALYTICAL  = 2;
+  QUERY_CREATIVE    = 3;
+  QUERY_CODE        = 4;
+  QUERY_CONVERSATIONAL = 5;
+}
+
+// RAG retrieval method
+enum RetrievalMethod {
+  RETRIEVAL_UNSPECIFIED = 0;
+  RETRIEVAL_DENSE       = 1;  // Vector similarity (FAISS)
+  RETRIEVAL_SPARSE      = 2;  // BM25 keyword
+  RETRIEVAL_HYBRID      = 3;  // RRF fusion of dense + sparse
+}
+
+// Memory tier — Letta 3-tier model
+enum MemoryTier {
+  MEMORY_UNSPECIFIED = 0;
+  MEMORY_SHORT_TERM  = 1;  // Sliding window, session-scoped
+  MEMORY_LONG_TERM   = 2;  // Persistent, cross-session
+  MEMORY_EPISODIC    = 3;  // Execution history replay
+  MEMORY_SEMANTIC    = 4;  // Knowledge graph (future)
+}
+
+// ════════════════════════════════════════════
+// Common Messages
+// ════════════════════════════════════════════
+
+// Unified API response wrapper — mirrors Java Result<T>
+message Result {
+  bool   success   = 1;
+  int32  code      = 2;
+  string message   = 3;
+  google.protobuf.Struct data = 4;
+  google.protobuf.Timestamp timestamp = 5;
+}
+
+// Pagination request
+message PageRequest {
+  int32  page     = 1;
+  int32  size     = 2;
+  string sort_by  = 3;
+  bool   asc      = 4;
+}
+
+// Pagination response metadata
+message PageMeta {
+  int64 total  = 1;
+  int32 page   = 2;
+  int32 size   = 3;
+  int32 pages  = 4;
+}
+
+// Token usage metrics
+message TokenUsage {
+  int32  prompt_tokens     = 1;
+  int32  completion_tokens = 2;
+  int32  total_tokens      = 3;
+  string model             = 4;
+}
+
+// Latency breakdown
+message LatencyMetrics {
+  double total_ms      = 1;
+  double llm_ms        = 2;
+  double retrieval_ms  = 3;
+  double rerank_ms     = 4;
+  double tool_ms       = 5;
+  double embedding_ms  = 6;
+}
+
+// Work mode context — passed per-request for mode isolation
+message ModeContext {
+  string mode_id       = 1;
+  string system_prompt  = 2;
+  map<string, string> agent_config = 3;
+  map<string, string> tools_config = 4;
+  map<string, string> rag_config   = 5;
+}
+
+// Generic stream event envelope — used across all streaming RPCs
+message StreamEvent {
+  StreamEventType event     = 1;
+  string          session_id = 2;
+  string          step_id    = 3;
+  google.protobuf.Struct data = 4;
+  google.protobuf.Timestamp timestamp = 5;
+}
+
+// Health check (follows gRPC health checking protocol pattern)
+message HealthCheckRequest {
+  string service = 1;
+}
+
+message HealthCheckResponse {
+  enum ServingStatus {
+    UNKNOWN         = 0;
+    SERVING         = 1;
+    NOT_SERVING     = 2;
+    SERVICE_UNKNOWN = 3;
+  }
+  ServingStatus status = 1;
+  string version       = 2;
+  int64  uptime_seconds = 3;
+}

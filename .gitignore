@@ -1,0 +1,127 @@
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+pip-wheel-metadata/
+*.egg-info/
+.eggs/
+
+# ============ Virtual Environments ============
+.venv/
+venv/
+env/
+ENV/
+shadowlink-ai/.venv311/
+.python-version
+
+# ============ Node.js / React / Vite ============
+node_modules/
+.vite/
+.turbo/
+.next/
+.nuxt/
+dist/
+build/
+out/
+shadowlink-web/dist/
+shadowlink-electron/dist/
+shadowlink-electron/out/
+*.tsbuildinfo
+.eslintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ============ Java / Maven ============
+target/
+shadowlink-server/**/target/
+*.class
+*.jar
+*.war
+*.ear
+shadowlink-server/.mvn/wrapper/maven/
+!.mvn/wrapper/maven-wrapper.jar
+!shadowlink-server/.mvn/wrapper/maven-wrapper.jar
+hs_err_pid*
+replay_pid*
+
+# ============ Electron / Installers ============
+release/
+*.asar
+*.blockmap
+*.snap
+*.exe
+*.msi
+*.zip
+*.7z
+
+# ============ Generated gRPC / Proto ============
+*_pb2.py
+*_pb2_grpc.py
+*_pb2.pyi
+**/*_pb2*.py
+**/generated/
+
+# ============ Local Runtime Data ============
+*.db
+*.sqlite
+*.sqlite3
+chat_history.db
+.shadowlink_cache/
+data/jarvis_settings.json
+shadowlink-ai/data/jarvis_settings.json
+data/llm_providers.json
+shadowlink-ai/data/llm_providers.json
+
+# ============ AI Models / Indexes ============
+models/
+rag_indexes/
+Ollama/
+shadowlink-ai/app/models/
+
+# ============ Secrets / Local Config ============
+.env
+.env.*
+!.env.example
+!**/.env.example
+deploy/.env
+!deploy/.env.example
+llm_config.json
+tasks_config.json
+
+# ============ IDE / Editor ============
+.cursor/
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# ============ OS Files ============
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============ Docker / Local Overrides ============
+docker-compose.override.yml
+
+# ============ Temporary / Backups ============
+tmp/
+temp/
+logs/
+*.tmp
+*.bak
+*.spec.bak
+*.manifest
+*.log

@@ -1,0 +1,87 @@
+server:
+  port: 8080
+  servlet:
+    context-path: /
+  tomcat:
+    threads:
+      max: 200
+    accept-count: 100
+    connection-timeout: 5000
+
+spring:
+  application:
+    name: shadowlink-server
+  profiles:
+    active: @spring.profiles.active@
+
+  # ── Jackson ──
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+    default-property-inclusion: non_null
+
+  # ── Servlet ──
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 100MB
+
+# ── JWT ──
+shadowlink:
+  jwt:
+    secret: shadowlink-default-secret-key-replace-in-production-at-least-256-bits!!
+    access-token-expire-minutes: 30
+    refresh-token-expire-days: 7
+    issuer: shadowlink
+  ai-service:
+    grpc-target: localhost:50051
+    rest-base-url: http://localhost:8000
+    timeout-seconds: 120
+    prefer-grpc: true
+
+# ── MyBatis-Plus ──
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+      id-type: assign_id
+    banner: false
+
+# ── Knife4j ──
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+
+# ── Actuator ──
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+
+# ── Resilience4j ──
+resilience4j:
+  ratelimiter:
+    instances:
+      agentExecute:
+        limit-for-period: 10
+        limit-refresh-period: 1m
+        timeout-duration: 0s
+  circuitbreaker:
+    instances:
+      pythonAI:
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+
+logging:
+  config: classpath:logback-spring.xml

@@ -1,0 +1,39 @@
+#!/bin/sh
+# Maven Wrapper bootstrap script
+# Downloads Maven if not present, then delegates
+
+set -e
+
+MAVEN_WRAPPER_PROPERTIES="$(dirname "$0")/.mvn/wrapper/maven-wrapper.properties"
+
+if [ ! -f "$MAVEN_WRAPPER_PROPERTIES" ]; then
+  echo "Error: .mvn/wrapper/maven-wrapper.properties not found" >&2
+  exit 1
+fi
+
+DIST_URL=$(grep -m1 'distributionUrl' "$MAVEN_WRAPPER_PROPERTIES" | cut -d'=' -f2- | tr -d '\r')
+WRAPPER_DIR="$(dirname "$0")/.mvn/wrapper"
+MAVEN_HOME="$WRAPPER_DIR/maven"
+MAVEN_BIN="$MAVEN_HOME/bin/mvn"
+
+if [ ! -f "$MAVEN_BIN" ]; then
+  echo "Downloading Maven from: $DIST_URL"
+  mkdir -p "$WRAPPER_DIR/tmp"
+  ARCHIVE="$WRAPPER_DIR/tmp/maven.zip"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "$ARCHIVE" "$DIST_URL"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$ARCHIVE" "$DIST_URL"
+  else
+    echo "Error: curl or wget required" >&2
+    exit 1
+  fi
+
+  unzip -qo "$ARCHIVE" -d "$WRAPPER_DIR/tmp"
+  mv "$WRAPPER_DIR/tmp/apache-maven-"* "$MAVEN_HOME"
+  rm -rf "$WRAPPER_DIR/tmp"
+  chmod +x "$MAVEN_BIN"
+fi
+
+exec "$MAVEN_BIN" "$@"

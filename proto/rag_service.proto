@@ -1,0 +1,281 @@
+// ============================================================
+// ShadowLink — RAG Service Proto
+// Python AI ← gRPC → Java Backend
+//
+// Covers: 9-step RAG pipeline, document ingestion, index
+// management, mode-partitioned retrieval, quality tracing
+// ============================================================
+
+syntax = "proto3";
+
+package shadowlink.rag;
+
+option java_package = "com.shadowlink.bridge.proto.rag";
+option java_multiple_files = true;
+option java_outer_classname = "RagServiceProto";
+
+import "common.proto";
+import "google/protobuf/timestamp.proto";
+
+// ════════════════════════════════════════════
+// Service Definition
+// ════════════════════════════════════════════
+
+service RAGService {
+
+  // Execute the full 9-step RAG pipeline
+  rpc Query (RAGQueryRequest) returns (RAGQueryResponse);
+
+  // Retrieve context without answer generation (for agent use)
+  rpc Retrieve (RAGRetrieveRequest) returns (RAGRetrieveResponse);
+
+  // Ingest a single document
+  rpc Ingest (IngestRequest) returns (IngestResponse);
+
+  // Batch ingest multiple documents with progress streaming
+  rpc BatchIngest (BatchIngestRequest) returns (stream IngestProgress);
+
+  // ── Index Management ──
+
+  // List all indices (optionally filtered by mode)
+  rpc ListIndices (ListIndicesRequest) returns (ListIndicesResponse);
+
+  // Get statistics for an index
+  rpc GetIndexStats (IndexStatsRequest) returns (IndexStatsResponse);
+
+  // Delete an index partition
+  rpc DeleteIndex (DeleteIndexRequest) returns (DeleteIndexResponse);
+
+  // Rebuild an index from source documents
+  rpc RebuildIndex (RebuildIndexRequest) returns (stream IngestProgress);
+
+  // ── Document Management ──
+
+  // List documents in an index
+  rpc ListDocuments (ListDocumentsRequest) returns (ListDocumentsResponse);
+
+  // Delete a document and its chunks from the index
+  rpc DeleteDocument (DeleteDocumentRequest) returns (DeleteDocumentResponse);
+
+  // Health check
+  rpc HealthCheck (shadowlink.common.HealthCheckRequest)
+      returns (shadowlink.common.HealthCheckResponse);
+}
+
+// ════════════════════════════════════════════
+// Query Pipeline
+// ════════════════════════════════════════════
+
+message RAGQueryRequest {
+  string query   = 1;
+  string mode_id = 2;
+  int32  top_k   = 3;         // Number of chunks to retrieve (0 = use default)
+
+  // Pipeline configuration overrides
+  bool   enable_rewrite  = 4;  // Query rewriting (default: true)
+  bool   enable_rerank   = 5;  // Cross-encoder reranking (default: true)
+  bool   enable_crag     = 6;  // CRAG quality gate (default: true)
+
+  shadowlink.common.RetrievalMethod retrieval_method = 7;
+
+  // Metadata filters (e.g., file_type, date range)
+  map<string, string> filters = 8;
+
+  // Session context for conversational RAG
+  string session_id = 9;
+}
+
+message RAGQueryResponse {
+  string answer           = 1;
+  repeated RAGChunk chunks = 2;
+  RAGTrace trace          = 3;
+  shadowlink.common.TokenUsage token_usage = 4;
+}
+
+// Retrieve-only (no generation) — returns ranked chunks
+message RAGRetrieveRequest {
+  string query   = 1;
+  string mode_id = 2;
+  int32  top_k   = 3;
+  bool   enable_rerank = 4;
+  shadowlink.common.RetrievalMethod retrieval_method = 5;
+  map<string, string> filters = 6;
+}
+
+message RAGRetrieveResponse {
+  repeated RAGChunk chunks = 1;
+  RAGTrace trace           = 2;
+}
+
+// ════════════════════════════════════════════
+// Chunks & Tracing
+// ════════════════════════════════════════════
+
+message RAGChunk {
+  string chunk_id  = 1;
+  string content   = 2;
+  string source    = 3;    // Source document name/path
+  string doc_id    = 4;    // Parent document ID
+  float  score     = 5;    // Relevance score (0.0 ~ 1.0)
+  int32  position  = 6;    // Position within the source document
+  map<string, string> metadata = 7;
+}
+
+// Full 9-step pipeline trace for observability
+message RAGTrace {
+  string trace_id         = 1;
+  string original_query   = 2;
+  string rewritten_query  = 3;
+
+  shadowlink.common.QueryClassification classification = 4;
+  shadowlink.common.RetrievalMethod    retrieval_method = 5;
+
+  int32  retrieved_count     = 6;   // After initial retrieval
+  int32  after_rerank_count  = 7;   // After reranking
+  bool   quality_gate_passed = 8;   // CRAG gate result
+
+  // Latency breakdown
+  shadowlink.common.LatencyMetrics latency = 9;
+
+  // Quality metrics
+  double relevance_avg = 10;
+  double precision     = 11;
+  double recall        = 12;
+
+  google.protobuf.Timestamp timestamp = 13;
+}
+
+// ════════════════════════════════════════════
+// Document Ingestion
+// ════════════════════════════════════════════
+
+message IngestRequest {
+  string file_path   = 1;
+  string file_name   = 2;
+  string mode_id     = 3;
+  string doc_id      = 4;    // Pre-assigned doc ID (empty = auto-generate)
+
+  // Chunking configuration
+  string chunking_strategy = 5;  // recursive | sentence | semantic | fixed
+  int32  chunk_size        = 6;  // 0 = use default
+  int32  chunk_overlap     = 7;  // 0 = use default
+
+  map<string, string> metadata = 8;
+}
+
+message IngestResponse {
+  bool   success     = 1;
+  string doc_id      = 2;
+  int32  chunk_count = 3;
+  string message     = 4;
+  double latency_ms  = 5;
+}
+
+message BatchIngestRequest {
+  repeated IngestRequest files = 1;
+  string mode_id               = 2;  // Default mode if not set per file
+}
+
+// Streaming progress event during batch ingestion
+message IngestProgress {
+  string file_name       = 1;
+  string doc_id          = 2;
+  int32  current_index   = 3;  // 0-based index in batch
+  int32  total_files     = 4;
+  string status          = 5;  // processing | completed | failed
+  int32  chunk_count     = 6;
+  string error_message   = 7;
+  double progress_pct    = 8;  // 0.0 ~ 100.0
+}
+
+// ════════════════════════════════════════════
+// Index Management
+// ════════════════════════════════════════════
+
+message ListIndicesRequest {
+  string mode_id = 1;  // Empty = list all
+}
+
+message ListIndicesResponse {
+  repeated IndexInfo indices = 1;
+}
+
+message IndexInfo {
+  string index_id        = 1;
+  string mode_id         = 2;
+  int32  document_count  = 3;
+  int32  chunk_count     = 4;
+  int64  size_bytes      = 5;
+  string embedding_model = 6;
+  int32  dimension       = 7;
+  google.protobuf.Timestamp created_at  = 8;
+  google.protobuf.Timestamp updated_at  = 9;
+}
+
+message IndexStatsRequest {
+  string mode_id = 1;
+}
+
+message IndexStatsResponse {
+  IndexInfo info = 1;
+  // Distribution metrics
+  double avg_chunk_length = 2;
+  int32  max_chunk_length = 3;
+  int32  min_chunk_length = 4;
+  map<string, int32> file_type_counts = 5;
+}
+
+message DeleteIndexRequest {
+  string mode_id = 1;
+  bool   confirm = 2;  // Safety: must be true to proceed
+}
+
+message DeleteIndexResponse {
+  bool   success = 1;
+  string message = 2;
+  int32  deleted_chunks = 3;
+}
+
+message RebuildIndexRequest {
+  string mode_id            = 1;
+  string embedding_model    = 2;  // Empty = use current model
+  string chunking_strategy  = 3;
+  int32  chunk_size         = 4;
+  int32  chunk_overlap      = 5;
+}
+
+// ════════════════════════════════════════════
+// Document Management
+// ════════════════════════════════════════════
+
+message ListDocumentsRequest {
+  string mode_id = 1;
+  shadowlink.common.PageRequest page = 2;
+}
+
+message ListDocumentsResponse {
+  repeated DocumentInfo documents = 1;
+  shadowlink.common.PageMeta page = 2;
+}
+
+message DocumentInfo {
+  string doc_id     = 1;
+  string file_name  = 2;
+  string file_type  = 3;
+  int64  file_size  = 4;
+  int32  chunk_count = 5;
+  string mode_id    = 6;
+  string status     = 7;
+  google.protobuf.Timestamp ingested_at = 8;
+}
+
+message DeleteDocumentRequest {
+  string doc_id  = 1;
+  string mode_id = 2;
+}
+
+message DeleteDocumentResponse {
+  bool   success        = 1;
+  string message        = 2;
+  int32  deleted_chunks = 3;
+}

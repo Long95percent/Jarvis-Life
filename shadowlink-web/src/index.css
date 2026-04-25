@@ -1,0 +1,125 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===== Ambient Theme — CSS Variable Defaults (General preset) ===== */
+:root {
+  /* Primary palette (RGB triplets — use with Tailwind opacity) */
+  --color-primary-50: 238 239 255;
+  --color-primary-100: 224 225 254;
+  --color-primary-200: 199 200 254;
+  --color-primary-300: 165 168 253;
+  --color-primary-400: 129 140 248;
+  --color-primary-500: 99 102 241;
+  --color-primary-600: 79 70 229;
+  --color-primary-700: 67 56 202;
+  --color-primary-800: 55 48 163;
+  --color-primary-900: 49 46 129;
+
+  /* Semantic colors */
+  --color-bg: #0f1117;
+  --color-surface: #1a1b23;
+  --color-surface-secondary: #252631;
+  --color-surface-tertiary: #2f3142;
+  --color-text: #e2e8f0;
+  --color-text-muted: #94a3b8;
+  --color-accent: #a78bfa;
+  --color-primary: #6366f1;
+  --color-primary-light: #818cf8;
+  --color-primary-dark: #4f46e5;
+
+  /* Gradient */
+  --gradient-from: #6366f1;
+  --gradient-to: #8b5cf6;
+
+  /* Typography */
+  --font-sans: 'Inter';
+  --font-mono: 'JetBrains Mono';
+
+  /* Layout */
+  --sidebar-width: 280px;
+  --panel-ratio-agent: 6;
+  --panel-ratio-dialog: 4;
+
+  /* Ambient */
+  --ambient-transition: 600ms;
+  --ambient-type: particles;
+  --ambient-bg-effect: gradient_shift;
+}
+
+/* ===== Base layer — global resets using CSS vars ===== */
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-app text-foreground antialiased;
+    font-family: var(--font-sans), 'Inter', system-ui, -apple-system, sans-serif;
+    min-height: 100vh;
+    overflow: hidden;
+  }
+
+  code, pre, kbd, samp {
+    font-family: var(--font-mono), 'JetBrains Mono', 'Fira Code', monospace;
+  }
+
+  /* Scrollbar styling */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-surface-tertiary);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-text-muted);
+  }
+}
+
+/* ===== Component layer — reusable ambient utilities ===== */
+@layer components {
+  .ambient-gradient {
+    background: linear-gradient(135deg, var(--gradient-from), var(--gradient-to));
+  }
+
+  .ambient-gradient-text {
+    background: linear-gradient(135deg, var(--gradient-from), var(--gradient-to));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .surface-card {
+    background: var(--color-surface);
+    border: 1px solid var(--color-surface-tertiary);
+    border-radius: 0.75rem;
+  }
+
+  .surface-card-hover {
+    background: var(--color-surface);
+    border: 1px solid var(--color-surface-tertiary);
+    border-radius: 0.75rem;
+    transition: border-color 200ms ease, background-color 200ms ease;
+  }
+
+  .surface-card-hover:hover {
+    border-color: var(--color-primary);
+    background: var(--color-surface-secondary);
+  }
+}
+
+/* ===== Utility layer ===== */
+@layer utilities {
+  .transition-ambient {
+    transition-duration: var(--ambient-transition);
+    transition-timing-function: ease-in-out;
+  }
+}

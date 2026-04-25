@@ -1,0 +1,313 @@
+# ============================================================
+# ShadowLink — Production Docker Compose
+# ============================================================
+# Usage:
+#   cp .env.example .env  (edit values)
+#   docker compose up -d --build
+#   docker compose ps
+#   docker compose logs -f shadowlink-server
+# ============================================================
+
+services:
+
+  # ════════════════════════════════════════════
+  # Infrastructure
+  # ════════════════════════════════════════════
+
+  mysql:
+    image: mysql:8.0
+    container_name: sl-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root123}
+      MYSQL_DATABASE: ${DB_DATABASE:-shadowlink}
+      MYSQL_USER: ${DB_USER:-shadowlink}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-shadowlink123}
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./mysql/my.cnf:/etc/mysql/conf.d/custom.cnf:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_ROOT_PASSWORD:-root123}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    command: --default-authentication-plugin=caching_sha2_password
+             --character-set-server=utf8mb4
+             --collation-server=utf8mb4_unicode_ci
+             --max-connections=500
+             --innodb-buffer-pool-size=256M
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+    networks:
+      - shadowlink-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: sl-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.5"
+    networks:
+      - shadowlink-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  # ════════════════════════════════════════════
+  # Application Services
+  # ════════════════════════════════════════════
+
+  shadowlink-server:
+    build:
+      context: ../shadowlink-server
+      dockerfile: Dockerfile
+    container_name: sl-server
+    restart: unless-stopped
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-prod}
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${DB_DATABASE:-shadowlink}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true
+      SPRING_DATASOURCE_USERNAME: ${DB_USER:-shadowlink}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD:-shadowlink123}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      # AI service connection
+      SHADOWLINK_AI_GRPC_HOST: shadowlink-ai
+      SHADOWLINK_AI_GRPC_PORT: 50051
+      SHADOWLINK_AI_REST_URL: http://shadowlink-ai:8000
+      # JVM tuning
+      JAVA_OPTS: >-
+        -Xms${JAVA_XMS:-256m}
+        -Xmx${JAVA_XMX:-1g}
+        -XX:+UseZGC
+        -XX:+ZGenerational
+        -XX:MaxGCPauseMillis=10
+        -Djava.security.egd=file:/dev/./urandom
+      # JWT
+      SHADOWLINK_JWT_SECRET: ${JWT_SECRET:-shadowlink-default-secret-key-replace-in-production-at-least-256-bits!!}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+          cpus: "2.0"
+    networks:
+      - shadowlink-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  shadowlink-ai:
+    build:
+      context: ../shadowlink-ai
+      dockerfile: Dockerfile
+    container_name: sl-ai
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "50051:50051"
+    environment:
+      SHADOWLINK_ENV: ${SHADOWLINK_ENV:-prod}
+      SHADOWLINK_LOG_LEVEL: ${SHADOWLINK_LOG_LEVEL:-INFO}
+      SHADOWLINK_LLM__BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      SHADOWLINK_LLM__API_KEY: ${LLM_API_KEY:-}
+      SHADOWLINK_LLM__MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      SHADOWLINK_GRPC__PORT: ${SHADOWLINK_GRPC_PORT:-50051}
+      # Workers
+      UVICORN_WORKERS: ${AI_WORKERS:-2}
+    volumes:
+      - ai-data:/app/data
+      - ai-logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+    networks:
+      - shadowlink-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  shadowlink-web:
+    build:
+      context: ../shadowlink-web
+      dockerfile: Dockerfile
+    container_name: sl-web
+    restart: unless-stopped
+    networks:
+      - shadowlink-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+
+  # ════════════════════════════════════════════
+  # Reverse Proxy
+  # ════════════════════════════════════════════
+
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: sl-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      shadowlink-server:
+        condition: service_healthy
+      shadowlink-web:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.5"
+    networks:
+      - shadowlink-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ════════════════════════════════════════════
+  # Monitoring (optional — enable with profile)
+  # ════════════════════════════════════════════
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: sl-prometheus
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    networks:
+      - shadowlink-net
+
+  grafana:
+    image: grafana/grafana:10.4.1
+    container_name: sl-grafana
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin123}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    networks:
+      - shadowlink-net
+
+# ════════════════════════════════════════════
+# Volumes
+# ════════════════════════════════════════════
+
+volumes:
+  mysql-data:
+    driver: local
+  redis-data:
+    driver: local
+  ai-data:
+    driver: local
+  ai-logs:
+    driver: local
+  nginx-logs:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+
+# ════════════════════════════════════════════
+# Network
+# ════════════════════════════════════════════
+
+networks:
+  shadowlink-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
