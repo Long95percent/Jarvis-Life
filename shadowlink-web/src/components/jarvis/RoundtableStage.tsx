@@ -3,6 +3,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Send } from "lucide-react";
 import { JARVIS_AGENTS } from "./agentMeta";
+import { jarvisApi } from "@/services/jarvisApi";
 
 interface Props {
   scenarioId: string;
@@ -113,6 +114,31 @@ function normalizeAgentReply(content: string, agentName: string): string {
   return content;
 }
 
+function transcriptEntryFromTurn(turn: { role: string; speaker_name: string; content: string; timestamp: number }, index: number): TranscriptEntry {
+  if (turn.role === "user") {
+    return {
+      key: `history-user-${index}`,
+      kind: "user",
+      agentId: "user",
+      agentName: "你",
+      agentColor: USER_COLOR,
+      agentIcon: USER_ICON,
+      content: turn.content,
+    };
+  }
+  const agentId = turn.role;
+  const meta = JARVIS_AGENTS[agentId];
+  return {
+    key: `history-agent-${index}`,
+    kind: "agent",
+    agentId,
+    agentName: turn.speaker_name || meta?.name || agentId,
+    agentColor: meta?.color ?? "#6366F1",
+    agentIcon: meta?.icon ?? "🤖",
+    content: turn.content,
+  };
+}
+
 export const RoundtableStage: React.FC<Props> = ({
   scenarioId,
   userInput,
@@ -220,12 +246,23 @@ export const RoundtableStage: React.FC<Props> = ({
   // Initial /start call
   useEffect(() => {
     isMountedRef.current = true;
-    streamRound("/api/v1/jarvis/roundtable/start", {
-      scenario_id: scenarioId,
-      user_input: userInput,
-      session_id: sessionId,
-      mode_id: modeId,
-    });
+    (async () => {
+      const existingTurns = await jarvisApi.getRoundtableTurns(sessionId).catch(() => []);
+      if (!isMountedRef.current) return;
+      if (existingTurns.length > 0) {
+        setTranscript(existingTurns.map(transcriptEntryFromTurn));
+        setStatus("idle");
+        setPhase("已恢复历史讨论");
+        setRoundCount(Math.max(1, Math.ceil(existingTurns.filter((turn) => turn.role !== "user").length / Math.max(1, participants.length || 1))));
+        return;
+      }
+      streamRound("/api/v1/jarvis/roundtable/start", {
+        scenario_id: scenarioId,
+        user_input: userInput,
+        session_id: sessionId,
+        mode_id: modeId,
+      });
+    })();
     return () => {
       isMountedRef.current = false;
       abortRef.current?.abort();

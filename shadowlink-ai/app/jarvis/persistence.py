@@ -65,10 +65,48 @@ CREATE TABLE IF NOT EXISTS agent_chat_turns (
     agent_id   TEXT NOT NULL,          -- which agent this 1:1 chat belongs to
     role       TEXT NOT NULL,          -- 'user' or 'agent'
     content    TEXT NOT NULL,
+    actions    TEXT NOT NULL DEFAULT '[]',
     timestamp  REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_agent ON agent_chat_turns(agent_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS jarvis_memories (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_kind     TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    source_agent    TEXT NOT NULL,
+    session_id      TEXT,
+    source_text     TEXT,
+    structured_payload TEXT NOT NULL,
+    sensitivity     TEXT NOT NULL DEFAULT 'normal',
+    confidence      REAL NOT NULL DEFAULT 0.6,
+    importance      REAL NOT NULL DEFAULT 0.5,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    last_used_at    REAL,
+    status          TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE INDEX IF NOT EXISTS idx_jarvis_memories_active ON jarvis_memories(status, importance DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jarvis_memories_kind ON jarvis_memories(memory_kind, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS conversation_history (
+    id                 TEXT PRIMARY KEY,
+    conversation_type  TEXT NOT NULL, -- private_chat | roundtable | brainstorm
+    title              TEXT NOT NULL,
+    agent_id           TEXT,
+    scenario_id        TEXT,
+    session_id         TEXT NOT NULL,
+    route_payload      TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'active',
+    created_at         REAL NOT NULL,
+    updated_at         REAL NOT NULL,
+    last_opened_at     REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversation_history_active ON conversation_history(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conversation_history_unopened ON conversation_history(status, last_opened_at, created_at);
 
 CREATE TABLE IF NOT EXISTS collaboration_memories (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,6 +136,68 @@ CREATE TABLE IF NOT EXISTS pending_actions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_actions(status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS background_tasks (
+    id                    TEXT PRIMARY KEY,
+    title                 TEXT NOT NULL,
+    task_type             TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'active',
+    source_agent          TEXT,
+    original_user_request TEXT NOT NULL,
+    goal                  TEXT,
+    time_horizon          TEXT NOT NULL,
+    milestones            TEXT NOT NULL,
+    subtasks              TEXT NOT NULL,
+    calendar_candidates   TEXT NOT NULL,
+    notes                 TEXT,
+    created_at            REAL NOT NULL,
+    updated_at            REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_background_tasks_status ON background_tasks(status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS demo_runs (
+    id                 TEXT PRIMARY KEY,
+    seed_name          TEXT NOT NULL,
+    profile_seed       TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'active',
+    created_at         REAL NOT NULL,
+    updated_at         REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_demo_runs_updated ON demo_runs(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS demo_trace_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    demo_run_id     TEXT NOT NULL,
+    demo_step_id    TEXT NOT NULL,
+    event_type      TEXT NOT NULL,
+    agent_id        TEXT,
+    user_input      TEXT,
+    agent_reply     TEXT,
+    tool_calls      TEXT NOT NULL,
+    memory_events   TEXT NOT NULL,
+    confirmation    TEXT NOT NULL,
+    payload         TEXT NOT NULL,
+    created_at      REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_demo_trace_run ON demo_trace_events(demo_run_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS demo_memory_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    demo_run_id     TEXT NOT NULL,
+    demo_step_id    TEXT NOT NULL,
+    memory_kind     TEXT NOT NULL,
+    content         TEXT NOT NULL,
+    source_text     TEXT,
+    sensitivity     TEXT NOT NULL DEFAULT 'normal',
+    confidence      REAL NOT NULL DEFAULT 0.6,
+    importance      REAL NOT NULL DEFAULT 0.5,
+    created_at      REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_demo_memory_run ON demo_memory_items(demo_run_id, created_at DESC);
 """
 
 
@@ -111,6 +211,9 @@ def _ensure_initialized() -> None:
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(_DB_PATH) as con:
         con.executescript(SCHEMA)
+        columns = {row[1] for row in con.execute("PRAGMA table_info(agent_chat_turns)").fetchall()}
+        if "actions" not in columns:
+            con.execute("ALTER TABLE agent_chat_turns ADD COLUMN actions TEXT NOT NULL DEFAULT '[]'")
         con.commit()
     _initialized = True
 
@@ -336,21 +439,22 @@ async def context_history(limit: int = 100) -> list[dict[str, Any]]:
 # ── Agent chat history (1:1 private chats) ────────────────────────
 
 
-def _save_chat_turn_sync(agent_id: str, role: str, content: str) -> None:
+def _save_chat_turn_sync(agent_id: str, role: str, content: str, actions: list[dict[str, Any]] | None = None) -> None:
+    actions_json = json.dumps(actions or [], ensure_ascii=False)
     with _conn() as con:
         con.execute(
             """
-            INSERT INTO agent_chat_turns (agent_id, role, content, timestamp)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO agent_chat_turns (agent_id, role, content, actions, timestamp)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (agent_id, role, content, time.time()),
+            (agent_id, role, content, actions_json, time.time()),
         )
         con.commit()
 
 
-async def save_chat_turn(*, agent_id: str, role: str, content: str) -> None:
+async def save_chat_turn(*, agent_id: str, role: str, content: str, actions: list[dict[str, Any]] | None = None) -> None:
     try:
-        await asyncio.to_thread(_save_chat_turn_sync, agent_id, role, content)
+        await asyncio.to_thread(_save_chat_turn_sync, agent_id, role, content, actions)
     except Exception as exc:
         logger.warning("persistence.save_chat_turn_failed", agent_id=agent_id, error=str(exc))
 
@@ -359,7 +463,7 @@ def _get_chat_history_sync(agent_id: str, limit: int) -> list[dict[str, Any]]:
     with _conn() as con:
         rows = con.execute(
             """
-            SELECT role, content, timestamp
+            SELECT role, content, actions, timestamp
             FROM agent_chat_turns
             WHERE agent_id = ?
             ORDER BY id DESC
@@ -368,7 +472,15 @@ def _get_chat_history_sync(agent_id: str, limit: int) -> list[dict[str, Any]]:
             (agent_id, limit),
         ).fetchall()
     # Reverse so the oldest is first (chronological order for display)
-    return [dict(r) for r in reversed(rows)]
+    turns: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        item = dict(row)
+        try:
+            item["actions"] = json.loads(item.get("actions") or "[]")
+        except Exception:
+            item["actions"] = []
+        turns.append(item)
+    return turns
 
 
 async def get_chat_history(agent_id: str, limit: int = 50) -> list[dict[str, Any]]:
@@ -377,6 +489,346 @@ async def get_chat_history(agent_id: str, limit: int = 50) -> list[dict[str, Any
     except Exception as exc:
         logger.warning("persistence.get_chat_history_failed", agent_id=agent_id, error=str(exc))
         return []
+
+
+# -- Unified Jarvis memory -----------------------------------------
+
+
+def _row_to_jarvis_memory(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    try:
+        item["structured_payload"] = json.loads(item["structured_payload"])
+    except Exception:
+        item["structured_payload"] = {}
+    return item
+
+
+def _find_similar_memory_sync(memory_kind: str, content: str) -> dict[str, Any] | None:
+    normalized = " ".join(content.strip().split())
+    with _conn() as con:
+        row = con.execute(
+            """
+            SELECT * FROM jarvis_memories
+            WHERE status = 'active' AND memory_kind = ? AND content = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (memory_kind, normalized),
+        ).fetchone()
+    return _row_to_jarvis_memory(row) if row else None
+
+
+def _save_jarvis_memory_sync(
+    *,
+    memory_kind: str,
+    content: str,
+    source_agent: str,
+    session_id: str | None,
+    source_text: str | None,
+    structured_payload: dict[str, Any] | None,
+    sensitivity: str,
+    confidence: float,
+    importance: float,
+) -> dict[str, Any]:
+    normalized = " ".join(content.strip().split())
+    existing = _find_similar_memory_sync(memory_kind, normalized)
+    now = time.time()
+    payload = structured_payload or {}
+    with _conn() as con:
+        if existing:
+            new_confidence = max(float(existing.get("confidence") or 0.0), confidence)
+            new_importance = max(float(existing.get("importance") or 0.0), importance)
+            con.execute(
+                """
+                UPDATE jarvis_memories
+                SET source_agent = ?, session_id = COALESCE(?, session_id), source_text = COALESCE(?, source_text),
+                    structured_payload = ?, sensitivity = ?, confidence = ?, importance = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    source_agent,
+                    session_id,
+                    source_text,
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    sensitivity,
+                    new_confidence,
+                    new_importance,
+                    now,
+                    existing["id"],
+                ),
+            )
+            memory_id = existing["id"]
+        else:
+            cursor = con.execute(
+                """
+                INSERT INTO jarvis_memories
+                  (memory_kind, content, source_agent, session_id, source_text, structured_payload,
+                   sensitivity, confidence, importance, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    memory_kind,
+                    normalized,
+                    source_agent,
+                    session_id,
+                    source_text,
+                    json.dumps(payload, ensure_ascii=False, default=str),
+                    sensitivity,
+                    confidence,
+                    importance,
+                    now,
+                    now,
+                ),
+            )
+            memory_id = cursor.lastrowid
+        row = con.execute("SELECT * FROM jarvis_memories WHERE id = ?", (memory_id,)).fetchone()
+        con.commit()
+    return _row_to_jarvis_memory(row)
+
+
+async def save_jarvis_memory(
+    *,
+    memory_kind: str,
+    content: str,
+    source_agent: str,
+    session_id: str | None = None,
+    source_text: str | None = None,
+    structured_payload: dict[str, Any] | None = None,
+    sensitivity: str = "normal",
+    confidence: float = 0.6,
+    importance: float = 0.5,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _save_jarvis_memory_sync,
+        memory_kind=memory_kind,
+        content=content,
+        source_agent=source_agent,
+        session_id=session_id,
+        source_text=source_text,
+        structured_payload=structured_payload,
+        sensitivity=sensitivity,
+        confidence=confidence,
+        importance=importance,
+    )
+
+
+def _list_jarvis_memories_sync(
+    *,
+    memory_kind: str | None = None,
+    status: str = "active",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    with _conn() as con:
+        if memory_kind:
+            rows = con.execute(
+                """
+                SELECT * FROM jarvis_memories
+                WHERE status = ? AND memory_kind = ?
+                ORDER BY importance DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (status, memory_kind, limit),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """
+                SELECT * FROM jarvis_memories
+                WHERE status = ?
+                ORDER BY importance DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (status, limit),
+            ).fetchall()
+    return [_row_to_jarvis_memory(row) for row in rows]
+
+
+async def list_jarvis_memories(
+    *,
+    memory_kind: str | None = None,
+    status: str = "active",
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(
+        _list_jarvis_memories_sync,
+        memory_kind=memory_kind,
+        status=status,
+        limit=limit,
+    )
+
+
+def _mark_jarvis_memories_used_sync(memory_ids: list[int]) -> None:
+    if not memory_ids:
+        return
+    placeholders = ",".join("?" for _ in memory_ids)
+    with _conn() as con:
+        con.execute(
+            f"UPDATE jarvis_memories SET last_used_at = ? WHERE id IN ({placeholders})",
+            (time.time(), *memory_ids),
+        )
+        con.commit()
+
+
+async def mark_jarvis_memories_used(memory_ids: list[int]) -> None:
+    await asyncio.to_thread(_mark_jarvis_memories_used_sync, memory_ids)
+
+
+def _delete_jarvis_memory_sync(memory_id: int) -> bool:
+    with _conn() as con:
+        cursor = con.execute(
+            "UPDATE jarvis_memories SET status = 'deleted', updated_at = ? WHERE id = ? AND status != 'deleted'",
+            (time.time(), memory_id),
+        )
+        con.commit()
+    return cursor.rowcount > 0
+
+
+async def delete_jarvis_memory(memory_id: int) -> bool:
+    return await asyncio.to_thread(_delete_jarvis_memory_sync, memory_id)
+
+
+# -- Conversation history list -------------------------------------
+
+
+def _row_to_conversation(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    try:
+        item["route_payload"] = json.loads(item["route_payload"])
+    except Exception:
+        item["route_payload"] = {}
+    return item
+
+
+def _cleanup_expired_conversations_sync(days: int = 7) -> int:
+    cutoff = time.time() - days * 24 * 60 * 60
+    with _conn() as con:
+        cursor = con.execute(
+            """
+            UPDATE conversation_history
+            SET status = 'deleted', updated_at = ?
+            WHERE status = 'active' AND last_opened_at IS NULL AND created_at < ?
+            """,
+            (time.time(), cutoff),
+        )
+        con.commit()
+    return cursor.rowcount
+
+
+async def cleanup_expired_conversations(days: int = 7) -> int:
+    return await asyncio.to_thread(_cleanup_expired_conversations_sync, days)
+
+
+def _save_conversation_sync(
+    *,
+    conversation_id: str,
+    conversation_type: str,
+    title: str,
+    agent_id: str | None,
+    scenario_id: str | None,
+    session_id: str,
+    route_payload: dict[str, Any],
+) -> dict[str, Any]:
+    now = time.time()
+    with _conn() as con:
+        con.execute(
+            """
+            INSERT INTO conversation_history
+              (id, conversation_type, title, agent_id, scenario_id, session_id, route_payload,
+               status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              title = excluded.title,
+              agent_id = excluded.agent_id,
+              scenario_id = excluded.scenario_id,
+              route_payload = excluded.route_payload,
+              status = 'active',
+              updated_at = excluded.updated_at
+            """,
+            (
+                conversation_id,
+                conversation_type,
+                title,
+                agent_id,
+                scenario_id,
+                session_id,
+                json.dumps(route_payload, ensure_ascii=False, default=str),
+                now,
+                now,
+            ),
+        )
+        row = con.execute("SELECT * FROM conversation_history WHERE id = ?", (conversation_id,)).fetchone()
+        con.commit()
+    return _row_to_conversation(row)
+
+
+async def save_conversation(
+    *,
+    conversation_id: str,
+    conversation_type: str,
+    title: str,
+    agent_id: str | None = None,
+    scenario_id: str | None = None,
+    session_id: str,
+    route_payload: dict[str, Any],
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _save_conversation_sync,
+        conversation_id=conversation_id,
+        conversation_type=conversation_type,
+        title=title,
+        agent_id=agent_id,
+        scenario_id=scenario_id,
+        session_id=session_id,
+        route_payload=route_payload,
+    )
+
+
+def _list_conversations_sync(limit: int = 30) -> list[dict[str, Any]]:
+    _cleanup_expired_conversations_sync(days=7)
+    with _conn() as con:
+        rows = con.execute(
+            """
+            SELECT * FROM conversation_history
+            WHERE status = 'active'
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [_row_to_conversation(row) for row in rows]
+
+
+async def list_conversations(limit: int = 30) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_list_conversations_sync, limit)
+
+
+def _mark_conversation_opened_sync(conversation_id: str) -> dict[str, Any] | None:
+    now = time.time()
+    with _conn() as con:
+        con.execute(
+            "UPDATE conversation_history SET last_opened_at = ?, updated_at = ? WHERE id = ? AND status = 'active'",
+            (now, now, conversation_id),
+        )
+        row = con.execute("SELECT * FROM conversation_history WHERE id = ? AND status = 'active'", (conversation_id,)).fetchone()
+        con.commit()
+    return _row_to_conversation(row) if row else None
+
+
+async def mark_conversation_opened(conversation_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_mark_conversation_opened_sync, conversation_id)
+
+
+def _delete_conversation_sync(conversation_id: str) -> bool:
+    with _conn() as con:
+        cursor = con.execute(
+            "UPDATE conversation_history SET status = 'deleted', updated_at = ? WHERE id = ? AND status != 'deleted'",
+            (time.time(), conversation_id),
+        )
+        con.commit()
+    return cursor.rowcount > 0
+
+
+async def delete_conversation(conversation_id: str) -> bool:
+    return await asyncio.to_thread(_delete_conversation_sync, conversation_id)
 
 
 def _clear_chat_history_sync(agent_id: str) -> int:
@@ -675,3 +1127,374 @@ async def update_pending_action(
         arguments=arguments,
         title=title,
     )
+
+# -- Background task planning --------------------------------------
+
+
+def _row_to_background_task(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    for key in ("time_horizon", "milestones", "subtasks", "calendar_candidates"):
+        try:
+            item[key] = json.loads(item[key])
+        except Exception:
+            item[key] = {} if key == "time_horizon" else []
+    return item
+
+
+def _save_background_task_sync(
+    *,
+    task_id: str,
+    title: str,
+    task_type: str,
+    status: str,
+    source_agent: str | None,
+    original_user_request: str,
+    goal: str | None,
+    time_horizon: dict[str, Any] | None,
+    milestones: list[dict[str, Any]] | None,
+    subtasks: list[dict[str, Any]] | None,
+    calendar_candidates: list[dict[str, Any]] | None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    now = time.time()
+    with _conn() as con:
+        con.execute(
+            """
+            INSERT INTO background_tasks
+              (id, title, task_type, status, source_agent, original_user_request,
+               goal, time_horizon, milestones, subtasks, calendar_candidates,
+               notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              title = excluded.title,
+              task_type = excluded.task_type,
+              status = excluded.status,
+              source_agent = excluded.source_agent,
+              original_user_request = excluded.original_user_request,
+              goal = excluded.goal,
+              time_horizon = excluded.time_horizon,
+              milestones = excluded.milestones,
+              subtasks = excluded.subtasks,
+              calendar_candidates = excluded.calendar_candidates,
+              notes = excluded.notes,
+              updated_at = excluded.updated_at
+            """,
+            (
+                task_id,
+                title,
+                task_type,
+                status,
+                source_agent,
+                original_user_request,
+                goal,
+                json.dumps(time_horizon or {}, ensure_ascii=False, default=str),
+                json.dumps(milestones or [], ensure_ascii=False, default=str),
+                json.dumps(subtasks or [], ensure_ascii=False, default=str),
+                json.dumps(calendar_candidates or [], ensure_ascii=False, default=str),
+                notes,
+                now,
+                now,
+            ),
+        )
+        con.commit()
+    return _get_background_task_sync(task_id) or {}
+
+
+async def save_background_task(
+    *,
+    task_id: str,
+    title: str,
+    task_type: str,
+    status: str = "active",
+    source_agent: str | None = None,
+    original_user_request: str,
+    goal: str | None = None,
+    time_horizon: dict[str, Any] | None = None,
+    milestones: list[dict[str, Any]] | None = None,
+    subtasks: list[dict[str, Any]] | None = None,
+    calendar_candidates: list[dict[str, Any]] | None = None,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _save_background_task_sync,
+        task_id=task_id,
+        title=title,
+        task_type=task_type,
+        status=status,
+        source_agent=source_agent,
+        original_user_request=original_user_request,
+        goal=goal,
+        time_horizon=time_horizon,
+        milestones=milestones,
+        subtasks=subtasks,
+        calendar_candidates=calendar_candidates,
+        notes=notes,
+    )
+
+
+def _get_background_task_sync(task_id: str) -> dict[str, Any] | None:
+    with _conn() as con:
+        row = con.execute("SELECT * FROM background_tasks WHERE id = ?", (task_id,)).fetchone()
+    return _row_to_background_task(row) if row else None
+
+
+async def get_background_task(task_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_get_background_task_sync, task_id)
+
+
+def _list_background_tasks_sync(status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    with _conn() as con:
+        if status:
+            rows = con.execute(
+                "SELECT * FROM background_tasks WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT * FROM background_tasks ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    return [_row_to_background_task(row) for row in rows]
+
+
+async def list_background_tasks(status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_list_background_tasks_sync, status, limit)
+
+
+# -- Demo memory and trace -----------------------------------------
+
+
+def _reset_demo_data_sync() -> dict[str, Any]:
+    with _conn() as con:
+        memory_count = con.execute("SELECT COUNT(*) FROM demo_memory_items").fetchone()[0]
+        trace_count = con.execute("SELECT COUNT(*) FROM demo_trace_events").fetchone()[0]
+        run_count = con.execute("SELECT COUNT(*) FROM demo_runs").fetchone()[0]
+        con.execute("DELETE FROM demo_memory_items")
+        con.execute("DELETE FROM demo_trace_events")
+        con.execute("DELETE FROM demo_runs")
+        con.commit()
+    return {"demo_runs": run_count, "trace_events": trace_count, "memory_items": memory_count}
+
+
+async def reset_demo_data() -> dict[str, Any]:
+    return await asyncio.to_thread(_reset_demo_data_sync)
+
+
+def _start_demo_run_sync(*, demo_run_id: str, seed_name: str, profile_seed: dict[str, Any]) -> dict[str, Any]:
+    now = time.time()
+    with _conn() as con:
+        con.execute(
+            """
+            INSERT INTO demo_runs (id, seed_name, profile_seed, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'active', ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              seed_name = excluded.seed_name,
+              profile_seed = excluded.profile_seed,
+              status = 'active',
+              updated_at = excluded.updated_at
+            """,
+            (demo_run_id, seed_name, json.dumps(profile_seed, ensure_ascii=False, default=str), now, now),
+        )
+        con.commit()
+    return _get_demo_run_sync(demo_run_id) or {}
+
+
+async def start_demo_run(*, demo_run_id: str, seed_name: str, profile_seed: dict[str, Any]) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _start_demo_run_sync,
+        demo_run_id=demo_run_id,
+        seed_name=seed_name,
+        profile_seed=profile_seed,
+    )
+
+
+def _row_to_demo_run(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    try:
+        item["profile_seed"] = json.loads(item["profile_seed"])
+    except Exception:
+        item["profile_seed"] = {}
+    return item
+
+
+def _get_demo_run_sync(demo_run_id: str) -> dict[str, Any] | None:
+    with _conn() as con:
+        row = con.execute("SELECT * FROM demo_runs WHERE id = ?", (demo_run_id,)).fetchone()
+    return _row_to_demo_run(row) if row else None
+
+
+async def get_demo_run(demo_run_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_get_demo_run_sync, demo_run_id)
+
+
+def _list_demo_runs_sync(limit: int = 20) -> list[dict[str, Any]]:
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM demo_runs ORDER BY updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [_row_to_demo_run(row) for row in rows]
+
+
+async def list_demo_runs(limit: int = 20) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_list_demo_runs_sync, limit)
+
+
+def _row_to_demo_trace(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    for key, fallback in (("tool_calls", []), ("memory_events", []), ("confirmation", {}), ("payload", {})):
+        try:
+            item[key] = json.loads(item[key])
+        except Exception:
+            item[key] = fallback
+    return item
+
+
+def _row_to_demo_memory(row: sqlite3.Row) -> dict[str, Any]:
+    return dict(row)
+
+
+def _append_demo_trace_event_sync(
+    *,
+    demo_run_id: str,
+    demo_step_id: str,
+    event_type: str,
+    agent_id: str | None,
+    user_input: str | None,
+    agent_reply: str | None,
+    tool_calls: list[dict[str, Any]] | None,
+    memory_events: list[dict[str, Any]] | None,
+    confirmation: dict[str, Any] | None,
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    now = time.time()
+    with _conn() as con:
+        cursor = con.execute(
+            """
+            INSERT INTO demo_trace_events
+              (demo_run_id, demo_step_id, event_type, agent_id, user_input, agent_reply,
+               tool_calls, memory_events, confirmation, payload, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                demo_run_id,
+                demo_step_id,
+                event_type,
+                agent_id,
+                user_input,
+                agent_reply,
+                json.dumps(tool_calls or [], ensure_ascii=False, default=str),
+                json.dumps(memory_events or [], ensure_ascii=False, default=str),
+                json.dumps(confirmation or {}, ensure_ascii=False, default=str),
+                json.dumps(payload or {}, ensure_ascii=False, default=str),
+                now,
+            ),
+        )
+        con.execute("UPDATE demo_runs SET updated_at = ? WHERE id = ?", (now, demo_run_id))
+        row = con.execute("SELECT * FROM demo_trace_events WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        con.commit()
+    return _row_to_demo_trace(row)
+
+
+async def append_demo_trace_event(
+    *,
+    demo_run_id: str,
+    demo_step_id: str,
+    event_type: str,
+    agent_id: str | None = None,
+    user_input: str | None = None,
+    agent_reply: str | None = None,
+    tool_calls: list[dict[str, Any]] | None = None,
+    memory_events: list[dict[str, Any]] | None = None,
+    confirmation: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _append_demo_trace_event_sync,
+        demo_run_id=demo_run_id,
+        demo_step_id=demo_step_id,
+        event_type=event_type,
+        agent_id=agent_id,
+        user_input=user_input,
+        agent_reply=agent_reply,
+        tool_calls=tool_calls,
+        memory_events=memory_events,
+        confirmation=confirmation,
+        payload=payload,
+    )
+
+
+def _save_demo_memory_item_sync(
+    *,
+    demo_run_id: str,
+    demo_step_id: str,
+    memory_kind: str,
+    content: str,
+    source_text: str | None,
+    sensitivity: str,
+    confidence: float,
+    importance: float,
+) -> dict[str, Any]:
+    now = time.time()
+    with _conn() as con:
+        cursor = con.execute(
+            """
+            INSERT INTO demo_memory_items
+              (demo_run_id, demo_step_id, memory_kind, content, source_text,
+               sensitivity, confidence, importance, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (demo_run_id, demo_step_id, memory_kind, content, source_text, sensitivity, confidence, importance, now),
+        )
+        con.execute("UPDATE demo_runs SET updated_at = ? WHERE id = ?", (now, demo_run_id))
+        row = con.execute("SELECT * FROM demo_memory_items WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        con.commit()
+    return _row_to_demo_memory(row)
+
+
+async def save_demo_memory_item(
+    *,
+    demo_run_id: str,
+    demo_step_id: str,
+    memory_kind: str,
+    content: str,
+    source_text: str | None = None,
+    sensitivity: str = "normal",
+    confidence: float = 0.6,
+    importance: float = 0.5,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        _save_demo_memory_item_sync,
+        demo_run_id=demo_run_id,
+        demo_step_id=demo_step_id,
+        memory_kind=memory_kind,
+        content=content,
+        source_text=source_text,
+        sensitivity=sensitivity,
+        confidence=confidence,
+        importance=importance,
+    )
+
+
+def _export_demo_trace_sync(demo_run_id: str) -> dict[str, Any] | None:
+    run = _get_demo_run_sync(demo_run_id)
+    if run is None:
+        return None
+    with _conn() as con:
+        trace_rows = con.execute(
+            "SELECT * FROM demo_trace_events WHERE demo_run_id = ? ORDER BY created_at ASC",
+            (demo_run_id,),
+        ).fetchall()
+        memory_rows = con.execute(
+            "SELECT * FROM demo_memory_items WHERE demo_run_id = ? ORDER BY created_at ASC",
+            (demo_run_id,),
+        ).fetchall()
+    return {
+        "demo_run": run,
+        "trace_events": [_row_to_demo_trace(row) for row in trace_rows],
+        "memory_items": [_row_to_demo_memory(row) for row in memory_rows],
+    }
+
+
+async def export_demo_trace(demo_run_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_export_demo_trace_sync, demo_run_id)

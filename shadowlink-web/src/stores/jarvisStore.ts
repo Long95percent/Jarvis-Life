@@ -1,8 +1,35 @@
 ﻿// shadowlink-web/src/stores/jarvisStore.ts
 import { create } from "zustand";
-import { jarvisApi, type ActionResult, type CalendarEvent, type EscalationHint, type JarvisAgent, type LifeContext, type ProactiveMessage, type TeamCollaborationResponse } from "@/services/jarvisApi";
+import { jarvisApi, type ActionResult, type CalendarEvent, type ConversationHistoryItem, type EscalationHint, type JarvisAgent, type LifeContext, type ProactiveMessage, type TeamCollaborationResponse } from "@/services/jarvisApi";
 
 export type InteractionMode = "scenario_grid" | "private_chat" | "roundtable";
+
+const UI_STATE_KEY = "jarvis.uiState.v1";
+
+interface PersistedUiState {
+  interactionMode?: InteractionMode;
+  activeAgentId?: string;
+  activeRoundtableScenario?: string | null;
+  activeRoundtableInput?: string;
+  sessionId?: string;
+}
+
+function readPersistedUiState(): PersistedUiState {
+  if (typeof window === "undefined") return {};
+  try {
+    return JSON.parse(window.localStorage.getItem(UI_STATE_KEY) || "{}") as PersistedUiState;
+  } catch {
+    return {};
+  }
+}
+
+function writePersistedUiState(patch: PersistedUiState) {
+  if (typeof window === "undefined") return;
+  const current = readPersistedUiState();
+  window.localStorage.setItem(UI_STATE_KEY, JSON.stringify({ ...current, ...patch }));
+}
+
+const persistedUiState = readPersistedUiState();
 
 interface LocalLifeSnapshot {
   weather: Record<string, any> | null;
@@ -18,7 +45,7 @@ interface JarvisState {
   agents: JarvisAgent[];
   proactiveMessages: ProactiveMessage[];
   activeAgentId: string;
-  chatHistory: Record<string, Array<{ role: "user" | "agent"; content: string; actions?: ActionResult[] }>>;
+  chatHistory: Record<string, Array<{ role: "user" | "agent"; content: string; actions?: ActionResult[]; routing?: Record<string, unknown> | null }>>;
   isLoading: boolean;
 
   // Local-life snapshot (shared reactive state so every card updates in sync)
@@ -28,6 +55,7 @@ interface JarvisState {
   interactionMode: InteractionMode;
   activeRoundtableScenario: string | null;
   activeRoundtableInput: string;
+  sessionId: string;
 
   loadContext: () => Promise<void>;
   updateContext: (fields: Partial<LifeContext>) => Promise<void>;
@@ -77,6 +105,7 @@ interface JarvisState {
   setInteractionMode: (mode: InteractionMode) => void;
   openPrivateChat: (agentId: string) => void;
   startRoundtable: (scenarioId: string, userInput: string) => void;
+  openConversation: (conversation: ConversationHistoryItem) => Promise<void>;
   startTeamCollaboration: (goal: string, userMessage: string, agents?: string[]) => Promise<TeamCollaborationResponse>;
   closeRoundtable: () => void;
   resetToScenarioGrid: () => void;
@@ -86,14 +115,15 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
   context: null,
   agents: [],
   proactiveMessages: [],
-  activeAgentId: "alfred",
+  activeAgentId: persistedUiState.activeAgentId ?? "alfred",
   chatHistory: {},
   isLoading: false,
   localLife: null,
 
-  interactionMode: "scenario_grid",
-  activeRoundtableScenario: null,
-  activeRoundtableInput: "",
+  interactionMode: persistedUiState.interactionMode ?? "scenario_grid",
+  activeRoundtableScenario: persistedUiState.activeRoundtableScenario ?? null,
+  activeRoundtableInput: persistedUiState.activeRoundtableInput ?? "",
+  sessionId: persistedUiState.sessionId ?? `jarvis-${Date.now()}`,
 
   loadContext: async () => {
     const context = await jarvisApi.getContext();
@@ -122,7 +152,10 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     }));
   },
 
-  setActiveAgent: (agentId) => set({ activeAgentId: agentId }),
+  setActiveAgent: (agentId) => {
+    writePersistedUiState({ activeAgentId: agentId });
+    set({ activeAgentId: agentId });
+  },
 
   sendMessage: async (agentId, message, sessionId) => {
     set((s) => ({
@@ -147,19 +180,36 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
       }));
       throw error;
     }
+    const routedAgentId = response.agent_id || agentId;
+    const agentTurn = {
+      role: "agent" as const,
+      content: response.content,
+      actions: response.actions ?? undefined,
+      routing: response.routing ?? undefined,
+    };
     set((s) => ({
       chatHistory: {
         ...s.chatHistory,
         [agentId]: [
           ...(s.chatHistory[agentId] ?? []),
-          {
-            role: "agent",
-            content: response.content,
-            actions: response.actions ?? undefined,
-          },
+          agentTurn,
         ],
+        ...(routedAgentId !== agentId
+          ? {
+              [routedAgentId]: [
+                ...(s.chatHistory[routedAgentId] ?? []),
+                { role: "user" as const, content: message },
+                agentTurn,
+              ],
+            }
+          : {}),
       },
     }));
+    if (routedAgentId !== agentId) {
+      writePersistedUiState({ activeAgentId: routedAgentId, interactionMode: "private_chat", sessionId });
+      set({ activeAgentId: routedAgentId, interactionMode: "private_chat", sessionId });
+    }
+    window.dispatchEvent(new Event("jarvis:conversation-history-changed"));
     // If the agent executed any actions that may have changed state, refresh.
     if (response.actions && response.actions.length > 0) {
       const mutating = response.actions.some((a) =>
@@ -180,7 +230,7 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     set((s) => ({
       chatHistory: {
         ...s.chatHistory,
-        [agentId]: turns.map((t) => ({ role: t.role, content: t.content })),
+        [agentId]: turns.map((t) => ({ role: t.role, content: t.content, actions: t.actions })),
       },
     }));
   },
@@ -232,17 +282,72 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     await get().refreshAll();
   },
 
-  setInteractionMode: (mode) => set({ interactionMode: mode }),
+  setInteractionMode: (mode) => {
+    writePersistedUiState({ interactionMode: mode });
+    set({ interactionMode: mode });
+  },
 
-  openPrivateChat: (agentId) =>
-    set({ activeAgentId: agentId, interactionMode: "private_chat" }),
+  openPrivateChat: (agentId) => {
+    const sessionId = get().sessionId || `jarvis-${Date.now()}`;
+    writePersistedUiState({ activeAgentId: agentId, interactionMode: "private_chat", sessionId });
+    set({ activeAgentId: agentId, interactionMode: "private_chat", sessionId });
+  },
 
-  startRoundtable: (scenarioId, userInput) =>
+  startRoundtable: (scenarioId, userInput) => {
+    const sessionId = `jarvis-${Date.now()}`;
+    const isBrainstorm = scenarioId === "work_brainstorm";
+    writePersistedUiState({
+      interactionMode: "roundtable",
+      activeRoundtableScenario: scenarioId,
+      activeRoundtableInput: userInput,
+      sessionId,
+    });
+    jarvisApi.saveConversationHistory({
+      conversation_id: `${isBrainstorm ? "brainstorm" : "roundtable"}:${sessionId}`,
+      conversation_type: isBrainstorm ? "brainstorm" : "roundtable",
+      title: `${isBrainstorm ? "工作难题头脑风暴" : "圆桌讨论"}${userInput ? `：${userInput.slice(0, 18)}` : ""}`,
+      scenario_id: scenarioId,
+      session_id: sessionId,
+      route_payload: { mode: "roundtable", scenario_id: scenarioId, user_input: userInput, mode_id: "general" },
+    }).catch(() => {});
     set({
       interactionMode: "roundtable",
       activeRoundtableScenario: scenarioId,
       activeRoundtableInput: userInput,
-    }),
+      sessionId,
+    });
+  },
+
+  openConversation: async (conversation) => {
+    await jarvisApi.openConversationHistory(conversation.id).catch(() => {});
+    const payload = conversation.route_payload ?? {};
+    if (conversation.conversation_type === "private_chat" && conversation.agent_id) {
+      writePersistedUiState({
+        interactionMode: "private_chat",
+        activeAgentId: conversation.agent_id,
+        sessionId: conversation.session_id,
+      });
+      set({ interactionMode: "private_chat", activeAgentId: conversation.agent_id, sessionId: conversation.session_id });
+      await get().loadChatHistory(conversation.agent_id);
+      return;
+    }
+    const scenarioId = conversation.scenario_id ?? (typeof payload.scenario_id === "string" ? payload.scenario_id : null);
+    if (scenarioId) {
+      const userInput = typeof payload.user_input === "string" ? payload.user_input : "";
+      writePersistedUiState({
+        interactionMode: "roundtable",
+        activeRoundtableScenario: scenarioId,
+        activeRoundtableInput: userInput,
+        sessionId: conversation.session_id,
+      });
+      set({
+        interactionMode: "roundtable",
+        activeRoundtableScenario: scenarioId,
+        activeRoundtableInput: userInput,
+        sessionId: conversation.session_id,
+      });
+    }
+  },
 
   startTeamCollaboration: async (goal, userMessage, agents) => {
     return jarvisApi.startTeamCollaboration({
@@ -254,17 +359,23 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
   },
 
   closeRoundtable: () =>
+  {
+    writePersistedUiState({ interactionMode: "scenario_grid", activeRoundtableScenario: null, activeRoundtableInput: "" });
     set({
       interactionMode: "scenario_grid",
       activeRoundtableScenario: null,
       activeRoundtableInput: "",
-    }),
+    });
+  },
 
   resetToScenarioGrid: () =>
+  {
+    writePersistedUiState({ interactionMode: "scenario_grid", activeRoundtableScenario: null, activeRoundtableInput: "" });
     set({
       interactionMode: "scenario_grid",
       activeRoundtableScenario: null,
       activeRoundtableInput: "",
-    }),
+    });
+  },
 }));
 

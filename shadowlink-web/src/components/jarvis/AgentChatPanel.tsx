@@ -1,6 +1,7 @@
 ﻿import React, { useEffect, useRef, useState } from "react";
 import { useJarvisStore } from "@/stores/jarvisStore";
 import { jarvisApi, type ActionResult, type EscalationHint } from "@/services/jarvisApi";
+import { JARVIS_CONVERSATION_HISTORY_CHANGED } from "./ConversationHistoryPanel";
 
 interface Props {
   agentId: string;
@@ -9,6 +10,17 @@ interface Props {
 }
 
 type ConfirmationState = "confirmed" | "cancelled";
+
+interface TaskPlanFormState {
+  goal?: string;
+  targetDate?: string;
+  weeklyDays?: string;
+  dailyMinutes?: string;
+  budget?: string;
+  companions?: string;
+  destination?: string;
+  notes?: string;
+}
 
 const SEVERITY_STYLES: Record<
   EscalationHint["severity"],
@@ -42,6 +54,23 @@ function formatEndTime(value: string): string {
   return new Date(value).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function asList(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => item !== null && typeof item === "object" && !Array.isArray(item)) : [];
+}
+
+function routingTitle(routing: Record<string, unknown>): string {
+  const source = toText(routing.source_agent, "当前 Agent");
+  const target = toText(routing.target_agent, "maxwell");
+  const type = toText(routing.type, "schedule_intent");
+  return type === "task_intent"
+    ? `${source} 已把长期任务规划交给 ${target}`
+    : `${source} 已把日程安排交给 ${target}`;
+}
+
 function isHttpStatus(error: unknown, status: number): boolean {
   return typeof error === "object" && error !== null && "status" in error && (error as { status?: number }).status === status;
 }
@@ -62,6 +91,8 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [escalation, setEscalation] = useState<EscalationHint | null>(null);  const [confirmations, setConfirmations] = useState<Record<string, ConfirmationState>>({});
   const [confirmationErrors, setConfirmationErrors] = useState<Record<string, string>>({});
+  const [confirmationMessages, setConfirmationMessages] = useState<Record<string, string>>({});
+  const [taskPlanForms, setTaskPlanForms] = useState<Record<string, TaskPlanFormState>>({});
   const [confirmingKey, setConfirmingKey] = useState<string | null>(null);
 
   const escalationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -111,6 +142,21 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     handleCancelEscalation();
     startRoundtable(scenarioId, message);
   };
+
+  const saveAndClose = async () => {
+    if (agent) {
+      await jarvisApi.saveConversationHistory({
+        conversation_id: `private:${sessionId}:${agentId}`,
+        conversation_type: "private_chat",
+        title: `${agent.name} 私聊`,
+        agent_id: agentId,
+        session_id: sessionId,
+        route_payload: { mode: "private_chat", agent_id: agentId },
+      }).catch(() => undefined);
+      window.dispatchEvent(new Event(JARVIS_CONVERSATION_HISTORY_CHANGED));
+    }
+    onClose();
+  };
   const handleSend = async () => {
     const message = input.trim();
     if (!message || sending) return;
@@ -120,8 +166,14 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     lastUserMessageRef.current = message;
     try {
       const hint = await sendMessage(agentId, message, sessionId);
-      if (hint) {
-        setEscalation(hint);      }
+      const latestState = useJarvisStore.getState();
+      const visibleAgentId = latestState.activeAgentId || agentId;
+      const updatedAgentHistory = latestState.chatHistory[visibleAgentId] ?? latestState.chatHistory[agentId] ?? [];
+      const updatedLatestAgentTurn = [...updatedAgentHistory].reverse().find((item) => item.role === "agent");
+      const hasUpdatedPendingAction = updatedLatestAgentTurn?.actions?.some((action) => action.pending_confirmation) ?? false;
+      if (hint && !hasUpdatedPendingAction) {
+        setEscalation(hint);
+      }
     } finally {
       setSending(false);
     }
@@ -181,6 +233,71 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
       setConfirmingKey(null);
     }
   };
+
+  const updateTaskPlanForm = (key: string, patch: TaskPlanFormState) => {
+    setTaskPlanForms((prev) => ({ ...prev, [key]: { ...(prev[key] ?? {}), ...patch } }));
+  };
+
+  const buildTaskPlanArguments = (action: ActionResult, key: string): Record<string, unknown> => {
+    const args = action.arguments ?? {};
+    const plan = typeof args.plan === "object" && args.plan !== null ? { ...(args.plan as Record<string, unknown>) } : { ...args };
+    const form = taskPlanForms[key] ?? {};
+    const userConstraints = Array.isArray(plan.user_constraints) ? [...plan.user_constraints] : [];
+    if (form.goal) userConstraints.push(`目标/分数：${form.goal}`);
+    if (form.targetDate) userConstraints.push(`目标日期/考试日期/出发日期：${form.targetDate}`);
+    if (form.weeklyDays) userConstraints.push(`每周可投入天数：${form.weeklyDays}`);
+    if (form.dailyMinutes) userConstraints.push(`每次/每天可投入分钟数：${form.dailyMinutes}`);
+    if (form.destination) userConstraints.push(`目的地：${form.destination}`);
+    if (form.budget) userConstraints.push(`预算：${form.budget}`);
+    if (form.companions) userConstraints.push(`同行人：${form.companions}`);
+    if (form.notes) userConstraints.push(`补充说明：${form.notes}`);
+
+    const timeHorizon = typeof plan.time_horizon === "object" && plan.time_horizon !== null ? { ...(plan.time_horizon as Record<string, unknown>) } : {};
+    if (form.targetDate) {
+      timeHorizon.target_date = form.targetDate;
+      timeHorizon.deadline = form.targetDate;
+    }
+
+    const enrichedPlan = {
+      ...plan,
+      goal: form.goal ? `${toText(plan.goal, toText(plan.title, "后台任务"))}（${form.goal}）` : plan.goal,
+      time_horizon: timeHorizon,
+      user_constraints: userConstraints,
+      user_filled_fields: form,
+    };
+    return { ...args, plan: enrichedPlan, user_filled_fields: form };
+  };
+
+  const confirmTaskPlanAction = async (action: ActionResult, index: number) => {
+    const key = actionKey(action, index);
+    const pendingId = action.pending_action_id ?? action.confirmation_id;
+    if (!pendingId) {
+      setConfirmationErrors((prev) => ({ ...prev, [key]: "缺少待确认任务 ID，请重新让秘书生成任务计划。" }));
+      return;
+    }
+    setConfirmingKey(key);
+    setConfirmationErrors((prev) => ({ ...prev, [key]: "" }));
+    setConfirmationMessages((prev) => ({ ...prev, [key]: "" }));
+    try {
+      const result = await jarvisApi.confirmPendingAction(String(pendingId), {
+        title: toText(action.arguments?.title, "后台任务计划"),
+        arguments: buildTaskPlanArguments(action, key),
+      });
+      const task = result.result?.task as { id?: string; title?: string; persisted?: boolean } | undefined;
+      const taskTitle = task?.title || toText(action.arguments?.title, "后台任务计划");
+      setConfirmations((prev) => ({ ...prev, [key]: "confirmed" }));
+      setConfirmationMessages((prev) => ({ ...prev, [key]: `已保存到后台任务清单：${taskTitle}` }));
+      useJarvisStore.getState().refreshAll().catch(() => undefined);
+    } catch (error) {
+      setConfirmationErrors((prev) => ({
+        ...prev,
+        [key]: error instanceof Error ? error.message : "确认任务计划失败，请稍后重试。",
+      }));
+    } finally {
+      setConfirmingKey(null);
+    }
+  };
+
   const renderAction = (action: ActionResult, index: number) => {
     const key = actionKey(action, index);
     const state = confirmations[key];
@@ -189,6 +306,23 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     const title = toText(args.title, action.title ?? "待确认日程");
     const start = toText(args.start, action.start ?? "");
     const end = toText(args.end, action.end ?? "");
+    const scheduleGuard = asRecord(args.schedule_guard);
+    const guardSummary = toText(scheduleGuard.summary);
+    const guardRecommendation = toText(scheduleGuard.recommendation);
+    const guardConflicts = asList(scheduleGuard.conflicts);
+    const guardAlternatives = asList(scheduleGuard.alternatives);
+
+    if (action.type === "schedule_intent" || action.type === "task_intent") {
+      const intent = asRecord(action.arguments);
+      const matched = Array.isArray(intent.matched_keywords) ? intent.matched_keywords.map(String).join("、") : "";
+      return (
+        <div key={key} className="w-full rounded-2xl border border-indigo-200 bg-indigo-50 p-3 text-xs text-indigo-900">
+          <div className="text-sm font-semibold">{routingTitle(intent)}</div>
+          <div className="mt-1">秘书 Maxwell 将统一判断：生成日程卡、长期任务卡，或先追问必要信息。</div>
+          {matched ? <div className="mt-1 text-indigo-700">命中意图：{matched}</div> : null}
+        </div>
+      );
+    }
 
     if (action.pending_confirmation && action.type === "calendar.add") {
       return (
@@ -198,6 +332,24 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
           <div className="mt-1 text-amber-700">
             {formatDateTime(start)}{end ? ` - ${formatEndTime(end)}` : ""}
           </div>
+          {guardSummary ? (
+            <div className={`mt-2 rounded-xl border p-2 ${guardRecommendation === "move" ? "border-red-200 bg-red-50 text-red-700" : "border-amber-200 bg-white/70 text-amber-800"}`}>
+              <div className="font-semibold">秘书判断：{guardRecommendation === "move" ? "建议调整时间" : guardRecommendation === "review" ? "建议复核" : "可执行"}</div>
+              <div className="mt-1">{guardSummary}</div>
+              {guardConflicts.length > 0 && (
+                <div className="mt-1 space-y-0.5">
+                  {guardConflicts.slice(0, 2).map((item, itemIndex) => (
+                    <div key={itemIndex}>冲突：{toText(item.title, "已有日程")}（{formatDateTime(toText(item.start))} - {formatEndTime(toText(item.end))}）</div>
+                  ))}
+                </div>
+              )}
+              {guardAlternatives.length > 0 && (
+                <div className="mt-1 text-[11px]">
+                  可选空档：{guardAlternatives.slice(0, 2).map((item) => `${formatDateTime(toText(item.start))} - ${formatEndTime(toText(item.end))}`).join("；")}
+                </div>
+              )}
+            </div>
+          ) : null}
           {state ? (
             <div className="mt-2 font-medium">{state === "confirmed" ? "已写入日程" : "已取消写入"}</div>
           ) : (
@@ -211,6 +363,71 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
               </button>
               <button
                 className="px-3 py-1.5 rounded-lg border border-amber-200 bg-white text-amber-700 hover:bg-amber-100"
+                onClick={async () => { const pendingId = action.pending_action_id ?? action.confirmation_id; if (pendingId) await jarvisApi.cancelPendingAction(String(pendingId)); setConfirmations((prev) => ({ ...prev, [key]: "cancelled" })); }}
+              >
+                取消
+              </button>
+            </div>
+          )}
+          {error ? <div className="mt-2 text-red-600">{error}</div> : null}
+        </div>
+      );
+    }
+
+    if (action.pending_confirmation && action.type === "task.plan") {
+      const plan = typeof args.plan === "object" && args.plan !== null ? args.plan as Record<string, unknown> : args;
+      const planTitle = toText(plan.title, toText(args.title, "后台任务计划"));
+      const classification = toText(args.classification, toText(plan.type, "project"));
+      const questions = Array.isArray(args.clarifying_questions) ? args.clarifying_questions.slice(0, 3) : [];
+      const milestones = Array.isArray(plan.milestones) ? plan.milestones.slice(0, 3) : [];
+      const form = taskPlanForms[key] ?? {};
+      const isTravel = planTitle.includes("旅行") || planTitle.includes("旅游");
+      return (
+        <div key={key} className="w-full rounded-2xl border border-blue-200 bg-blue-50 p-3 text-xs text-blue-900">
+          <div className="text-sm font-semibold">待确认长期/后台任务计划</div>
+          <div className="mt-1 font-medium">{planTitle}</div>
+          <div className="mt-1 text-blue-700">类型：{classification}</div>
+          {milestones.length > 0 && (
+            <div className="mt-2 space-y-1">
+              {milestones.map((item, itemIndex) => (
+                <div key={itemIndex}>- {toText((item as Record<string, unknown>).title, String(item))}</div>
+              ))}
+            </div>
+          )}
+          {questions.length > 0 && <div className="mt-2 text-blue-700">请直接在下面补充关键信息，秘书会把它们一起保存到任务里。</div>}
+          {!state && (
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              {isTravel ? (
+                <>
+                  <input className="rounded-lg border border-blue-200 bg-white px-2 py-1.5" placeholder="目的地，例如：大阪" value={form.destination ?? ""} onChange={(event) => updateTaskPlanForm(key, { destination: event.target.value })} />
+                  <input className="rounded-lg border border-blue-200 bg-white px-2 py-1.5" type="date" value={form.targetDate ?? ""} onChange={(event) => updateTaskPlanForm(key, { targetDate: event.target.value })} />
+                  <input className="rounded-lg border border-blue-200 bg-white px-2 py-1.5" placeholder="预算，例如：8000 元" value={form.budget ?? ""} onChange={(event) => updateTaskPlanForm(key, { budget: event.target.value })} />
+                  <input className="rounded-lg border border-blue-200 bg-white px-2 py-1.5" placeholder="同行人，例如：2 人/自己" value={form.companions ?? ""} onChange={(event) => updateTaskPlanForm(key, { companions: event.target.value })} />
+                </>
+              ) : (
+                <>
+                  <input className="rounded-lg border border-blue-200 bg-white px-2 py-1.5" placeholder="目标，例如：雅思 7 分" value={form.goal ?? ""} onChange={(event) => updateTaskPlanForm(key, { goal: event.target.value })} />
+                  <input className="rounded-lg border border-blue-200 bg-white px-2 py-1.5" type="date" value={form.targetDate ?? ""} onChange={(event) => updateTaskPlanForm(key, { targetDate: event.target.value })} />
+                  <input className="rounded-lg border border-blue-200 bg-white px-2 py-1.5" placeholder="每周几天，例如：4" value={form.weeklyDays ?? ""} onChange={(event) => updateTaskPlanForm(key, { weeklyDays: event.target.value })} />
+                  <input className="rounded-lg border border-blue-200 bg-white px-2 py-1.5" placeholder="每次多少分钟，例如：60" value={form.dailyMinutes ?? ""} onChange={(event) => updateTaskPlanForm(key, { dailyMinutes: event.target.value })} />
+                </>
+              )}
+              <textarea className="col-span-2 rounded-lg border border-blue-200 bg-white px-2 py-1.5 min-h-16" placeholder="补充约束/偏好，可不填" value={form.notes ?? ""} onChange={(event) => updateTaskPlanForm(key, { notes: event.target.value })} />
+            </div>
+          )}
+          {state ? (
+            <div className="mt-2 font-medium">{state === "confirmed" ? (confirmationMessages[key] || "已保存到后台任务清单，可在日历 → 查看所有任务里看到") : "已取消"}</div>
+          ) : (
+            <div className="mt-3 flex gap-2">
+              <button
+                className="px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-60"
+                disabled={confirmingKey === key}
+                onClick={() => confirmTaskPlanAction(action, index)}
+              >
+                {confirmingKey === key ? "加入中…" : "确认加入后台任务"}
+              </button>
+              <button
+                className="px-3 py-1.5 rounded-lg border border-blue-200 bg-white text-blue-700 hover:bg-blue-100"
                 onClick={async () => { const pendingId = action.pending_action_id ?? action.confirmation_id; if (pendingId) await jarvisApi.cancelPendingAction(String(pendingId)); setConfirmations((prev) => ({ ...prev, [key]: "cancelled" })); }}
               >
                 取消
@@ -268,7 +485,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
           >
             清空
           </button>
-          <button onClick={onClose} className="text-sm px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors">
+          <button onClick={saveAndClose} className="text-sm px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors">
             返回
           </button>
         </div>
@@ -279,6 +496,12 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
         {!loadingHistory && history.length === 0 && <p className="text-center text-sm text-gray-400 mt-8">和 {agent.name} 开始对话…</p>}
         {history.map((message, index) => (
           <div key={index} className={`flex flex-col gap-1 ${message.role === "user" ? "items-end" : "items-start"}`}>
+            {message.role === "agent" && message.routing && (
+              <div className="max-w-[75%] rounded-2xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-900">
+                <div className="font-semibold">{routingTitle(message.routing)}</div>
+                <div className="mt-1">当前由秘书 Maxwell 接管安排，避免非秘书 Agent 直接写日程或长期计划。</div>
+              </div>
+            )}
             <div
               className="max-w-[75%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap"
               style={

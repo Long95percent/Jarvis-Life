@@ -100,18 +100,75 @@ export interface ActionResult {
   fields?: Record<string, unknown>;
 }
 
+export interface BackgroundTask {
+  id: string;
+  title: string;
+  task_type: string;
+  status: string;
+  source_agent?: string | null;
+  original_user_request: string;
+  goal?: string | null;
+  time_horizon: Record<string, unknown>;
+  milestones: Array<Record<string, unknown>>;
+  subtasks: Array<Record<string, unknown>>;
+  calendar_candidates: Array<Record<string, unknown>>;
+  notes?: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
 export interface ChatResponse {
   agent_id: string;
   agent_name: string;
   content: string;
   escalation?: EscalationHint | null;
   actions?: ActionResult[] | null;
+  routing?: Record<string, unknown> | null;
 }
 
 export interface ChatHistoryTurn {
   role: "user" | "agent";
   content: string;
+  actions?: ActionResult[];
   timestamp: number;
+}
+
+export interface RoundtableTurn {
+  role: string;
+  speaker_name: string;
+  content: string;
+  timestamp: number;
+}
+
+export interface JarvisMemory {
+  id: number;
+  memory_kind: string;
+  content: string;
+  source_agent: string;
+  session_id?: string | null;
+  source_text?: string | null;
+  structured_payload: Record<string, unknown>;
+  sensitivity: "normal" | "private" | "sensitive" | string;
+  confidence: number;
+  importance: number;
+  created_at: number;
+  updated_at: number;
+  last_used_at?: number | null;
+  status: string;
+}
+
+export interface ConversationHistoryItem {
+  id: string;
+  conversation_type: "private_chat" | "roundtable" | "brainstorm" | string;
+  title: string;
+  agent_id?: string | null;
+  scenario_id?: string | null;
+  session_id: string;
+  route_payload: Record<string, unknown>;
+  status: string;
+  created_at: number;
+  updated_at: number;
+  last_opened_at?: number | null;
 }
 
 
@@ -205,6 +262,66 @@ export const jarvisApi = {
 
   async clearChatHistory(agentId: string): Promise<void> {
     await fetch(`${BASE}/chat/${agentId}/history`, { method: "DELETE" });
+  },
+
+  async listMemories(params?: { memoryKind?: string; limit?: number }): Promise<JarvisMemory[]> {
+    const query = new URLSearchParams();
+    if (params?.memoryKind) query.set("memory_kind", params.memoryKind);
+    if (params?.limit) query.set("limit", String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const res = await fetch(`${BASE}/memories${suffix}`);
+    if (!res.ok) throw await errorFromResponse(res, `list memories HTTP ${res.status}`);
+    const data = await res.json();
+    return Array.isArray(data?.memories) ? data.memories : [];
+  },
+
+  async deleteMemory(memoryId: number): Promise<void> {
+    const res = await fetch(`${BASE}/memories/${memoryId}`, { method: "DELETE" });
+    if (!res.ok) throw await errorFromResponse(res, `delete memory HTTP ${res.status}`);
+  },
+
+  async listConversationHistory(limit = 30): Promise<ConversationHistoryItem[]> {
+    const res = await fetch(`${BASE}/conversation-history?limit=${limit}`);
+    if (!res.ok) throw await errorFromResponse(res, `conversation history HTTP ${res.status}`);
+    const data = await res.json();
+    return Array.isArray(data?.conversations) ? data.conversations : [];
+  },
+
+  async saveConversationHistory(payload: {
+    conversation_id: string;
+    conversation_type: "private_chat" | "roundtable" | "brainstorm";
+    title: string;
+    agent_id?: string | null;
+    scenario_id?: string | null;
+    session_id: string;
+    route_payload: Record<string, unknown>;
+  }): Promise<ConversationHistoryItem> {
+    const res = await fetch(`${BASE}/conversation-history`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `save conversation HTTP ${res.status}`);
+    const data = await res.json();
+    return data.conversation;
+  },
+
+  async openConversationHistory(conversationId: string): Promise<ConversationHistoryItem> {
+    const res = await fetch(`${BASE}/conversation-history/${encodeURIComponent(conversationId)}/open`, { method: "POST" });
+    if (!res.ok) throw await errorFromResponse(res, `open conversation HTTP ${res.status}`);
+    const data = await res.json();
+    return data.conversation;
+  },
+
+  async deleteConversationHistory(conversationId: string): Promise<void> {
+    const res = await fetch(`${BASE}/conversation-history/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
+    if (!res.ok) throw await errorFromResponse(res, `delete conversation HTTP ${res.status}`);
+  },
+
+  async getRoundtableTurns(sessionId: string): Promise<RoundtableTurn[]> {
+    const res = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/turns`);
+    if (!res.ok) return [];
+    return res.json();
   },
 
   async getLocalLife(force = false): Promise<any> {
@@ -303,7 +420,11 @@ export const jarvisApi = {
   async confirmPendingAction(
     pendingId: string,
     payload?: { title?: string; arguments?: Record<string, unknown> },
-  ): Promise<{ pending_action: PendingAction; result: { event: CalendarEvent } }> {
+  ): Promise<{
+    pending_action: PendingAction | null;
+    result: { event?: CalendarEvent; task?: BackgroundTask } & Record<string, unknown>;
+    fallback?: boolean;
+  }> {
     const res = await fetch(`${BASE}/pending-actions/${pendingId}/confirm`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -316,6 +437,15 @@ export const jarvisApi = {
   async cancelPendingAction(pendingId: string): Promise<PendingAction> {
     const res = await fetch(`${BASE}/pending-actions/${pendingId}/cancel`, { method: "POST" });
     if (!res.ok) throw await errorFromResponse(res, `cancel pending action HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async listBackgroundTasks(status?: string): Promise<BackgroundTask[]> {
+    const params = new URLSearchParams();
+    if (status) params.set("status", status);
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    const res = await fetch(`${BASE}/background-tasks${suffix}`);
+    if (!res.ok) return [];
     return res.json();
   },
 

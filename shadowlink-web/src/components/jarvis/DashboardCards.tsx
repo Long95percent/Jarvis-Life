@@ -61,8 +61,8 @@ const ScheduleCard: React.FC<{ onOpenCalendar?: () => void }> = ({ onOpenCalenda
       {events.length === 0 ? (
         <p className="text-xs text-gray-400 py-3 text-center">今天暂无安排</p>
       ) : (
-        <ul className="space-y-1.5 max-h-32 overflow-y-auto">
-          {events.slice(0, 5).map((event, index) => (
+        <ul className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+          {events.map((event, index) => (
             <li key={event.id ?? index} className="flex items-center gap-2 text-xs text-gray-700">
               <span className="w-1 h-1 rounded-full bg-[var(--color-primary)] flex-shrink-0" />
               <span className="truncate flex-1">{event.title}</span>

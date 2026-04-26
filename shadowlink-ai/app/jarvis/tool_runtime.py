@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from typing import Any
 
@@ -34,11 +35,109 @@ _CONFIRMATION_TYPE_BY_TOOL = {
     "jarvis_context_update": "context.set",
     "jarvis_checkin_schedule": "checkin.schedule",
     "jarvis_mood_journal": "mood.journal",
+    "jarvis_task_plan_decompose": "task.plan",
 }
 
 
 def _get_registry():
     return get_resource("tool_registry")
+
+
+def _parse_iso_datetime(raw: Any) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        value = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _timestamp(value: datetime | None) -> float:
+    return value.timestamp() if value is not None else 0.0
+
+
+def _build_schedule_guard(arguments: dict[str, Any]) -> dict[str, Any] | None:
+    start = _parse_iso_datetime(arguments.get("start"))
+    end = _parse_iso_datetime(arguments.get("end"))
+    if start is None or end is None:
+        return None
+
+    now = datetime.utcnow()
+    duration_minutes = max(15, int((_timestamp(end) - _timestamp(start)) / 60))
+    horizon_hours = max(24, int((_timestamp(end) - now.timestamp()) / 3600) + 48)
+    try:
+        from app.mcp.adapters.calendar_adapter import get_upcoming_events
+
+        events = get_upcoming_events(hours_ahead=horizon_hours)
+    except Exception:
+        events = []
+
+    conflicts: list[dict[str, Any]] = []
+    for event in events:
+        event_start = getattr(event, "start", None)
+        event_end = getattr(event, "end", None)
+        if event_start is None or event_end is None:
+            continue
+        if _timestamp(event_end) > _timestamp(start) and _timestamp(event_start) < _timestamp(end):
+            conflicts.append({
+                "id": getattr(event, "id", None),
+                "title": getattr(event, "title", "已有日程"),
+                "start": event_start.isoformat(),
+                "end": event_end.isoformat(),
+                "stress_weight": getattr(event, "stress_weight", 1.0),
+            })
+
+    window_start = max(now, start - timedelta(hours=12))
+    window_end = end + timedelta(hours=36)
+    sorted_events = sorted(
+        [
+            item for item in events
+            if getattr(item, "start", None) is not None and getattr(item, "end", None) is not None
+            and _timestamp(getattr(item, "end")) > _timestamp(window_start)
+            and _timestamp(getattr(item, "start")) < _timestamp(window_end)
+        ],
+        key=lambda item: _timestamp(getattr(item, "start")),
+    )
+    alternatives: list[dict[str, str]] = []
+    cursor = window_start
+    buffer = timedelta(minutes=15)
+    required_seconds = duration_minutes * 60
+    for event in sorted_events:
+        gap_end = getattr(event, "start") - buffer
+        if _timestamp(gap_end) - _timestamp(cursor) >= required_seconds:
+            alt_end = cursor + timedelta(minutes=duration_minutes)
+            alternatives.append({"start": cursor.isoformat(), "end": alt_end.isoformat()})
+        cursor = max(cursor, getattr(event, "end") + buffer)
+        if len(alternatives) >= 3:
+            break
+    if len(alternatives) < 3 and _timestamp(window_end) - _timestamp(cursor) >= required_seconds:
+        alternatives.append({"start": cursor.isoformat(), "end": (cursor + timedelta(minutes=duration_minutes)).isoformat()})
+
+    is_past = _timestamp(start) <= now.timestamp()
+    density_score = sum(float(getattr(event, "stress_weight", 1.0) or 1.0) for event in sorted_events)
+    recommendation = "keep"
+    reasons: list[str] = []
+    if is_past:
+        recommendation = "move"
+        reasons.append("开始时间已经早于当前时间")
+    if conflicts:
+        recommendation = "move"
+        reasons.append(f"与 {len(conflicts)} 条已有日程冲突")
+    if density_score >= 6:
+        if recommendation == "keep":
+            recommendation = "review"
+        reasons.append("附近日程密度偏高，建议留出缓冲")
+
+    return {
+        "checked": True,
+        "recommendation": recommendation,
+        "summary": "；".join(reasons) if reasons else "未发现明显时间冲突，安排可执行。",
+        "conflicts": conflicts,
+        "alternatives": alternatives[:3],
+    }
 
 
 def get_allowed_tool_names(agent_id: str) -> list[str]:
@@ -266,14 +365,19 @@ async def execute_tool_calls(agent_id: str, calls: list[dict[str, Any]]) -> list
 
         tool_info, handler = registered
 
-        if getattr(handler, "requires_confirmation", False):
+        if getattr(handler, "requires_confirmation", False) and tool_name != "jarvis_task_plan_decompose":
+            confirmation_arguments = dict(arguments)
+            if tool_name == "jarvis_calendar_add":
+                schedule_guard = _build_schedule_guard(confirmation_arguments)
+                if schedule_guard is not None:
+                    confirmation_arguments["schedule_guard"] = schedule_guard
             results.append({
                 "tool_name": tool_name,
                 "success": True,
                 "requires_confirmation": True,
                 "confirmation_id": uuid4().hex,
                 "description": tool_info.description,
-                "arguments": arguments,
+                "arguments": confirmation_arguments,
             })
             continue
 
@@ -287,6 +391,8 @@ async def execute_tool_calls(agent_id: str, calls: list[dict[str, Any]]) -> list
             results.append({
                 "tool_name": tool_name,
                 "success": True,
+                "requires_confirmation": bool(getattr(handler, "requires_confirmation", False)),
+                "confirmation_id": uuid4().hex if getattr(handler, "requires_confirmation", False) else None,
                 "description": tool_info.description,
                 "output": output,
             })
@@ -313,17 +419,22 @@ def to_action_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "jarvis_context_update",
             "jarvis_checkin_schedule",
             "jarvis_mood_journal",
+            "jarvis_task_plan_decompose",
         }:
             continue
 
         if item.get("requires_confirmation"):
+            output = item.get("output") if isinstance(item.get("output"), dict) else {}
+            arguments = item.get("arguments", {})
+            if output:
+                arguments = {**arguments, **output}
             action_results.append({
                 "type": _CONFIRMATION_TYPE_BY_TOOL.get(tool_name, tool_name),
                 "ok": True,
                 "pending_confirmation": True,
                 "confirmation_id": item.get("confirmation_id"),
                 "tool_name": tool_name,
-                "arguments": item.get("arguments", {}),
+                "arguments": arguments,
                 "description": item.get("description", ""),
             })
         elif item.get("success"):

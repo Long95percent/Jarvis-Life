@@ -67,6 +67,7 @@ public class JarvisProxyController {
                     "/pending-actions/{pendingId}",
                     "/pending-actions/{pendingId}/confirm",
                     "/pending-actions/{pendingId}/cancel",
+                    "/background-tasks",
                     "/team/collaborate",
                     "/scenarios",
                     "/proactive/fire",

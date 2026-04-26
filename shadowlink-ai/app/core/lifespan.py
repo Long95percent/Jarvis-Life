@@ -120,6 +120,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         JarvisPlanActivitySlotTool,
         JarvisRouteEstimateTool,
         JarvisSpecialistOrchestrateTool,
+        JarvisTaskPlanDecomposeTool,
         JarvisTaskPrioritizeTool,
         JarvisWeatherTool,
     )
@@ -144,6 +145,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         JarvisCalendarDeleteTool(),
         JarvisCalendarUpdateTool(),
         JarvisMeetingBriefTool(),
+        JarvisTaskPlanDecomposeTool(),
         JarvisTaskPrioritizeTool(),
         JarvisDeadlineCheckTool(),
         JarvisCalendarFindFreeSlotTool(),

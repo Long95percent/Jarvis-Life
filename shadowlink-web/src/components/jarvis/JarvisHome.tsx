@@ -1,32 +1,26 @@
-// shadowlink-web/src/components/jarvis/JarvisHome.tsx
+﻿// shadowlink-web/src/components/jarvis/JarvisHome.tsx
 import React, { useMemo, useState } from "react";
 import { useJarvisStore } from "@/stores/jarvisStore";
 import { AgentCard } from "./AgentCard";
-import { ProactiveMessageFeed } from "./ProactiveMessageFeed";
 import { ScenarioGrid } from "./ScenarioGrid";
 import { RoundtableStage } from "./RoundtableStage";
 import { AgentChatPanel } from "./AgentChatPanel";
 import { DashboardCards } from "./DashboardCards";
 import { CalendarPanel } from "./CalendarPanel";
+import { MemoryPanel } from "./MemoryPanel";
+import { ConversationHistoryPanel } from "./ConversationHistoryPanel";
 
 /**
- * JarvisHome — the unified command center.
+ * JarvisHome 鈥?the unified command center.
  *
  * Layout (CSS grid):
- *   ┌────────────────────────────────────────────────────┬───────────────┐
- *   │  Zone 1: dashboard cards (schedule / state / wx)   │               │
- *   ├────────────────────────────────────────────────────┤  Zone 3:      │
- *   │                                                    │  proactive    │
- *   │  Zone 2: interaction area                          │  feed         │
- *   │  (scenarios · roundtable · private chat)           │               │
- *   └────────────────────────────────────────────────────┴───────────────┘
- */
+ *   鈹屸攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹? *   鈹? Zone 1: dashboard cards (schedule / state / wx)   鈹?              鈹? *   鈹溾攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹? Zone 3:      鈹? *   鈹?                                                   鈹? proactive    鈹? *   鈹? Zone 2: interaction area                          鈹? feed         鈹? *   鈹? (scenarios 路 roundtable 路 private chat)           鈹?              鈹? *   鈹斺攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹粹攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹? */
 export const JarvisHome: React.FC = () => {
   const [calendarOpen, setCalendarOpen] = useState(false);
   const agents = useJarvisStore((s) => s.agents);
   const proactiveMessages = useJarvisStore((s) => s.proactiveMessages);
-  const markMessageRead = useJarvisStore((s) => s.markMessageRead);
   const activeAgentId = useJarvisStore((s) => s.activeAgentId);
+  const sessionId = useJarvisStore((s) => s.sessionId);
   const interactionMode = useJarvisStore((s) => s.interactionMode);
   const activeRoundtableScenario = useJarvisStore(
     (s) => s.activeRoundtableScenario,
@@ -40,7 +34,6 @@ export const JarvisHome: React.FC = () => {
   const closeRoundtable = useJarvisStore((s) => s.closeRoundtable);
   const resetToScenarioGrid = useJarvisStore((s) => s.resetToScenarioGrid);
 
-  const sessionId = useMemo(() => `jarvis-${Date.now()}`, []);
   const unreadCounts = useMemo(
     () =>
       Object.fromEntries(
@@ -96,8 +89,7 @@ export const JarvisHome: React.FC = () => {
               </div>
               {agents.length === 0 && (
                 <p className="text-xs text-gray-400 text-center py-4">
-                  加载中…
-                </p>
+                  鍔犺浇涓€?                </p>
               )}
             </div>
             <div className="flex-1 min-w-0">
@@ -127,26 +119,16 @@ export const JarvisHome: React.FC = () => {
           />
         )}
       </section>
-
-      {/* Zone 3: proactive feed (spans both rows on the right) */}
+      {/* Zone 3: memory + proactive feed (spans both rows on the right) */}
       <aside
-        className="col-start-2 row-start-1 row-span-2 min-h-0 rounded-2xl border border-gray-200 bg-white p-4 overflow-hidden flex flex-col"
+        className="col-start-2 row-start-1 row-span-2 min-h-0 flex flex-col gap-4 overflow-hidden"
       >
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-sm font-semibold text-gray-700">主动消息</h3>
-          {proactiveMessages.filter((m) => !m.read).length > 0 && (
-            <span className="px-1.5 py-0.5 rounded-full bg-red-100 text-red-600 text-xs">
-              {proactiveMessages.filter((m) => !m.read).length}
-            </span>
-          )}
+        <div className="min-h-0 flex-[1.15]">
+          <MemoryPanel />
         </div>
-        <div className="flex-1 min-h-0 overflow-y-auto -mx-1 px-1">
-          <ProactiveMessageFeed
-            messages={proactiveMessages}
-            onRead={markMessageRead}
-          />
-        </div>
+        <ConversationHistoryPanel />
       </aside>
     </div>
   );
 };
+

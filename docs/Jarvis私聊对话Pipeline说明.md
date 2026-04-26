@@ -369,3 +369,70 @@ Maxwell: ...
 3. 看前端聊天错误中返回的 `阶段`。
 4. 如果阶段是 `run_agent_turn`，优先看 Provider 错误。
 5. 如果阶段是 `prepare_context`，优先看本地 SQLite、用户设置、上下文总线、时区。
+
+## 8. Team Collaboration Layer（2026-04-25 增量落地）
+
+### 8.1 私聊触发方式
+
+普通私聊仍由 `/api/v1/jarvis/chat` 返回 `escalation` hint。前端不再自动倒计时进入圆桌/brainstorm，而是在输入框上方显示一张确认卡：
+
+- 按钮“进入协作模式”：调用 `startRoundtable(scenario_id, lastUserMessage)`。
+- 按钮“暂不进入”：只关闭卡片，保留私聊上下文。
+
+这样用户始终拥有是否进入 Brainstorm / Team Collaboration 的决定权。
+
+### 8.2 真实协作 API
+
+新增 REST 接口：`POST /api/v1/jarvis/team/collaborate`。
+
+请求体：
+
+```json
+{
+  "goal": "要协作解决的目标",
+  "user_message": "用户最新消息",
+  "agents": ["maxwell", "mira", "nora"],
+  "source_agent": "maxwell",
+  "session_id": "可选会话 ID"
+}
+```
+
+执行逻辑：
+
+1. 校验并选择专家 Agent。
+2. 读取当前 LifeContext。
+3. 逐个调用专家 Agent 的 `system_prompt`，要求每个角色只从自身职能输出 JSON：
+
+```json
+{
+  "agent_id": "maxwell",
+  "agent_name": "Maxwell",
+  "focus": "...",
+  "priority": "low|medium|high",
+  "advice": ["..."],
+  "needs_from": ["agent_id or user"],
+  "risk": "..."
+}
+```
+
+4. 调用 Alfred 做综合汇总，输出：
+
+```json
+{
+  "summary": "...",
+  "aligned_actions": ["..."],
+  "conflicts": ["..."],
+  "followups": ["..."],
+  "handoffs": [{"from": "mira", "to": "maxwell", "reason": "..."}]
+}
+```
+
+5. 调用 `remember_coordination_summary()` 写入协作记忆。
+6. 返回 `team.collaboration` 响应，供后续 UI、云图和私聊上下文使用。
+
+### 8.3 当前边界
+
+- 已是真实 LLM 多角色调用，不是 mock。
+- 已保存协作结果到本地 `collaboration_memories`。
+- 目前 UI 仍优先复用 Roundtable / Brainstorm 页面展示深度讨论。
+- 下一步可把 `/team/collaborate` 的 `handoffs` 与 `specialists` 接入关系云图。

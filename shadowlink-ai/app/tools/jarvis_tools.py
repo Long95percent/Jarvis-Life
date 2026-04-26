@@ -1,4 +1,4 @@
-"""Jarvis-specific tools registered into the unified ToolRegistry.
+﻿"""Jarvis-specific tools registered into the unified ToolRegistry.
 
 These tools expose life-domain data through the same MCP/registry surface
 used elsewhere in the project, so Jarvis agents can be connected via
@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -1072,6 +1073,138 @@ class JarvisMeetingBriefTool(ShadowLinkTool):
             "summary": summary,
         }
 
+
+class JarvisTaskPlanDecomposeInput(BaseModel):
+    user_request: str = Field(description="Original user request or routed task intent")
+    source_agent: str = Field(default="maxwell", description="Agent that detected or owns this task")
+    target_start: str | None = Field(default=None, description="Optional preferred project start date/time in ISO8601")
+    target_end: str | None = Field(default=None, description="Optional preferred project end/deadline in ISO8601")
+    user_constraints: list[str] = Field(default_factory=list, description="Known constraints and preferences")
+
+
+class JarvisTaskPlanDecomposeTool(ShadowLinkTool):
+    name: str = "jarvis_task_plan_decompose"
+    description: str = "Maxwell-only skill: classify and decompose short/long/future user goals into a background task plan with editable schedule candidates."
+    args_schema: type[BaseModel] = JarvisTaskPlanDecomposeInput
+    category: ToolCategory = ToolCategory.SYSTEM
+    requires_confirmation: bool = True
+
+    def _run(
+        self,
+        user_request: str,
+        source_agent: str = "maxwell",
+        target_start: str | None = None,
+        target_end: str | None = None,
+        user_constraints: list[str] | None = None,
+    ) -> dict:
+        raise NotImplementedError("Use async version")
+
+    async def _arun(
+        self,
+        user_request: str,
+        source_agent: str = "maxwell",
+        target_start: str | None = None,
+        target_end: str | None = None,
+        user_constraints: list[str] | None = None,
+    ) -> dict:
+        text = user_request.strip()
+        if not text:
+            return {"type": "task.plan", "ok": False, "error": "missing user_request"}
+
+        lowered = text.lower()
+        long_markers = ["雅思", "ielts", "考研", "考试", "一个月", "暑假", "长期", "今年", "旅行", "旅游", "搬家", "作品集"]
+        recurring_markers = ["每天", "每周", "每月", "长期", "一直", "坚持"]
+        future_markers = ["暑假", "之后", "以后", "一个月后", "放假", "明年", "下个月"]
+        if any(marker in lowered for marker in ["ielts"]):
+            classification = "long_project"
+        elif any(marker in text for marker in future_markers):
+            classification = "future_project"
+        elif any(marker in text for marker in recurring_markers):
+            classification = "recurring_plan"
+        elif any(marker in text for marker in long_markers):
+            classification = "long_project"
+        else:
+            classification = "short_project"
+
+        now = datetime.utcnow()
+        start_hint = target_start or now.isoformat()
+        end_hint = target_end
+        title = text[:32]
+        if "雅思" in text or "ielts" in lowered:
+            title = "雅思备考计划"
+            milestones = [
+                {"title": "确认目标分数与考试日期", "target_date": target_start or "待用户确认"},
+                {"title": "完成词汇与听力第一轮", "target_date": target_end or "开始后第 4 周"},
+                {"title": "完成一次全真模拟与复盘", "target_date": target_end or "开始后第 6 周"},
+            ]
+            subtasks = [
+                {"title": "听力/阅读训练", "schedule_policy": "每周 3 次，每次 60 分钟", "estimated_minutes": 60},
+                {"title": "口语素材与跟读", "schedule_policy": "每周 2 次，每次 45 分钟", "estimated_minutes": 45},
+                {"title": "写作批改与复盘", "schedule_policy": "每周 1 次，每次 90 分钟", "estimated_minutes": 90},
+            ]
+            calendar_candidates = [
+                {"title": "雅思听力/阅读训练", "preferred_period": "evening", "duration_minutes": 60, "repeat": "weekly:3", "editable": True},
+                {"title": "雅思写作训练", "preferred_period": "weekend_morning", "duration_minutes": 90, "repeat": "weekly:1", "editable": True},
+            ]
+            questions = ["目标分数是多少？", "预计什么时候考试？", "每周能稳定投入几天、每天多久？"]
+        elif "旅游" in text or "旅行" in text or "玩" in text:
+            title = "旅行筹备计划"
+            milestones = [
+                {"title": "确认目的地、预算和同行人", "target_date": target_start or "待用户确认"},
+                {"title": "查询交通与住宿", "target_date": "出行前 4-6 周"},
+                {"title": "预订酒店与核心交通", "target_date": "出行前 3-4 周"},
+                {"title": "整理证件、天气、路线和行李", "target_date": "出行前 1 周"},
+            ]
+            subtasks = [
+                {"title": "确认旅行偏好与预算", "schedule_policy": "启动计划当天", "estimated_minutes": 30},
+                {"title": "查酒店和路线", "schedule_policy": "启动后 1 周内", "estimated_minutes": 60},
+                {"title": "出发前检查清单", "schedule_policy": "出发前 3 天", "estimated_minutes": 30},
+            ]
+            calendar_candidates = [
+                {"title": "启动旅行计划：确认目的地/预算/时间", "preferred_period": "evening", "duration_minutes": 30, "editable": True},
+                {"title": "查询酒店与路线", "preferred_period": "weekend_afternoon", "duration_minutes": 60, "editable": True},
+            ]
+            questions = ["目的地是哪里？", "预计几号出发、几号回来？", "预算和同行人有要求吗？"]
+        else:
+            milestones = [
+                {"title": "明确目标和完成标准", "target_date": target_start or "待用户确认"},
+                {"title": "完成第一轮推进", "target_date": target_end or "开始后 1 周"},
+            ]
+            subtasks = [
+                {"title": f"推进：{title}", "schedule_policy": "近期找空档", "estimated_minutes": 45},
+            ]
+            calendar_candidates = [
+                {"title": title, "preferred_period": "any", "duration_minutes": 45, "editable": True},
+            ]
+            questions = ["这个任务最晚希望什么时候完成？", "每次适合投入多长时间？"]
+
+        task_id = f"task_{uuid4().hex}"
+        plan = {
+            "id": task_id,
+            "title": title,
+            "type": classification,
+            "status": "draft",
+            "source_agent": source_agent,
+            "original_user_request": text,
+            "goal": title,
+            "time_horizon": {"start_after": start_hint, "target_date": end_hint, "deadline": target_end},
+            "milestones": milestones,
+            "subtasks": subtasks,
+            "calendar_candidates": calendar_candidates,
+            "clarifying_questions": questions,
+            "user_constraints": user_constraints or [],
+        }
+        return {
+            "type": "task.plan",
+            "ok": True,
+            "pending_background_task": True,
+            "task_id": task_id,
+            "classification": classification,
+            "title": title,
+            "need_clarification": classification in {"long_project", "future_project", "recurring_plan"},
+            "clarifying_questions": questions,
+            "plan": plan,
+        }
 
 class JarvisTaskPrioritizeInput(BaseModel):
     tasks: list[MaxwellTaskCandidate] = Field(description="Candidate tasks to prioritize")
@@ -2141,3 +2274,6 @@ class JarvisSpecialistOrchestrateTool(ShadowLinkTool):
             "conflicts": synthesis.get("conflicts", []),
             "followups": synthesis.get("followups", []),
         }
+
+
+
