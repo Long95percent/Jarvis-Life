@@ -45,7 +45,12 @@ class ProactiveMessage(BaseModel):
     agent_name: str
     content: str
     trigger: str
+    priority: str = "normal"
+    status: str = "pending"  # pending | delivered | read | dismissed
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    delivered_at: datetime | None = None
+    read_at: datetime | None = None
+    dismissed_at: datetime | None = None
     read: bool = False
 
 

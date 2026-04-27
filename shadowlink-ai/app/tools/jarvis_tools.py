@@ -257,6 +257,87 @@ def _serialize_event(event: dict) -> dict:
     }
 
 
+def _parse_plan_date(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _infer_plan_days(text: str, target_start: str | None, target_end: str | None) -> int:
+    lowered = text.lower()
+    if target_start and target_end:
+        start = _parse_plan_date(target_start)
+        end = _parse_plan_date(target_end)
+        if start is not None and end is not None:
+            return max(1, min(60, (end.date() - start.date()).days + 1))
+    if any(marker in text for marker in ["一个月", "30天", "30 天"]) or "30 days" in lowered:
+        return 30
+    if any(marker in text for marker in ["两周", "2周", "14天", "14 天"]) or "two weeks" in lowered:
+        return 14
+    if any(marker in text for marker in ["一周", "7天", "7 天"]) or "week" in lowered:
+        return 7
+    if any(marker in text for marker in ["长期", "雅思", "旅行", "旅游", "备考", "考试"]):
+        return 14
+    return 3
+
+
+def _build_daily_plan(
+    *,
+    title: str,
+    user_request: str,
+    classification: str,
+    target_start: str | None,
+    target_end: str | None,
+) -> list[dict]:
+    start_dt = _parse_plan_date(target_start)
+    start_date = start_dt.date() if start_dt is not None else datetime.utcnow().date()
+    total_days = _infer_plan_days(user_request, target_start, target_end)
+    lowered = user_request.lower()
+
+    if "雅思" in user_request or "ielts" in lowered:
+        templates = [
+            ("雅思听力精听与错题记录", "完成 1 组听力精听，记录生词、定位词和错因。", 60),
+            ("雅思阅读限时训练", "完成 1 篇阅读限时训练，复盘题型和定位策略。", 60),
+            ("雅思口语素材与跟读", "整理 1 个口语话题素材并完成跟读录音。", 45),
+            ("雅思写作结构训练", "完成 1 个小作文/大作文提纲或段落练习。", 75),
+            ("雅思单词与复盘", "复习高频词与本周错题，更新薄弱点清单。", 45),
+        ]
+    elif "旅游" in user_request or "旅行" in user_request or "玩" in user_request:
+        templates = [
+            ("确认旅行约束", "确认目的地、预算、同行人、出发日期和不可接受条件。", 30),
+            ("交通与住宿初筛", "筛选交通方案和住宿区域，记录价格与通勤风险。", 60),
+            ("路线与活动草案", "列出每日路线、核心活动和备选方案。", 60),
+            ("预订与证件检查", "检查证件、签证、预订状态和付款风险。", 45),
+            ("行李与天气清单", "根据天气、活动强度和行程生成行李清单。", 30),
+        ]
+    else:
+        templates = [
+            (f"{title}：明确目标", "明确完成标准、约束和下一步动作。", 30),
+            (f"{title}：推进执行", "完成一个可交付的小步骤，并记录阻塞。", 45),
+            (f"{title}：复盘调整", "复盘进展，调整剩余安排和优先级。", 30),
+        ]
+
+    daily_plan: list[dict] = []
+    for index in range(total_days):
+        day = start_date + timedelta(days=index)
+        task_title, description, minutes = templates[index % len(templates)]
+        daily_plan.append({
+            "date": day.isoformat(),
+            "title": task_title,
+            "description": description,
+            "start_time": "20:00",
+            "end_time": f"{21 + (minutes > 60):02d}:00" if minutes >= 60 else "20:45",
+            "estimated_minutes": minutes,
+            "status": "pending",
+            "sort_order": index,
+            "classification": classification,
+        })
+    return daily_plan
+
+
 def _get_window_events(window_start: datetime, window_end: datetime) -> list[dict]:
     horizon_hours = max(24, int((_to_timestamp(window_end) - datetime.utcnow().timestamp()) / 3600) + 24)
     events = [
@@ -1084,7 +1165,11 @@ class JarvisTaskPlanDecomposeInput(BaseModel):
 
 class JarvisTaskPlanDecomposeTool(ShadowLinkTool):
     name: str = "jarvis_task_plan_decompose"
-    description: str = "Maxwell-only skill: classify and decompose short/long/future user goals into a background task plan with editable schedule candidates."
+    description: str = (
+        "Maxwell-only skill: classify and decompose short/long/future user goals into a background task plan. "
+        "For long-term, recurring, exam-prep, travel-prep, or future projects, the returned plan includes daily_plan "
+        "items that can be persisted as one completable task per day after user confirmation."
+    )
     args_schema: type[BaseModel] = JarvisTaskPlanDecomposeInput
     category: ToolCategory = ToolCategory.SYSTEM
     requires_confirmation: bool = True
@@ -1179,6 +1264,13 @@ class JarvisTaskPlanDecomposeTool(ShadowLinkTool):
             questions = ["这个任务最晚希望什么时候完成？", "每次适合投入多长时间？"]
 
         task_id = f"task_{uuid4().hex}"
+        daily_plan = _build_daily_plan(
+            title=title,
+            user_request=text,
+            classification=classification,
+            target_start=target_start,
+            target_end=target_end,
+        )
         plan = {
             "id": task_id,
             "title": title,
@@ -1191,6 +1283,7 @@ class JarvisTaskPlanDecomposeTool(ShadowLinkTool):
             "milestones": milestones,
             "subtasks": subtasks,
             "calendar_candidates": calendar_candidates,
+            "daily_plan": daily_plan,
             "clarifying_questions": questions,
             "user_constraints": user_constraints or [],
         }
@@ -1203,6 +1296,7 @@ class JarvisTaskPlanDecomposeTool(ShadowLinkTool):
             "title": title,
             "need_clarification": classification in {"long_project", "future_project", "recurring_plan"},
             "clarifying_questions": questions,
+            "daily_plan_count": len(daily_plan),
             "plan": plan,
         }
 
@@ -2274,6 +2368,4 @@ class JarvisSpecialistOrchestrateTool(ShadowLinkTool):
             "conflicts": synthesis.get("conflicts", []),
             "followups": synthesis.get("followups", []),
         }
-
-
 

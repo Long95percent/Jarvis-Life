@@ -108,7 +108,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     (async () => {
       setLoadingHistory(true);
       try {
-        await loadChatHistory(agentId);
+        await loadChatHistory(agentId, sessionId);
       } finally {
         if (!cancelled) setLoadingHistory(false);
       }
@@ -116,7 +116,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     return () => {
       cancelled = true;
     };
-  }, [agentId, loadChatHistory]);
+  }, [agentId, sessionId, loadChatHistory]);
 
   useEffect(() => {
     return () => {
@@ -324,6 +324,31 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
       );
     }
 
+    if (action.type === "agent.consult") {
+      const consultations = asList(action.arguments?.consultations);
+      return (
+        <div key={key} className="w-full rounded-2xl border border-violet-200 bg-violet-50 p-3 text-xs text-violet-900">
+          <div className="text-sm font-semibold">已完成私下咨询</div>
+          <div className="mt-1 text-violet-700">{action.description ?? `已完成 ${consultations.length} 次角色咨询`}</div>
+          {consultations.length > 0 && (
+            <div className="mt-2 space-y-1">
+              {consultations.slice(0, 3).map((item, itemIndex) => {
+                const fromName = toText(item.from_agent_name, toText(item.from_agent, "Agent"));
+                const toName = toText(item.to_agent_name, toText(item.to_agent, "Agent"));
+                const summary = toText(item.summary);
+                return (
+                  <div key={itemIndex} className="rounded-xl border border-violet-100 bg-white/75 px-2 py-1.5">
+                    <div className="font-medium">{fromName}{" -> "}{toName}</div>
+                    {summary ? <div className="mt-0.5 text-violet-700">{summary}</div> : null}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     if (action.pending_confirmation && action.type === "calendar.add") {
       return (
         <div key={key} className="w-full rounded-2xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
@@ -479,7 +504,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
         <div className="flex items-center gap-2">
           <button
             onClick={() => {
-              if (confirm(`清除和 ${agent.name} 的全部聊天记录？`)) clearChatHistoryStore(agentId);
+              if (confirm(`清除此会话中和 ${agent.name} 的聊天记录？`)) clearChatHistoryStore(agentId, sessionId);
             }}
             className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 transition-colors"
           >
@@ -574,8 +599,5 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     </div>
   );
 };
-
-
-
 
 

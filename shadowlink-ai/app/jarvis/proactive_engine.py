@@ -20,6 +20,7 @@ import structlog
 
 from app.jarvis.agents import JARVIS_AGENTS
 from app.jarvis.models import LifeContext, ProactiveMessage
+from app.jarvis.proactive_routines import ProactiveRoutineScheduler
 
 if TYPE_CHECKING:
     from app.jarvis.context_bus import LifeContextBus
@@ -58,6 +59,7 @@ class ProactiveTriggerEngine:
         self._pending_messages: list[ProactiveMessage] = []
         self._running = False
         self.rules = self._build_rules()
+        self.routine_scheduler = ProactiveRoutineScheduler()
 
     def _build_rules(self) -> list[TriggerRule]:
         return [
@@ -148,8 +150,14 @@ class ProactiveTriggerEngine:
                     content=decision.payload.get("content", ""),
                     trigger=rule.name,
                 )
-                self._pending_messages.append(msg)
-                logger.info("jarvis.engine.message_queued", agent_id=decision.agent_id, trigger=rule.name)
+                from app.jarvis.persistence import save_proactive_message
+
+                await save_proactive_message(msg)
+                logger.info("jarvis.engine.message_persisted", agent_id=decision.agent_id, trigger=rule.name)
+
+    async def check_routines(self) -> list[dict]:
+        ctx = await self.context_bus.get_context()
+        return await self.routine_scheduler.check_routines(ctx)
 
     def pop_pending_messages(self) -> list[ProactiveMessage]:
         msgs, self._pending_messages = self._pending_messages, []
@@ -161,6 +169,7 @@ class ProactiveTriggerEngine:
         while self._running:
             try:
                 await self.check_triggers()
+                await self.check_routines()
             except Exception as exc:
                 logger.error("jarvis.engine.error", error=str(exc))
             await asyncio.sleep(POLL_INTERVAL)

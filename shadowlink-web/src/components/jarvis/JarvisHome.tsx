@@ -9,6 +9,7 @@ import { DashboardCards } from "./DashboardCards";
 import { CalendarPanel } from "./CalendarPanel";
 import { MemoryPanel } from "./MemoryPanel";
 import { ConversationHistoryPanel } from "./ConversationHistoryPanel";
+import { ProactiveMessageFeed } from "./ProactiveMessageFeed";
 
 /**
  * JarvisHome 鈥?the unified command center.
@@ -33,6 +34,7 @@ export const JarvisHome: React.FC = () => {
   const startRoundtable = useJarvisStore((s) => s.startRoundtable);
   const closeRoundtable = useJarvisStore((s) => s.closeRoundtable);
   const resetToScenarioGrid = useJarvisStore((s) => s.resetToScenarioGrid);
+  const markMessageRead = useJarvisStore((s) => s.markMessageRead);
 
   const unreadCounts = useMemo(
     () =>
@@ -126,9 +128,21 @@ export const JarvisHome: React.FC = () => {
         <div className="min-h-0 flex-[1.15]">
           <MemoryPanel />
         </div>
+        <section className="min-h-0 flex-1 rounded-2xl border border-gray-200 bg-white p-4 overflow-hidden flex flex-col">
+          <div className="flex items-start justify-between gap-2 mb-3">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-700">主动提醒</h3>
+            </div>
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto pr-1">
+            <ProactiveMessageFeed
+              messages={proactiveMessages}
+              onRead={(id) => void markMessageRead(id)}
+            />
+          </div>
+        </section>
         <ConversationHistoryPanel />
       </aside>
     </div>
   );
 };
-

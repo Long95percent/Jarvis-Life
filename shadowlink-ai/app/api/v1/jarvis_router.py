@@ -7,6 +7,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -18,8 +19,12 @@ from app.jarvis.collaboration_memory import (
     remember_tool_actions,
     remember_user_constraint,
 )
+from app.jarvis.agent_consultation import run_agent_consultations
 from app.jarvis.context_bus import LifeContextBus, get_life_context_bus
-from app.jarvis.memory_extractor import build_memory_recall_prefix, extract_and_save_chat_memories
+from app.jarvis.memory_extractor import extract_and_save_chat_memories
+from app.jarvis.memory_compactor import maybe_compact_old_raw_memories
+from app.jarvis.memory_recall import build_bounded_memory_recall_prefix
+from app.jarvis.preference_learner import build_preference_profile_prefix
 from app.jarvis.tool_runtime import execute_tool_calls, run_agent_turn, to_action_results
 
 logger = structlog.get_logger("jarvis.api")
@@ -88,7 +93,10 @@ def _build_schedule_intent(message: str, agent_id: str) -> dict[str, Any] | None
     matched_schedule_actions = [keyword for keyword in schedule_action_keywords if keyword in text]
     matched_schedule_times = [keyword for keyword in schedule_time_keywords if keyword in text]
     matched_schedule = matched_schedule_actions + [keyword for keyword in matched_schedule_times if keyword not in matched_schedule_actions]
-    has_schedule_intent = bool(matched_schedule_actions) or (bool(matched_schedule_times) and any(verb in text for verb in ["去", "做", "办", "见", "练", "学", "整理", "散步", "健身", "复习", "吃饭"]))
+    has_schedule_intent = bool(matched_schedule_actions) or (
+        bool(matched_schedule_times)
+        and any(verb in text for verb in ["做", "办", "见", "练", "学", "整理", "散步", "健身", "复习", "吃饭"])
+    )
     if not matched_long and not has_schedule_intent:
         return None
 
@@ -488,6 +496,11 @@ async def chat_with_agent(
         raise HTTPException(status_code=404, detail=f"Agent {routed_agent_id!r} not found")
 
     try:
+        await get_life_context_bus().update_fields({}, source="user_chat")
+    except Exception as exc:
+        logger.warning("jarvis.chat.activity_mark_failed", agent_id=req.agent_id, error=str(exc))
+
+    try:
         from app.jarvis.persistence import save_conversation
 
         await save_conversation(
@@ -513,7 +526,7 @@ async def chat_with_agent(
             f"sleep={ctx.sleep_quality}/10, mood={ctx.mood_trend}]"
         )
 
-        history = await get_chat_history(routed_agent_id, limit=12)
+        history = await get_chat_history(routed_agent_id, limit=12, session_id=req.session_id)
         history_text = ""
         if history:
             lines = []
@@ -523,7 +536,15 @@ async def chat_with_agent(
             history_text = "## 最近对话\n" + "\n".join(lines) + "\n\n"
 
         collaboration_text = await build_collaboration_memory_prefix(routed_agent_id, limit=6)
-        memory_text = await build_memory_recall_prefix(routed_agent_id, limit=6)
+        memory_text = await build_bounded_memory_recall_prefix(routed_agent_id, req.message, limit=6)
+        preference_text = await build_preference_profile_prefix(routed_agent_id, limit=6)
+        consult_result = await run_agent_consultations(
+            source_agent=routed_agent_id,
+            user_message=req.message,
+            session_id=req.session_id,
+            llm_client=llm_client,
+            context_summary=context_summary,
+        )
 
         from zoneinfo import ZoneInfo
         from app.jarvis.user_settings import get_settings
@@ -569,6 +590,8 @@ async def chat_with_agent(
         f"{time_context}"
         f"{common_rules}"
         f"{intent_context}"
+        f"{consult_result.prompt_prefix}"
+        f"{preference_text}"
         f"{memory_text}"
         f"{collaboration_text}"
         f"{history_text}"
@@ -603,7 +626,7 @@ async def chat_with_agent(
             if not clean_reply:
                 clean_reply = "我先接管这条日程需求，给你生成一个待确认卡；时间不合适可以先取消再补充具体时间。"
         tool_results = await execute_tool_calls(routed_agent_id, [{"tool_name": fallback_tool_name, "arguments": fallback_arguments}])
-    action_results = to_action_results(tool_results)
+    action_results = [*consult_result.actions, *to_action_results(tool_results)]
     if schedule_intent:
         action_results.insert(0, {
             "type": schedule_intent["type"],
@@ -652,13 +675,20 @@ async def chat_with_agent(
             session_id=req.session_id,
             llm_client=llm_client,
         )
+        await maybe_compact_old_raw_memories(cutoff_days=7, min_interval_seconds=3600)
     except Exception as exc:
         logger.warning("jarvis.chat.memory_save_failed", agent_id=req.agent_id, error=str(exc))
 
     # Persist both sides of the exchange so the next request has history
     try:
-        await save_chat_turn(agent_id=routed_agent_id, role="user", content=req.message)
-        await save_chat_turn(agent_id=routed_agent_id, role="agent", content=clean_reply, actions=action_results)
+        await save_chat_turn(agent_id=routed_agent_id, role="user", content=req.message, session_id=req.session_id)
+        await save_chat_turn(
+            agent_id=routed_agent_id,
+            role="agent",
+            content=clean_reply,
+            actions=action_results,
+            session_id=req.session_id,
+        )
     except Exception as exc:
         logger.warning("jarvis.chat.persist_failed", agent_id=req.agent_id, error=str(exc))
 
@@ -709,22 +739,22 @@ async def chat_with_agent(
 
 
 @router.get("/chat/{agent_id}/history")
-async def get_agent_chat_history(agent_id: str, limit: int = 50) -> list[dict[str, Any]]:
+async def get_agent_chat_history(agent_id: str, limit: int = 50, session_id: str | None = None) -> list[dict[str, Any]]:
     """Return recent 1:1 chat turns for an agent (chronological, oldest first)."""
     if agent_id not in JARVIS_AGENTS or agent_id == "shadow":
         raise HTTPException(status_code=404, detail=f"Unknown agent_id {agent_id!r}")
     from app.jarvis.persistence import get_chat_history
-    return await get_chat_history(agent_id, limit=limit)
+    return await get_chat_history(agent_id, limit=limit, session_id=session_id)
 
 
 @router.delete("/chat/{agent_id}/history")
-async def clear_agent_chat_history(agent_id: str) -> dict[str, Any]:
+async def clear_agent_chat_history(agent_id: str, session_id: str | None = None) -> dict[str, Any]:
     """Wipe chat history for a specific agent."""
     if agent_id not in JARVIS_AGENTS or agent_id == "shadow":
         raise HTTPException(status_code=404, detail=f"Unknown agent_id {agent_id!r}")
     from app.jarvis.persistence import clear_chat_history
-    cleared = await clear_chat_history(agent_id)
-    return {"agent_id": agent_id, "cleared": cleared}
+    cleared = await clear_chat_history(agent_id, session_id=session_id)
+    return {"agent_id": agent_id, "session_id": session_id, "cleared": cleared}
 
 
 @router.get("/local-life")
@@ -744,13 +774,38 @@ async def get_local_life(force: bool = False) -> dict[str, Any]:
 
 
 @router.get("/messages")
-async def get_proactive_messages() -> list[dict[str, Any]]:
-    from app.core.lifespan import get_proactive_engine
-    engine = get_proactive_engine()
-    if engine is None:
-        return []
-    msgs = engine.pop_pending_messages()
-    return [m.model_dump() for m in msgs]
+async def get_proactive_messages(
+    include_read: bool = False,
+    limit: int = 50,
+    agent_id: str | None = None,
+) -> list[dict[str, Any]]:
+    from app.jarvis.persistence import list_proactive_messages
+
+    return await list_proactive_messages(
+        include_read=include_read,
+        limit=max(1, min(limit, 200)),
+        agent_id=agent_id,
+    )
+
+
+@router.post("/messages/{message_id}/read")
+async def mark_proactive_message_read_endpoint(message_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import mark_proactive_message_read
+
+    msg = await mark_proactive_message_read(message_id)
+    if msg is None:
+        raise HTTPException(status_code=404, detail=f"Proactive message {message_id!r} not found")
+    return msg
+
+
+@router.post("/messages/{message_id}/dismiss")
+async def dismiss_proactive_message_endpoint(message_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import dismiss_proactive_message
+
+    msg = await dismiss_proactive_message(message_id)
+    if msg is None:
+        raise HTTPException(status_code=404, detail=f"Proactive message {message_id!r} not found")
+    return msg
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -808,13 +863,19 @@ async def fire_proactive_trigger(req: ProactiveFireRequest) -> dict[str, Any]:
     if synth_fields:
         await bus.update_fields(synth_fields, source="demo_trigger")
 
+    from app.jarvis.persistence import list_proactive_messages
+
+    before_ids = {m["id"] for m in await list_proactive_messages(include_read=False, limit=200)}
     await engine.check_triggers()
-    pending = engine.pop_pending_messages()
+    pending = [
+        m for m in await list_proactive_messages(include_read=False, limit=200)
+        if m["id"] not in before_ids
+    ]
 
     return {
         "trigger": req.trigger_name,
         "message_count": len(pending),
-        "messages": [m.model_dump() for m in pending],
+        "messages": pending,
     }
 
 
@@ -965,6 +1026,68 @@ async def list_background_task_items(status: str | None = None, limit: int = 50)
     return await list_background_tasks(status=status, limit=limit)
 
 
+@router.get("/background-tasks/{task_id}/days")
+async def list_background_task_day_items(task_id: str, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    from app.jarvis.persistence import list_background_task_days
+
+    return await list_background_task_days(task_id=task_id, status=status, limit=limit)
+
+
+@router.get("/background-task-days")
+async def list_all_background_task_day_items(
+    task_id: str | None = None,
+    status: str | None = None,
+    plan_date: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    from app.jarvis.persistence import list_background_task_days
+
+    return await list_background_task_days(task_id=task_id, status=status, plan_date=plan_date, limit=limit)
+
+
+@router.post("/background-task-days/{day_id}/complete")
+async def complete_background_task_day_item(day_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import update_background_task_day_status
+
+    updated = await update_background_task_day_status(day_id, "completed")
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Background task day {day_id!r} not found")
+    return {"task_day": updated}
+
+
+@router.get("/maxwell/workbench-items")
+async def list_maxwell_workbench_items(
+    status: str | None = None,
+    plan_date: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    from app.jarvis.persistence import list_maxwell_workbench_items
+
+    return await list_maxwell_workbench_items(status=status, plan_date=plan_date, limit=limit)
+
+
+@router.post("/maxwell/workbench/push-daily-tasks")
+async def push_maxwell_daily_tasks(plan_date: str | None = None) -> dict[str, Any]:
+    from zoneinfo import ZoneInfo
+
+    from app.jarvis.persistence import push_background_task_days_to_workbench
+
+    effective_date = plan_date or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    items = await push_background_task_days_to_workbench(effective_date)
+    return {"plan_date": effective_date[:10], "pushed_count": len(items), "items": items}
+
+
+@router.post("/background-task-days/mark-overdue-missed")
+async def mark_overdue_background_task_day_items(today: str | None = None) -> dict[str, Any]:
+    from zoneinfo import ZoneInfo
+
+    from app.jarvis.persistence import mark_overdue_background_task_days_missed
+
+    effective_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    missed = await mark_overdue_background_task_days_missed(effective_today)
+    return {"today": effective_today[:10], "missed_count": len(missed), "task_days": missed}
+
+
 @router.patch("/pending-actions/{pending_id}")
 async def update_pending_action_item(pending_id: str, req: PendingActionUpdateRequest) -> dict[str, Any]:
     from app.jarvis.persistence import update_pending_action
@@ -1027,7 +1150,7 @@ async def confirm_pending_action_item(pending_id: str, req: PendingActionConfirm
 
     arguments = req.arguments if req.arguments is not None else item.get("arguments", {})
     if item.get("action_type") == "task.plan":
-        from app.jarvis.persistence import get_background_task, save_background_task
+        from app.jarvis.persistence import get_background_task, save_background_task, save_background_task_days
 
         plan = arguments.get("plan") if isinstance(arguments.get("plan"), dict) else arguments
         task_id = str(plan.get("id") or arguments.get("task_id") or pending_id)
@@ -1057,8 +1180,24 @@ async def confirm_pending_action_item(pending_id: str, req: PendingActionConfirm
                 status_code=500,
                 detail=f"后台任务 {task_id!r} 保存后回读失败：请检查 jarvis.db/background_tasks 写入。",
             )
+        daily_plan = plan.get("daily_plan") if isinstance(plan.get("daily_plan"), list) else []
+        persisted_days = await save_background_task_days(task_id=task_id, daily_plan=daily_plan)
+        if daily_plan and not persisted_days:
+            raise HTTPException(
+                status_code=500,
+                detail=f"后台任务 {task_id!r} 已保存，但每日任务写入失败：请检查 background_task_days 写入。",
+            )
         updated = await update_pending_action(pending_id, status="confirmed", arguments=arguments, title=saved_task.get("title"))
-        return {"pending_action": updated, "result": {"task": persisted_task, "persisted": True}, "fallback": False}
+        return {
+            "pending_action": updated,
+            "result": {
+                "task": persisted_task,
+                "task_days": persisted_days,
+                "task_day_count": len(persisted_days),
+                "persisted": True,
+            },
+            "fallback": False,
+        }
 
     if item.get("action_type") != "calendar.add":
         raise HTTPException(status_code=400, detail="Only calendar.add pending actions can be confirmed in this MVP")
@@ -1188,15 +1327,18 @@ async def update_calendar_event(event_id: str, req: CalendarEventUpdate) -> dict
 @router.get("/messages/stream")
 async def stream_proactive_messages() -> EventSourceResponse:
     """SSE endpoint — client subscribes to receive proactive messages in real-time."""
-    from app.core.lifespan import get_proactive_engine
+    from app.jarvis.persistence import list_proactive_messages, mark_proactive_messages_delivered
 
     async def event_generator():
+        seen: set[str] = set()
         while True:
-            engine = get_proactive_engine()
-            if engine:
-                msgs = engine.pop_pending_messages()
-                for msg in msgs:
-                    yield {"data": json.dumps(msg.model_dump())}
+            msgs = await list_proactive_messages(include_read=False, limit=50)
+            fresh = [msg for msg in reversed(msgs) if msg["id"] not in seen]
+            if fresh:
+                await mark_proactive_messages_delivered([msg["id"] for msg in fresh])
+            for msg in fresh:
+                seen.add(msg["id"])
+                yield {"data": json.dumps(jsonable_encoder(msg), ensure_ascii=False)}
             await asyncio.sleep(10)
 
     return EventSourceResponse(event_generator())
@@ -1570,5 +1712,3 @@ async def get_past_session_turns(session_id: str) -> list[dict[str, Any]]:
     """Return the full transcript for a past session (oldest turn first)."""
     from app.jarvis.persistence import get_session_turns
     return await get_session_turns(session_id)
-
-

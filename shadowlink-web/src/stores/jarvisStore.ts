@@ -60,12 +60,13 @@ interface JarvisState {
   loadContext: () => Promise<void>;
   updateContext: (fields: Partial<LifeContext>) => Promise<void>;
   loadAgents: () => Promise<void>;
+  loadProactiveMessages: () => Promise<void>;
   addProactiveMessage: (msg: ProactiveMessage) => void;
-  markMessageRead: (id: string) => void;
+  markMessageRead: (id: string) => Promise<void>;
   setActiveAgent: (agentId: string) => void;
   sendMessage: (agentId: string, message: string, sessionId: string) => Promise<EscalationHint | null>;
-  loadChatHistory: (agentId: string) => Promise<void>;
-  clearChatHistory: (agentId: string) => Promise<void>;
+  loadChatHistory: (agentId: string, sessionId?: string) => Promise<void>;
+  clearChatHistory: (agentId: string, sessionId?: string) => Promise<void>;
 
   // Local-life + calendar
   refreshLocalLife: (force?: boolean) => Promise<void>;
@@ -140,14 +141,30 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     set({ agents });
   },
 
-  addProactiveMessage: (msg) => {
-    set((s) => ({ proactiveMessages: [msg, ...s.proactiveMessages] }));
+  loadProactiveMessages: async () => {
+    const proactiveMessages = await jarvisApi.getPendingMessages();
+    set({ proactiveMessages });
   },
 
-  markMessageRead: (id) => {
+  addProactiveMessage: (msg) => {
+    set((s) => {
+      const existing = s.proactiveMessages.find((m) => m.id === msg.id);
+      if (existing) {
+        return {
+          proactiveMessages: s.proactiveMessages.map((m) =>
+            m.id === msg.id ? { ...m, ...msg } : m
+          ),
+        };
+      }
+      return { proactiveMessages: [msg, ...s.proactiveMessages] };
+    });
+  },
+
+  markMessageRead: async (id) => {
+    const updated = await jarvisApi.markProactiveMessageRead(id);
     set((s) => ({
       proactiveMessages: s.proactiveMessages.map((m) =>
-        m.id === id ? { ...m, read: true } : m
+        m.id === id ? { ...m, ...updated } : m
       ),
     }));
   },
@@ -190,19 +207,26 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     set((s) => ({
       chatHistory: {
         ...s.chatHistory,
-        [agentId]: [
-          ...(s.chatHistory[agentId] ?? []),
-          agentTurn,
-        ],
-        ...(routedAgentId !== agentId
+        ...(routedAgentId === agentId
           ? {
-              [routedAgentId]: [
-                ...(s.chatHistory[routedAgentId] ?? []),
-                { role: "user" as const, content: message },
+              [agentId]: [
+                ...(s.chatHistory[agentId] ?? []),
                 agentTurn,
               ],
             }
-          : {}),
+          : {
+              [agentId]: (s.chatHistory[agentId] ?? []).filter((turn, index, turns) => {
+                const isOptimisticUserTurn =
+                  index === turns.length - 1 &&
+                  turn.role === "user" &&
+                  turn.content === message;
+                return !isOptimisticUserTurn;
+              }),
+              [routedAgentId]: [
+                { role: "user" as const, content: message },
+                agentTurn,
+              ],
+            }),
       },
     }));
     if (routedAgentId !== agentId) {
@@ -225,8 +249,9 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     return response.escalation ?? null;
   },
 
-  loadChatHistory: async (agentId) => {
-    const turns = await jarvisApi.getChatHistory(agentId);
+  loadChatHistory: async (agentId, sessionId) => {
+    const effectiveSessionId = sessionId ?? get().sessionId;
+    const turns = await jarvisApi.getChatHistory(agentId, 50, effectiveSessionId);
     set((s) => ({
       chatHistory: {
         ...s.chatHistory,
@@ -235,8 +260,9 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     }));
   },
 
-  clearChatHistory: async (agentId) => {
-    await jarvisApi.clearChatHistory(agentId);
+  clearChatHistory: async (agentId, sessionId) => {
+    const effectiveSessionId = sessionId ?? get().sessionId;
+    await jarvisApi.clearChatHistory(agentId, effectiveSessionId);
     set((s) => ({
       chatHistory: { ...s.chatHistory, [agentId]: [] },
     }));
@@ -288,7 +314,7 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
   },
 
   openPrivateChat: (agentId) => {
-    const sessionId = get().sessionId || `jarvis-${Date.now()}`;
+    const sessionId = `private-${agentId}-${Date.now()}`;
     writePersistedUiState({ activeAgentId: agentId, interactionMode: "private_chat", sessionId });
     set({ activeAgentId: agentId, interactionMode: "private_chat", sessionId });
   },
@@ -328,7 +354,7 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
         sessionId: conversation.session_id,
       });
       set({ interactionMode: "private_chat", activeAgentId: conversation.agent_id, sessionId: conversation.session_id });
-      await get().loadChatHistory(conversation.agent_id);
+      await get().loadChatHistory(conversation.agent_id, conversation.session_id);
       return;
     }
     const scenarioId = conversation.scenario_id ?? (typeof payload.scenario_id === "string" ? payload.scenario_id : null);
@@ -378,4 +404,3 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     });
   },
 }));
-

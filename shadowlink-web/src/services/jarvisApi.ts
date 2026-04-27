@@ -47,7 +47,12 @@ export interface ProactiveMessage {
   agent_name: string;
   content: string;
   trigger: string;
+  priority?: string;
+  status?: "pending" | "delivered" | "read" | "dismissed" | string;
   created_at: string;
+  delivered_at?: string | null;
+  read_at?: string | null;
+  dismissed_at?: string | null;
   read: boolean;
 }
 
@@ -113,6 +118,37 @@ export interface BackgroundTask {
   subtasks: Array<Record<string, unknown>>;
   calendar_candidates: Array<Record<string, unknown>>;
   notes?: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface BackgroundTaskDay {
+  id: string;
+  task_id: string;
+  plan_date: string;
+  title: string;
+  description?: string | null;
+  start_time?: string | null;
+  end_time?: string | null;
+  estimated_minutes?: number | null;
+  status: "pending" | "pushed" | "completed" | "missed" | "rescheduled" | "cancelled" | string;
+  calendar_event_id?: string | null;
+  workbench_item_id?: string | null;
+  sort_order: number;
+  llm_payload: Record<string, unknown>;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface MaxwellWorkbenchItem {
+  id: string;
+  task_day_id?: string | null;
+  agent_id: string;
+  title: string;
+  description?: string | null;
+  due_at?: string | null;
+  status: "todo" | "doing" | "done" | "cancelled" | string;
+  pushed_at?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -254,14 +290,19 @@ export const jarvisApi = {
     return res.json();
   },
 
-  async getChatHistory(agentId: string, limit = 50): Promise<ChatHistoryTurn[]> {
-    const res = await fetch(`${BASE}/chat/${agentId}/history?limit=${limit}`);
+  async getChatHistory(agentId: string, limit = 50, sessionId?: string): Promise<ChatHistoryTurn[]> {
+    const query = new URLSearchParams({ limit: String(limit) });
+    if (sessionId) query.set("session_id", sessionId);
+    const res = await fetch(`${BASE}/chat/${agentId}/history?${query.toString()}`);
     if (!res.ok) return [];
     return res.json();
   },
 
-  async clearChatHistory(agentId: string): Promise<void> {
-    await fetch(`${BASE}/chat/${agentId}/history`, { method: "DELETE" });
+  async clearChatHistory(agentId: string, sessionId?: string): Promise<void> {
+    const query = new URLSearchParams();
+    if (sessionId) query.set("session_id", sessionId);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    await fetch(`${BASE}/chat/${agentId}/history${suffix}`, { method: "DELETE" });
   },
 
   async listMemories(params?: { memoryKind?: string; limit?: number }): Promise<JarvisMemory[]> {
@@ -449,6 +490,59 @@ export const jarvisApi = {
     return res.json();
   },
 
+  async listBackgroundTaskDays(params?: { taskId?: string; status?: string; planDate?: string; limit?: number }): Promise<BackgroundTaskDay[]> {
+    const query = new URLSearchParams();
+    if (params?.status) query.set("status", params.status);
+    if (params?.planDate) query.set("plan_date", params.planDate);
+    if (params?.limit) query.set("limit", String(params.limit));
+    if (params?.taskId) {
+      const suffix = query.toString() ? `?${query.toString()}` : "";
+      const res = await fetch(`${BASE}/background-tasks/${params.taskId}/days${suffix}`);
+      if (!res.ok) return [];
+      return res.json();
+    }
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const res = await fetch(`${BASE}/background-task-days${suffix}`);
+    if (!res.ok) return [];
+    return res.json();
+  },
+
+  async completeBackgroundTaskDay(dayId: string): Promise<BackgroundTaskDay> {
+    const res = await fetch(`${BASE}/background-task-days/${dayId}/complete`, { method: "POST" });
+    if (!res.ok) throw await errorFromResponse(res, `complete background task day HTTP ${res.status}`);
+    const data = await res.json();
+    return data.task_day;
+  },
+
+  async listMaxwellWorkbenchItems(params?: { status?: string; planDate?: string; limit?: number }): Promise<MaxwellWorkbenchItem[]> {
+    const query = new URLSearchParams();
+    if (params?.status) query.set("status", params.status);
+    if (params?.planDate) query.set("plan_date", params.planDate);
+    if (params?.limit) query.set("limit", String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const res = await fetch(`${BASE}/maxwell/workbench-items${suffix}`);
+    if (!res.ok) return [];
+    return res.json();
+  },
+
+  async pushDailyTasksToMaxwellWorkbench(planDate?: string): Promise<{ plan_date: string; pushed_count: number; items: MaxwellWorkbenchItem[] }> {
+    const query = new URLSearchParams();
+    if (planDate) query.set("plan_date", planDate);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const res = await fetch(`${BASE}/maxwell/workbench/push-daily-tasks${suffix}`, { method: "POST" });
+    if (!res.ok) throw await errorFromResponse(res, `push daily tasks HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async markOverdueBackgroundTaskDaysMissed(today?: string): Promise<{ today: string; missed_count: number; task_days: BackgroundTaskDay[] }> {
+    const query = new URLSearchParams();
+    if (today) query.set("today", today);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const res = await fetch(`${BASE}/background-task-days/mark-overdue-missed${suffix}`, { method: "POST" });
+    if (!res.ok) throw await errorFromResponse(res, `mark overdue task days HTTP ${res.status}`);
+    return res.json();
+  },
+
   async startTeamCollaboration(payload: TeamCollaborationRequest): Promise<TeamCollaborationResponse> {
     const res = await fetch(`${BASE}/team/collaborate`, {
       method: "POST",
@@ -459,9 +553,28 @@ export const jarvisApi = {
     return res.json();
   },
 
-  async getPendingMessages(): Promise<ProactiveMessage[]> {
-    const res = await fetch(`${BASE}/messages`);
+  async getPendingMessages(includeRead = false): Promise<ProactiveMessage[]> {
+    const params = new URLSearchParams();
+    if (includeRead) params.set("include_read", "true");
+    const qs = params.toString();
+    const res = await fetch(`${BASE}/messages${qs ? `?${qs}` : ""}`);
     if (!res.ok) return [];
+    return res.json();
+  },
+
+  async markProactiveMessageRead(id: string): Promise<ProactiveMessage> {
+    const res = await fetch(`${BASE}/messages/${encodeURIComponent(id)}/read`, {
+      method: "POST",
+    });
+    if (!res.ok) throw await errorFromResponse(res, `mark proactive read HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async dismissProactiveMessage(id: string): Promise<ProactiveMessage> {
+    const res = await fetch(`${BASE}/messages/${encodeURIComponent(id)}/dismiss`, {
+      method: "POST",
+    });
+    if (!res.ok) throw await errorFromResponse(res, `dismiss proactive HTTP ${res.status}`);
     return res.json();
   },
 
@@ -476,4 +589,3 @@ export const jarvisApi = {
     return () => sse.close();
   },
 };
-

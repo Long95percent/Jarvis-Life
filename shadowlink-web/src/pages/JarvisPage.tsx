@@ -14,11 +14,13 @@ import { jarvisApi } from "@/services/jarvisApi";
 export const JarvisPage: React.FC = () => {
   const loadContext = useJarvisStore((s) => s.loadContext);
   const loadAgents = useJarvisStore((s) => s.loadAgents);
+  const loadProactiveMessages = useJarvisStore((s) => s.loadProactiveMessages);
   const addProactiveMessage = useJarvisStore((s) => s.addProactiveMessage);
 
   useEffect(() => {
     loadContext();
     loadAgents();
+    loadProactiveMessages();
     const unsubscribe = jarvisApi.subscribeToMessages(addProactiveMessage);
     return unsubscribe;
     // eslint-disable-next-line react-hooks/exhaustive-deps

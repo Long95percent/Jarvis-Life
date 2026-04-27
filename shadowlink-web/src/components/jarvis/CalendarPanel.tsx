@@ -1,6 +1,6 @@
 ﻿import React, { useEffect, useMemo, useState } from "react";
 import { useJarvisStore } from "@/stores/jarvisStore";
-import { jarvisApi, type BackgroundTask, type CalendarEvent, type PendingAction } from "@/services/jarvisApi";
+import { jarvisApi, type BackgroundTask, type BackgroundTaskDay, type CalendarEvent, type PendingAction } from "@/services/jarvisApi";
 
 interface Props { open: boolean; onClose: () => void }
 type ViewMode = "day" | "week" | "month";
@@ -150,6 +150,27 @@ function taskStatusLabel(status: string): string {
   return status;
 }
 
+function taskDayStatusLabel(status: string): string {
+  if (status === "pending") return "待执行";
+  if (status === "pushed") return "已进工作台";
+  if (status === "completed") return "已完成";
+  if (status === "missed") return "已逾期";
+  if (status === "rescheduled") return "已重排";
+  if (status === "cancelled") return "已取消";
+  return status;
+}
+
+function taskDayDate(day: BackgroundTaskDay): Date {
+  const startTime = day.start_time ? day.start_time.slice(0, 5) : "23:59";
+  return new Date(`${day.plan_date}T${startTime}:00`);
+}
+
+function taskDaysForDay(days: BackgroundTaskDay[], date: Date): BackgroundTaskDay[] {
+  return days
+    .filter((day) => sameDay(taskDayDate(day), date))
+    .sort((a, b) => +taskDayDate(a) - +taskDayDate(b));
+}
+
 export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
   const addCalendarEvent = useJarvisStore((s) => s.addCalendarEvent);
   const updateCalendarEvent = useJarvisStore((s) => s.updateCalendarEvent);
@@ -161,9 +182,11 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [pendingActions, setPendingActions] = useState<PendingAction[]>([]);
   const [tasks, setTasks] = useState<BackgroundTask[]>([]);
+  const [taskDays, setTaskDays] = useState<BackgroundTaskDay[]>([]);
   const [selectedTask, setSelectedTask] = useState<BackgroundTask | null>(null);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<CalendarEvent | null>(null);
+  const [selectedTaskDay, setSelectedTaskDay] = useState<BackgroundTaskDay | null>(null);
   const [editing, setEditing] = useState<CalendarEvent | null>(null);
   const [editingPending, setEditingPending] = useState<PendingAction | null>(null);
   const [form, setForm] = useState<EventForm>(() => emptyForm(new Date()));
@@ -184,14 +207,16 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
   const loadAll = async () => {
     setLoading(true);
     try {
-      const [items, pending, backgroundTasks] = await Promise.all([
+      const [items, pending, backgroundTasks, backgroundTaskDays] = await Promise.all([
         jarvisApi.listCalendarEvents(24, { start: range.start.toISOString(), end: range.end.toISOString() }),
         jarvisApi.listPendingActions("pending"),
         jarvisApi.listBackgroundTasks(),
+        jarvisApi.listBackgroundTaskDays({ limit: 500 }),
       ]);
       setEvents(items);
       setPendingActions(pending);
       setTasks(backgroundTasks);
+      setTaskDays(backgroundTaskDays);
       setSelectedTask((current) => current ? backgroundTasks.find((item) => item.id === current.id) ?? current : backgroundTasks[0] ?? null);
     } finally {
       setLoading(false);
@@ -203,6 +228,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     loadAll();
     setForm(emptyForm(currentDate));
     setSelected(null);
+    setSelectedTaskDay(null);
     setEditing(null);
     setEditingPending(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -249,6 +275,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
   const startEdit = (event: CalendarEvent) => { setEditing(event); setEditingPending(null); setSelected(event); setForm(formFromEvent(event)); };
   const markCompleted = async (event: CalendarEvent) => { if (!event.id) return; await updateCalendarEvent(event.id, { status: event.status === "completed" ? "confirmed" : "completed" }); await loadAll(); setSelected(null); };
   const removeEvent = async (event: CalendarEvent) => { if (!event.id || !confirm(`删除日程「${event.title}」？`)) return; await deleteCalendarEvent(event.id); await loadAll(); setSelected(null); setEditing(null); };
+  const completeTaskDay = async (day: BackgroundTaskDay) => { await jarvisApi.completeBackgroundTaskDay(day.id); await loadAll(); setSelectedTaskDay(null); };
 
   const renderEventButton = (event: CalendarEvent, compact = false) => (
     <button
@@ -260,11 +287,23 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     </button>
   );
 
+  const renderTaskDayButton = (day: BackgroundTaskDay, compact = false) => (
+    <button
+      key={day.id}
+      className={`w-full rounded-lg px-2 py-1 text-left ${compact ? "text-[10px]" : "text-xs"} ${day.status === "completed" ? "bg-gray-100 text-gray-400 line-through" : day.status === "missed" ? "bg-red-50 text-red-700 hover:bg-red-100" : "bg-emerald-50 text-emerald-800 hover:bg-emerald-100"}`}
+      title={day.description ?? ""}
+      onClick={() => { setSelectedTaskDay(day); setSelected(null); }}
+    >
+      <span className="font-medium">{compact ? day.title : `${day.start_time ? day.start_time.slice(0, 5) : "任务"} ${day.title}`}</span>
+    </button>
+  );
+
   const weekDays = Array.from({ length: 7 }, (_, index) => addDays(startOfWeek(currentDate), index));
   const monthDays = Array.from({ length: Math.round((range.end.getTime() - range.start.getTime()) / 86400000) }, (_, index) => addDays(range.start, index));
   const selectedMilestones = asList(selectedTask?.milestones);
   const selectedSubtasks = asList(selectedTask?.subtasks);
   const selectedCandidates = asList(selectedTask?.calendar_candidates);
+  const selectedTaskDays = selectedTask ? taskDays.filter((day) => day.task_id === selectedTask.id) : [];
 
   return (
     <div className="fixed inset-0 z-40 flex">
@@ -306,7 +345,9 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
                 {loading ? <div className="py-10 text-center text-sm text-gray-400">正在加载日程…</div> : null}
                 {!loading && mode === "day" && (
                   <div className="space-y-2">
-                    {eventsForDay(events, currentDate).length === 0 ? <div className="rounded-2xl border border-dashed border-gray-200 bg-white p-8 text-center text-sm text-gray-400">今天暂无日程</div> : eventsForDay(events, currentDate).map((event) => renderEventButton(event))}
+                    {eventsForDay(events, currentDate).length === 0 && taskDaysForDay(taskDays, currentDate).length === 0 ? <div className="rounded-2xl border border-dashed border-gray-200 bg-white p-8 text-center text-sm text-gray-400">今天暂无日程</div> : null}
+                    {eventsForDay(events, currentDate).map((event) => renderEventButton(event))}
+                    {taskDaysForDay(taskDays, currentDate).map((day) => renderTaskDayButton(day))}
                   </div>
                 )}
                 {!loading && mode === "week" && (
@@ -314,7 +355,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
                     {weekDays.map((day) => (
                       <div key={day.toISOString()} className={`rounded-2xl border bg-white p-2 min-h-72 ${sameDay(day, new Date()) ? "border-blue-300" : "border-gray-200"}`}>
                         <button className="text-xs font-semibold text-gray-700 mb-2" onClick={() => { setCurrentDate(day); setMode("day"); }}>{WEEKDAY_LABELS[day.getDay()]} {day.getMonth() + 1}/{day.getDate()}</button>
-                        <div className="space-y-1">{eventsForDay(events, day).map((event) => renderEventButton(event))}</div>
+                        <div className="space-y-1">{eventsForDay(events, day).map((event) => renderEventButton(event))}{taskDaysForDay(taskDays, day).map((taskDay) => renderTaskDayButton(taskDay))}</div>
                       </div>
                     ))}
                   </div>
@@ -323,12 +364,12 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
                   <div className="grid grid-cols-7 gap-2">
                     {WEEKDAY_LABELS.map((label) => <div key={label} className="text-center text-xs font-semibold text-gray-400">{label}</div>)}
                     {monthDays.map((day) => {
-                      const dayEvents = eventsForDay(events, day);
+                      const dayItems = [...eventsForDay(events, day), ...taskDaysForDay(taskDays, day)];
                       const inMonth = day.getMonth() === currentDate.getMonth();
                       return (
                         <div key={day.toISOString()} className={`rounded-2xl border bg-white p-2 min-h-28 ${sameDay(day, new Date()) ? "border-blue-300" : "border-gray-200"} ${inMonth ? "" : "opacity-45"}`}>
                           <button className="text-xs font-semibold text-gray-700" onClick={() => { setCurrentDate(day); setMode("day"); }}>{day.getDate()}</button>
-                          <div className="mt-1 space-y-1">{dayEvents.slice(0, 3).map((event) => renderEventButton(event, true))}{dayEvents.length > 3 && <div className="text-[10px] text-gray-400">+{dayEvents.length - 3} 项</div>}</div>
+                          <div className="mt-1 space-y-1">{eventsForDay(events, day).slice(0, 3).map((event) => renderEventButton(event, true))}{taskDaysForDay(taskDays, day).slice(0, Math.max(0, 3 - eventsForDay(events, day).length)).map((taskDay) => renderTaskDayButton(taskDay, true))}{dayItems.length > 3 && <div className="text-[10px] text-gray-400">+{dayItems.length - 3} 项</div>}</div>
                         </div>
                       );
                     })}
@@ -354,6 +395,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
                   {(editing || editingPending) && <button className="w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-600" onClick={() => { setEditing(null); setEditingPending(null); setForm(emptyForm(currentDate)); }}>取消修改</button>}
                 </div>
                 {selected && <div className="mt-5 border-t border-gray-100 pt-4 text-xs text-gray-600"><h3 className={`text-sm font-semibold text-gray-900 ${selected.status === "completed" ? "line-through text-gray-400" : ""}`}>{selected.title}</h3><p className="mt-1">{formatTime(selected.start)} - {formatTime(selected.end)} · {selected.status ?? "confirmed"}</p><p className="mt-1">来源：{eventSource(selected)}</p>{selected.created_reason && <p className="mt-1">原因：{selected.created_reason}</p>}{selected.location && <p className="mt-1">地点：{selected.location}</p>}{selected.notes && <p className="mt-1">备注：{selected.notes}</p>}<div className="mt-3 grid grid-cols-3 gap-2"><button className="rounded-lg border border-gray-200 px-2 py-1.5" onClick={() => startEdit(selected)}>修改</button><button className="rounded-lg border border-gray-200 px-2 py-1.5" onClick={() => markCompleted(selected)}>{selected.status === "completed" ? "恢复" : "划掉"}</button><button className="rounded-lg border border-red-200 px-2 py-1.5 text-red-600" onClick={() => removeEvent(selected)}>删除</button></div></div>}
+                {selectedTaskDay && <div className="mt-5 border-t border-gray-100 pt-4 text-xs text-gray-600"><h3 className={`text-sm font-semibold text-gray-900 ${selectedTaskDay.status === "completed" ? "line-through text-gray-400" : ""}`}>{selectedTaskDay.title}</h3><p className="mt-1">{formatDate(selectedTaskDay.plan_date)} · {selectedTaskDay.start_time ? selectedTaskDay.start_time.slice(0, 5) : "未设时间"} · {taskDayStatusLabel(selectedTaskDay.status)}</p>{selectedTaskDay.description && <p className="mt-2">{selectedTaskDay.description}</p>}<button className="mt-3 w-full rounded-lg border border-emerald-200 px-2 py-1.5 text-emerald-700 disabled:text-gray-400 disabled:border-gray-200" disabled={selectedTaskDay.status === "completed"} onClick={() => completeTaskDay(selectedTaskDay)}>标记完成</button></div>}
               </aside>
             </div>
           </>
@@ -392,6 +434,11 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
                       <div className="rounded-xl bg-gray-50 p-3"><div className="text-gray-400">来源 Agent</div><div className="mt-1 font-medium text-gray-700">{selectedTask.source_agent || "未记录"}</div></div>
                       <div className="rounded-xl bg-gray-50 p-3"><div className="text-gray-400">任务类型</div><div className="mt-1 font-medium text-gray-700">{selectedTask.task_type}</div></div>
                     </div>
+                  </section>
+
+                  <section className="rounded-2xl border border-gray-200 p-4">
+                    <h4 className="text-sm font-semibold text-gray-800 mb-3">每日计划</h4>
+                    <div className="space-y-2">{selectedTaskDays.length === 0 ? <p className="text-sm text-gray-400">暂无每日计划</p> : selectedTaskDays.map((day) => <div key={day.id} className="rounded-xl bg-emerald-50 p-3 text-sm text-emerald-950"><div className="flex items-start justify-between gap-3"><div><div className={`font-medium ${day.status === "completed" ? "line-through text-gray-400" : ""}`}>{day.title}</div><div className="mt-1 text-xs text-emerald-700">{formatDate(day.plan_date)} {day.start_time ? `· ${day.start_time.slice(0, 5)}` : ""} · {taskDayStatusLabel(day.status)}</div>{day.description && <p className="mt-1 text-xs text-emerald-800">{day.description}</p>}</div><button className="shrink-0 rounded-lg border border-emerald-200 bg-white px-2 py-1 text-xs text-emerald-700 disabled:text-gray-400" disabled={day.status === "completed"} onClick={() => completeTaskDay(day)}>完成</button></div></div>)}</div>
                   </section>
 
                   <section className="rounded-2xl border border-gray-200 p-4">

@@ -1,0 +1,922 @@
+====================================================================
+    Jarvis · Be IronMan 项目 —— 2026-04-27 工作总结
+====================================================================
+
+日期：2026-04-27（周一）
+工作目录：/Users/ohmorimotoki/Downloads/Jarvis Life v3
+远端仓库：https://github.com/Long95percent/Jarvis-Life.git
+当前本地提交：e58fe20 feat: upgrade jarvis life agent workflows（日志整理前）
+当前状态：本地 main ahead origin/main 1 commit；本整理版日志尚未 amend 进该提交；
+         push 因 GitHub 凭据/权限未刷新暂未成功。
+
+--------------------------------------------------------------------
+一、总览
+--------------------------------------------------------------------
+
+今天的主线是把 Jarvis Life 从“多个能力散落存在”推进到“多 Agent、
+长期任务、偏好学习、长期记忆、主动打扰可以形成较完整闭环”的版本。
+
+核心完成内容：
+
+1. 统一工作目录到依赖完整的 Downloads/Jarvis Life v3。
+2. 修复私聊历史按 agent_id 串 session 的问题。
+3. 修复跨 Agent 路由时前端本地 history 重复显示的问题。
+4. 推进长期任务 daily_plan：从大 JSON 计划升级为每日可完成任务。
+5. 补上 background_task_days 的前端可见化、完成按钮、Maxwell 工作台
+   推送 MVP 和逾期 missed 标记 MVP。
+6. 增加非圆桌场景下的 Agent 私下咨询层。
+7. 升级 Shadow 偏好学习器，让全局/角色专属偏好画像可持续落库并回流
+   到 Agent prompt。
+8. 升级长期记忆机制：有边界共享、近期原文、久远压缩、召回固定上限。
+9. 修复异常触发主动打扰的可靠性：持久化、状态流转、前端 feed、多客户端
+   不丢消息。
+10. 增加日常节律定时打扰方案 B：晨间、午餐、晚间、周复盘 routine，
+    带 quiet hours、活跃判断、优先级降级/升级和一次性去重。
+11. 将日志目录从 docs/worklog 改名为 docs/ohmori-worklog，并新增本日总结。
+
+--------------------------------------------------------------------
+二、量化指标
+--------------------------------------------------------------------
+
+以下统计来自日志整理前的本地提交 e58fe20；整理本文件后，最终提交统计会有小幅变化。
+
+Git 变更规模：
+
+1. 按 Git 识别重命名后的逻辑统计：
+   - 35 files changed
+   - 4647 insertions
+   - 124 deletions
+
+2. 按 no-renames 原始路径统计：
+   - 37 paths changed
+   - 5084 insertions
+   - 561 deletions
+
+3. 路径级变化：
+   - 2 个日志文件重命名：
+       docs/worklog/2026-04-23-daily-summary.txt
+       -> docs/ohmori-worklog/2026-04-23-daily-summary.txt
+
+       docs/worklog/2026-04-24-daily-summary.txt
+       -> docs/ohmori-worklog/2026-04-24-daily-summary.txt
+   - 1 个新增当日日志：
+       docs/ohmori-worklog/2026-04-27-daily-summary.txt
+   - 4 个新增 implementation plan：
+       docs/superpowers/plans/2026-04-27-agent-consult-layer.md
+       docs/superpowers/plans/2026-04-27-agent-preference-profiles.md
+       docs/superpowers/plans/2026-04-27-background-task-days-mvp.md
+       docs/superpowers/plans/2026-04-27-bounded-memory-lifecycle.md
+   - 3 个新增 design spec：
+       docs/superpowers/specs/2026-04-27-agent-consult-design.md
+       docs/superpowers/specs/2026-04-27-agent-preference-profiles-design.md
+       docs/superpowers/specs/2026-04-27-bounded-memory-lifecycle-design.md
+
+新增后端模块：
+
+1. shadowlink-ai/app/jarvis/agent_consultation.py
+2. shadowlink-ai/app/jarvis/memory_compactor.py
+3. shadowlink-ai/app/jarvis/memory_recall.py
+4. shadowlink-ai/app/jarvis/proactive_routines.py
+
+新增测试文件：
+
+1. shadowlink-ai/tests/unit/jarvis/test_agent_consultation.py
+2. shadowlink-ai/tests/unit/jarvis/test_memory_lifecycle.py
+3. shadowlink-ai/tests/unit/jarvis/test_proactive_routines.py
+
+主要数据库/持久化变化：
+
+1. agent_chat_turns 增加 session_id、actions 兼容迁移。
+2. conversation_history 增加 session_id、route_payload、last_opened_at 兼容迁移。
+3. collaboration_memories 增加 session_id 兼容迁移。
+4. proactive_messages 增加 priority、status、delivered_at、read_at、dismissed_at。
+5. 新增 proactive_routine_runs。
+6. 新增/扩展 background_task_days。
+7. 新增/扩展 maxwell_workbench_items。
+8. 新增 agent_preference_profiles。
+9. jarvis_memories 增加 memory_tier、visibility、owner_agent_id、
+   allowed_agent_ids、compressed_from_ids、expires_at、decay_score、
+   last_accessed_at、access_count。
+
+验证规模：
+
+1. 最新 Jarvis 单元测试集合：
+   - 76 passed
+2. 最新 focused integration tests：
+   - 3 passed
+3. 日常节律 / 旧库迁移 / 聊天活跃 focused tests：
+   - 7 passed
+4. 异常主动打扰 focused tests：
+   - 5 passed
+5. Agent consult focused 测试阶段：
+   - 23 passed
+6. Preference learner focused 测试阶段：
+   - 6 passed
+7. Memory lifecycle focused 测试阶段：
+   - 6 passed
+8. frontend type-check：
+   - passed
+9. Python py_compile：
+   - passed
+10. git diff --check：
+   - passed
+
+--------------------------------------------------------------------
+三、工作目录与 Git 状态整理
+--------------------------------------------------------------------
+
+处理过程：
+
+1. 确认后续开发默认使用：
+   /Users/ohmorimotoki/Downloads/Jarvis Life v3
+
+2. 确认该目录依赖完整，保留：
+   - shadowlink-ai/.venv311
+   - shadowlink-web/node_modules
+   - shadowlink-electron/node_modules
+   - Java target 目录
+
+3. 确认 Git remote：
+   - origin = https://github.com/Long95percent/Jarvis-Life.git
+   - branch = main
+
+4. 原 L2 项目 Git 信息已备份到：
+   .git.l2-backup-20260427
+
+5. 日志目录按用户要求从 docs/worklog 迁移为 docs/ohmori-worklog。
+
+当前 Git 注意事项：
+
+1. 本地 commit 已生成，但 push origin main 失败。
+2. GitHub 返回：
+   Permission to Long95percent/Jarvis-Life.git denied to sengo0723
+3. 排查发现 gh auth status 显示 sengo0723 token invalid。
+4. 需要刷新 GitHub 登录凭据，或确认 collaborator 邀请已接受后重新 push。
+
+--------------------------------------------------------------------
+四、修复一：私聊历史按 session 精确恢复
+--------------------------------------------------------------------
+
+问题：
+
+agent_chat_turns 原来主要按 agent_id 拉历史。同一个 Agent 如果有多个
+私聊 session，点击历史恢复时会把这些会话混在一起，无法精确恢复
+某一条历史对话。
+
+修复思路：
+
+1. 历史记录不能只靠 agent_id 作为隔离边界。
+2. 每次私聊必须带 session_id。
+3. 保存、查询、清空都要支持 session_id + agent_id。
+4. 不传 session_id 时保留旧行为，避免破坏已有调用。
+
+实现过程：
+
+1. 数据库层：
+   - agent_chat_turns 增加 session_id。
+   - 初始化时兼容旧库迁移。
+   - 新增 idx_chat_session_agent 索引。
+
+2. 持久层：
+   - save_chat_turn 写入 session_id。
+   - get_chat_history 支持 session_id。
+   - clear_chat_history 支持 session_id。
+
+3. API 层：
+   - /api/v1/jarvis/chat 保存 user/agent turn 时传入 req.session_id。
+   - /chat/{agent_id}/history 增加 session_id 查询参数。
+
+4. 前端层：
+   - jarvisApi.getChatHistory 支持 sessionId。
+   - jarvisStore.loadChatHistory 按当前 session 加载。
+   - AgentChatPanel 加载和清空时传当前 sessionId。
+   - 从主页新开私聊时生成 private-{agentId}-{timestamp} session。
+
+测试：
+
+1. test_private_chat_history_can_be_scoped_by_session
+2. test_clearing_private_chat_history_is_session_scoped
+
+验收标准：
+
+1. 同一 Agent 的两个私聊 session 不再串话。
+2. 清空当前 session 不影响同 Agent 的其它 session 历史。
+
+--------------------------------------------------------------------
+五、修复二：跨 Agent 路由本地 history 重复显示
+--------------------------------------------------------------------
+
+问题：
+
+例如用户在 Mira 私聊里说“明天下午帮我安排散步”，后端会路由给
+Maxwell。旧前端逻辑会把同一轮 Maxwell 回复同时写进：
+
+1. 原 Agent：Mira 的本地 chatHistory。
+2. routed Agent：Maxwell 的本地 chatHistory。
+
+风险：
+
+1. 同一回复重复显示。
+2. 刷新前后状态不一致。
+3. 原 Agent 面板短暂残留 routed Agent 的回复。
+
+修复思路：
+
+1. 路由后的最终归属应该是 routedAgentId。
+2. 原 Agent 不应保留这轮 routed 回复。
+3. routed Agent 不应沿用其它 session 的旧本地 history。
+4. 切换 activeAgent 后，由组件按 sessionId 重新加载后端真实历史。
+
+实现过程：
+
+1. 修改 shadowlink-web/src/stores/jarvisStore.ts 的 sendMessage。
+2. 普通未路由场景保持原逻辑。
+3. 路由场景中：
+   - 移除原 Agent 刚乐观追加的 user turn。
+   - 只把当前轮 user + agent 写入最终 routedAgentId。
+   - 不再把 routed Agent 回复追加到原 Agent history。
+   - 切换 activeAgent 后重新加载对应 session 历史。
+
+验收脚本结果：
+
+1. old_mira_turns: 3
+2. old_maxwell_turns: 3
+3. fixed_mira_turns: 1
+4. fixed_maxwell_turns: 2
+
+验收标准：
+
+跨 Agent 路由后，只在目标 Agent 当前 session 中显示当前轮消息；
+原 Agent 不再残留同一条 routed 回复。
+
+--------------------------------------------------------------------
+六、长期任务 daily_plan 落盘第一版
+--------------------------------------------------------------------
+
+问题：
+
+长期任务此前主要保存为 background_tasks 的大 JSON。它能记录总计划，
+但缺少“一天一条可完成任务”的实体，因此无法稳定支持：
+
+1. 每日完成 / 取消 / 延期。
+2. 当天任务进入 Maxwell 工作台。
+3. 逾期后按剩余日期重排。
+4. 日历或任务视图按天展示。
+
+修复思路：
+
+1. 总任务仍保留 background_tasks。
+2. 每日执行单元拆到 background_task_days。
+3. Maxwell prompt 需要明确知道 daily_plan / background_task_days /
+   workbench 这条能力链。
+4. 用户确认 task.plan 后，总任务和 daily_plan 必须一起落库。
+
+实现过程：
+
+1. Agent 侧能力同步：
+   - Maxwell prompt 明确要求长期任务使用 jarvis_task_plan_decompose。
+   - 时间范围可推断时生成 daily_plan。
+   - 每条 daily item 包含 date/title/description/start_time/end_time/
+     estimated_minutes。
+   - prompt 中明确系统会在用户确认后保存为 background_task_days。
+
+2. 工具层：
+   - jarvis_task_plan_decompose 返回 daily_plan。
+   - 雅思/考试类生成听力、阅读、口语、写作、复盘等轮换任务。
+   - 旅行类生成约束确认、交通住宿、路线活动、预订证件、行李天气等任务。
+   - 默认按 target_start / target_end 推断天数，最多限制 60 天。
+
+3. 数据库层：
+   - 新增 background_task_days。
+   - 新增 maxwell_workbench_items。
+
+4. 持久层：
+   - save_background_task_days。
+   - list_background_task_days。
+   - update_background_task_day_status。
+
+5. API 层：
+   - GET  /api/v1/jarvis/background-tasks/{task_id}/days
+   - GET  /api/v1/jarvis/background-task-days
+   - POST /api/v1/jarvis/background-task-days/{day_id}/complete
+
+6. 确认链路：
+   - 用户确认 task.plan 时继续保存 background_tasks 总任务。
+   - 同步保存 plan.daily_plan 到 background_task_days。
+   - 返回 task_days 和 task_day_count。
+   - 如果 daily_plan 存在但每日任务落库失败，返回 500 让问题显性化。
+
+7. 前端 API 类型：
+   - BackgroundTaskDay。
+   - listBackgroundTaskDays。
+   - completeBackgroundTaskDay。
+
+测试：
+
+1. test_background_task_days_are_persisted_and_completable
+2. test_confirming_task_plan_persists_daily_plan_days
+3. test_maxwell_knows_daily_plan_task_days_and_workbench
+4. test_task_plan_tool_returns_one_daily_item_per_known_day
+
+--------------------------------------------------------------------
+七、长期任务每日执行 MVP 闭环
+--------------------------------------------------------------------
+
+问题：
+
+daily_plan 已能落到 background_task_days，但用户前端仍看不到每日任务，
+也无法完成某一天任务。Maxwell 工作台表存在，但没有推送入口；逾期状态
+也没有显性化。
+
+修复思路：
+
+1. 先把“可见、可完成、可推送、可标记逾期”跑通。
+2. 凌晨 1 点自动 scheduler 和 LLM 自动重排先留作后续。
+3. Maxwell 工作台先做持久层和 API MVP。
+
+实现过程：
+
+1. 前端每日任务可见化：
+   - CalendarPanel 打开时同时加载 background_task_days。
+   - 日/周/月视图把 background_task_days 作为“长期任务投影”展示。
+   - 任务详情页新增“每日计划”区块。
+   - 每条每日任务展示日期、时间、状态、描述。
+
+2. 前端完成按钮：
+   - 每日任务支持点击“完成”。
+   - 调用 completeBackgroundTaskDay。
+   - 完成后刷新日历和任务详情。
+
+3. Maxwell 工作台 MVP：
+   - 新增 maxwell_workbench_items 的唯一 task_day_id 索引。
+   - 新增 list_maxwell_workbench_items。
+   - 新增 push_background_task_days_to_workbench。
+   - 按 plan_date 把当天 pending 的 background_task_days 推入 Maxwell 工作台。
+   - 同步把 day 状态更新为 pushed。
+   - 重复推送同一天不会重复创建 workbench item。
+
+4. 逾期标记 MVP：
+   - 新增 mark_overdue_background_task_days_missed。
+   - today 之前仍为 pending/pushed 的每日任务标记为 missed。
+   - completed 不会被误标记。
+   - 本次不接 LLM 自动重排，先把逾期状态显性化。
+
+5. API 层：
+   - GET  /api/v1/jarvis/maxwell/workbench-items
+   - POST /api/v1/jarvis/maxwell/workbench/push-daily-tasks
+   - POST /api/v1/jarvis/background-task-days/mark-overdue-missed
+
+测试：
+
+1. test_push_background_task_days_to_workbench_is_idempotent
+2. test_mark_overdue_background_task_days_as_missed
+
+当前边界：
+
+1. Maxwell 工作台推送已有手动 API 和持久层 MVP，凌晨 1 点 scheduler 尚未实现。
+2. 前端还没有独立 Maxwell 工作台页面。
+3. 逾期任务已能标记 missed，但 LLM 自动重排尚未实现。
+4. daily_plan 目前偏规则模板生成，后续应升级为 LLM schema 输出并由后端校验。
+
+--------------------------------------------------------------------
+八、Agent Consult 私下咨询层
+--------------------------------------------------------------------
+
+目标：
+
+实现非圆桌场景下的受控 Agent 私下咨询：
+
+1. 用户可以明确要求一个角色去问另一个角色。
+2. 支持最多两跳链式咨询。
+3. Shadow 不参与可见角色咨询。
+4. 最终仍由当前私聊角色回复用户，不自动进入圆桌。
+
+示例需求：
+
+让营养师去问问心理师最近的心理状况，再决定吃什么。
+
+修复/实现思路：
+
+1. 不做无限 Agent 社交网络。
+2. 只处理用户明确触发的咨询。
+3. 用规则解析别名和“问/咨询”类触发词。
+4. 最多两跳，避免 token、延迟和行为不可控。
+5. 咨询结果作为上下文注入最终主 Agent prompt。
+
+实现过程：
+
+1. 新增：
+   - shadowlink-ai/app/jarvis/agent_consultation.py
+
+2. 支持 Agent 英文名和中文角色别名：
+   - Alfred / 总管家 / 管家
+   - Maxwell / 秘书 / 日程管家 / 日程
+   - Nora / 营养师 / 营养
+   - Mira / 心理师 / 心理医生 / 心理咨询师 / 心理
+   - Leo / 生活顾问 / 生活
+
+3. 支持触发词：
+   - 问
+   - 问问
+   - 问一下
+   - 咨询
+   - 听听
+
+4. 执行策略：
+   - 最多执行 2 条咨询边。
+   - 链式咨询按下游优先执行。
+   - A 问 B 时可带上 B 问 C 的结果。
+   - 每条咨询写入 collaboration_memories。
+   - memory_kind = agent_consultation。
+
+5. /jarvis/chat 接入：
+   - 在 run_agent_turn 前执行 run_agent_consultations。
+   - 向最终主 Agent prompt 注入“私下咨询结果”。
+   - API response actions 增加 agent.consult。
+
+6. 前端展示：
+   - AgentChatPanel 对 agent.consult action 渲染“已完成私下咨询”卡片。
+
+测试：
+
+1. “问问心理师”能解析为 Nora -> Mira。
+2. “营养师问心理师，再让心理师问秘书”能解析为 Nora -> Mira、Mira -> Maxwell。
+3. 链式咨询按 Maxwell 后 Mira 的依赖顺序执行。
+4. 咨询结果写入 collaboration_memories，并对根 Agent 可见。
+5. /jarvis/chat 会把私下咨询结果注入最终 Agent prompt。
+6. /jarvis/chat 返回 agent.consult action。
+
+验证记录：
+
+1. Agent consult focused 测试阶段：
+   - 23 passed
+2. 前端类型检查：
+   - passed
+3. Python py_compile：
+   - passed
+
+当前边界：
+
+1. 这是显式用户触发的 Consult 层，不是 Agent 自主无限社交网络。
+2. 当前解析是规则型别名 + 触发词，后续可升级为 LLM router。
+3. 前端只展示摘要卡片，不展开完整内部 prompt。
+4. 权限策略目前是“所有可见 Agent 之间可咨询，Shadow 禁止”。
+
+--------------------------------------------------------------------
+九、Preference Learner v2：后台偏好画像闭环
+--------------------------------------------------------------------
+
+目标：
+
+优化 Shadow 偏好学习器，使偏好学习不再只是内存对象，而是能后台持续
+沉淀为稳定的全局/角色专属画像，并在后续私聊中回流到 Agent prompt。
+
+用户要求：
+
+1. 不需要前端显式入口。
+2. 后台一直运作学习。
+3. 每个助手要能随着相处时间变长，稳定演化自己的用户画像。
+
+修复/实现思路：
+
+1. 偏好必须持久化，不能只存在进程内。
+2. 区分 global 和 agent scope。
+3. 重复偏好不堆积，用 evidence_count 和 confidence 稳定演化。
+4. 每轮聊天不都调用 LLM，保留每 5 次观察提取一次，控制 token 成本。
+5. Agent prompt 只注入当前角色相关画像和全局画像。
+
+实现过程：
+
+1. 后端持久化：
+   - 新增 agent_preference_profiles。
+   - 字段包括 agent_id、preference_key、preference_value、confidence、
+     evidence_count、source_agent、source_excerpt、created_at、updated_at、
+     last_seen_at、status。
+   - 唯一约束 UNIQUE(agent_id, preference_key)。
+
+2. 新增持久层函数：
+   - upsert_agent_preference_profile。
+   - list_agent_preference_profiles。
+
+3. PreferenceLearner 升级：
+   - 保留 get_profile() 兼容旧调用。
+   - Shadow 每 5 次观察执行一次 LLM 提取。
+   - 新 schema 支持 preferences 数组。
+   - scope=global 写入 global。
+   - scope=agent 写入指定角色。
+   - 重复 key 累加 evidence_count，并取更高 confidence。
+   - 保留旧版 {"key","value"} fallback。
+
+4. Prompt 回流：
+   - 新增 build_preference_profile_prefix(agent_id)。
+   - /jarvis/chat 在最终 prompt 中注入“偏好学习画像”。
+   - 同时注入 global 画像和当前 Agent 专属画像。
+
+测试：
+
+1. 旧版 PreferenceLearner observe / get_profile 仍兼容。
+2. upsert 相同 agent_id + preference_key 会累积 evidence_count。
+3. confidence 使用更高置信度。
+4. Shadow LLM 输出 global + per-agent 偏好后能持久化。
+5. build_preference_profile_prefix 能同时召回全局画像和角色画像。
+6. /jarvis/chat prompt 包含偏好学习画像。
+
+验证记录：
+
+1. focused 测试：
+   - 6 passed
+2. 当时 Jarvis 单元测试集合：
+   - 61 passed
+3. Python py_compile：
+   - passed
+4. 前端类型检查：
+   - passed
+5. git diff --check：
+   - passed
+
+当前边界：
+
+1. 没有前端入口。
+2. 没有删除/禁用某条偏好画像的 UI。
+3. 冲突偏好目前采用“更新 value + 累积证据 + 保留更高 confidence”，
+   还没有完整冲突历史审计。
+
+--------------------------------------------------------------------
+十、长期记忆有边界共享与生命周期压缩
+--------------------------------------------------------------------
+
+目标：
+
+把长期记忆从“全局池按重要性取前 N 条”升级为更接近人脑记忆的机制：
+
+1. 有边界共享：
+   - 全局稳定记忆可跨 Agent 共享。
+   - Agent 私有原文不跨角色泄露。
+   - 敏感内容跨角色只走摘要。
+2. 有生命周期：
+   - 最近记忆保留 raw。
+   - 久远 raw 记忆压缩为 condensed。
+   - 原 raw 归档，默认不再召回。
+3. 兼顾速度和精确性：
+   - 第一版不引入向量库。
+   - 使用 SQLite + 规则打分。
+   - 召回条数固定，不随记忆总量线性增长。
+
+修复/实现思路：
+
+1. 先在 SQLite schema 中补生命周期字段。
+2. 主召回链路替换为 bounded memory recall。
+3. 召回前做 visibility 过滤，避免串长期记忆。
+4. 压缩器先做确定性摘要，保持速度快、测试稳定。
+5. 旧 raw 不物理删除，改为 archived，方便恢复和审计。
+
+实现过程：
+
+1. 持久层：
+   - jarvis_memories 增加 memory_tier、visibility、owner_agent_id、
+     allowed_agent_ids、compressed_from_ids、expires_at、decay_score、
+     last_accessed_at、access_count。
+   - save_jarvis_memory 支持写入生命周期元数据。
+   - mark_jarvis_memories_used 更新 last_accessed_at 和 access_count。
+   - 新增 archive_jarvis_memories。
+
+2. 有边界召回：
+   - 新增 shadowlink-ai/app/jarvis/memory_recall.py。
+   - 新增 build_bounded_memory_recall_prefix(agent_id, user_message, limit=6)。
+   - 召回过滤：
+       global：所有可见 Agent 可用。
+       private_raw：仅 owner / allowed agent 可用。
+       agent_scoped：owner / allowed agent 可用。
+       sensitive_summary：只共享摘要，按 allowed_agent_ids 控制。
+   - 召回打分考虑 importance、recency、agent relevance、memory_kind relevance、
+     keyword overlap、tier/visibility、decay_score。
+   - /jarvis/chat 从旧 build_memory_recall_prefix 切换到 bounded recall。
+
+3. 记忆压缩：
+   - 新增 shadowlink-ai/app/jarvis/memory_compactor.py。
+   - compact_old_raw_memories(cutoff_days=7) 找到超过 cutoff 的 active raw 记忆。
+   - 按 owner/sensitivity 分组生成 condensed summary。
+   - 原 raw 标记为 archived。
+   - maybe_compact_old_raw_memories 按 min_interval_seconds 节流。
+   - /jarvis/chat 保存记忆后按节流触发压缩检查。
+
+测试：
+
+1. save_jarvis_memory 能保存生命周期元数据。
+2. Nora 能召回 global 记忆和允许共享的 sensitive_summary。
+3. Nora 不能召回 Mira 的 private_raw 心理原文。
+4. Nora / Maxwell 召回会偏向各自角色相关记忆。
+5. 旧 raw 记忆会压缩成 condensed，并归档原始 raw。
+6. maybe_compact_old_raw_memories 有节流。
+7. /jarvis/chat 最终 prompt 使用 bounded memory recall。
+
+验证记录：
+
+1. focused 测试：
+   - 6 passed
+2. 当时 Jarvis 单元测试集合：
+   - 67 passed
+3. Python py_compile：
+   - passed
+4. 前端类型检查：
+   - passed
+5. git diff --check：
+   - passed
+
+当前边界：
+
+1. 压缩器第一版不调用 LLM。
+2. 目前没有向量检索。
+3. 原文没有物理删除，而是 archived。
+4. MemoryPanel 仍显示 active jarvis_memories；archived 默认不会返回。
+5. 旧 build_memory_recall_prefix 保留给兼容测试和潜在旧调用。
+
+--------------------------------------------------------------------
+十一、异常触发主动打扰可靠性升级
+--------------------------------------------------------------------
+
+范围：
+
+本轮只处理异常触发主动打扰。日常节律 / 固定时间 routine 当时暂不实现，
+后续在第十二节单独完成。
+
+问题：
+
+1. 原 proactive message 只存在 ProactiveTriggerEngine._pending_messages 内存队列。
+2. GET /jarvis/messages 和 SSE 都通过 pop_pending_messages() 取出即清空。
+3. 服务重启、页面刷新、多客户端订阅都可能导致消息丢失或不可见。
+4. 前端有 ProactiveMessageFeed 组件，但 JarvisHome 没有真正渲染。
+
+修复思路：
+
+1. 主动消息必须持久化。
+2. GET /jarvis/messages 必须非破坏式读取。
+3. SSE 只能标记 delivered，不能清空全局消息。
+4. 前端本地 store 需要按 id upsert，防止 SSE / demo / 页面加载重复插入。
+5. feed 要真正显示在 JarvisHome。
+
+实现过程：
+
+1. 后端模型：
+   - ProactiveMessage 增加 priority、status、delivered_at、read_at、dismissed_at。
+
+2. 数据库：
+   - proactive_messages 表增加 id、agent_id、agent_name、content、trigger、
+     priority、status、created_at、delivered_at、read_at、dismissed_at。
+
+3. 持久化 API：
+   - save_proactive_message。
+   - list_proactive_messages。
+   - mark_proactive_messages_delivered。
+   - mark_proactive_message_read。
+   - dismiss_proactive_message。
+
+4. 引擎：
+   - ProactiveTriggerEngine 命中 send_message 后写入 SQLite。
+
+5. API：
+   - GET /jarvis/messages 改为非破坏式读取。
+   - POST /jarvis/messages/{message_id}/read。
+   - POST /jarvis/messages/{message_id}/dismiss。
+   - SSE /jarvis/messages/stream 从 SQLite 读取未读消息，并在单个 SSE 连接内按 id 去重。
+   - /jarvis/proactive/fire 从持久化消息里筛本次新增消息返回。
+
+6. 前端：
+   - JarvisPage mount 时调用 loadProactiveMessages。
+   - jarvisStore.addProactiveMessage 按 id upsert。
+   - markMessageRead 调用后端 read endpoint 并合并返回状态。
+   - JarvisHome 右侧栏渲染 ProactiveMessageFeed。
+
+测试：
+
+1. test_proactive_messages_are_persistent_and_non_destructive
+2. test_proactive_message_status_flow_read_and_dismissed
+3. test_check_triggers_persists_proactive_messages
+4. test_get_proactive_messages_is_non_destructive
+5. test_mark_proactive_message_read_updates_state
+
+验证记录：
+
+1. focused proactive tests：
+   - 5 passed
+2. Jarvis unit tests：
+   - 70 passed
+3. frontend type-check：
+   - passed
+4. Python py_compile：
+   - passed
+5. git diff --check：
+   - passed
+
+--------------------------------------------------------------------
+十二、日常节律定时打扰方案 B
+--------------------------------------------------------------------
+
+目标：
+
+实现用户选择的方案 B：不要做过重的完整 scheduler 系统，但要比纯固定
+时间更聪明一些，具备活跃判断、quiet hours、优先级调节和去重。
+
+设计取舍：
+
+1. 不做独立调度服务。
+2. 不做配置界面。
+3. 复用现有 ProactiveTriggerEngine 的 5 分钟轮询。
+4. 复用 proactive_messages、SSE、feed、read/dismiss 状态流。
+5. routine 固定写在代码里，后续再由偏好学习动态调整。
+
+实现过程：
+
+1. 新增 routine scheduler：
+   - shadowlink-ai/app/jarvis/proactive_routines.py
+
+2. 固定 4 类节律：
+   - morning_brief：08:00-10:30，Maxwell 晨间提醒 / 日程检查。
+   - midday_appetite：11:30-13:30，Nora 午餐 / 胃口询问。
+   - evening_checkin：21:30-23:30，Mira 晚间状态确认。
+   - weekly_review：周日 19:00-21:30，Alfred 周复盘。
+
+3. 轻量策略层：
+   - quiet hours：00:00-06:30 不触发 routine。
+   - 用户活跃判断：最近 120 分钟内由 user / user_chat / user_ui 更新过上下文。
+   - 活跃用户：normal priority，压力/日程/睡眠异常时可升为 high。
+   - 非活跃用户：仍落库，但降为 low priority，等用户回来后在 feed 中看到。
+   - 晚间高压力或情绪下降时，evening_checkin 升为 high priority。
+   - 睡眠差或日程密集时，morning_brief 文案更温和/更偏日程保护。
+
+4. 去重持久化：
+   - 新增 proactive_routine_runs。
+   - 以 routine_id + run_date 唯一约束保证同一天同一 routine 只触发一次。
+   - 新增 has_proactive_routine_run。
+   - 新增 save_proactive_routine_run。
+
+5. 引擎接入：
+   - ProactiveTriggerEngine 新增 routine_scheduler。
+   - start() 循环中在 check_triggers() 后调用 check_routines()。
+   - routine 生成的仍是 ProactiveMessage。
+
+6. 用户活跃记录：
+   - /jarvis/chat 开始时调用 LifeContextBus.update_fields({}, source="user_chat")。
+   - 不改变压力、日程、睡眠等业务字段，只更新时间戳和 source_agent。
+   - routine scheduler 可把真实聊天行为识别为“用户最近活跃”。
+
+7. 旧库兼容修复：
+   - 旧库 agent_chat_turns / conversation_history / collaboration_memories 可能缺
+     session_id 等新列。
+   - 将相关索引创建移动到列迁移之后，避免初始化时报 no such column。
+   - 为 conversation_history 补 session_id / route_payload / last_opened_at。
+   - 为 collaboration_memories 补 session_id。
+
+测试：
+
+1. test_morning_brief_fires_once_when_user_recently_active
+2. test_midday_appetite_inactive_user_is_low_priority_but_persisted
+3. test_evening_checkin_becomes_high_priority_when_stress_is_high
+4. test_routines_do_not_fire_during_quiet_hours
+5. test_proactive_routine_runs_are_recorded_once_per_day
+6. test_existing_conversation_and_collaboration_tables_get_session_columns
+7. test_chat_with_agent 追加断言：聊天会刷新 source_agent=user_chat
+
+验证记录：
+
+1. focused routine / migration / chat tests：
+   - 7 passed
+2. 最新 Jarvis unit tests：
+   - 76 passed
+3. focused integration tests：
+   - 3 passed
+4. Python py_compile：
+   - passed
+5. git diff --check：
+   - passed
+
+当前边界：
+
+1. 节律配置暂时写死。
+2. “非活跃只落库”复用 feed 语义，没有做真正系统通知队列。
+3. 后续策略层可继续加合并/降级、用户反馈、打扰预算按 routine 类型区分。
+
+--------------------------------------------------------------------
+十三、验证记录汇总
+--------------------------------------------------------------------
+
+最新完整 Jarvis 单元测试：
+
+命令：
+   cd "/Users/ohmorimotoki/Downloads/Jarvis Life v3/shadowlink-ai"
+   ./.venv311/bin/python -m pytest tests/unit/jarvis -q
+
+结果：
+   76 passed
+
+最新 focused integration tests：
+
+命令：
+   cd "/Users/ohmorimotoki/Downloads/Jarvis Life v3/shadowlink-ai"
+   ./.venv311/bin/python -m pytest \
+     tests/integration/test_jarvis_api.py::test_chat_with_agent \
+     tests/integration/test_jarvis_api.py::test_get_proactive_messages_is_non_destructive \
+     tests/integration/test_jarvis_api.py::test_mark_proactive_message_read_updates_state -q
+
+结果：
+   3 passed
+
+Python 编译：
+
+覆盖文件：
+   - app/jarvis/proactive_routines.py
+   - app/jarvis/proactive_engine.py
+   - app/jarvis/persistence.py
+   - app/api/v1/jarvis_router.py
+   - 相关测试文件
+
+结果：
+   passed
+
+前端类型检查：
+
+命令：
+   cd shadowlink-web
+   npm run type-check
+
+结果：
+   passed
+
+Diff 检查：
+
+命令：
+   git diff --check
+
+结果：
+   passed
+
+--------------------------------------------------------------------
+十四、当前边界与待办
+--------------------------------------------------------------------
+
+高优先级：
+
+1. GitHub push：
+   - 本地提交已在 main。
+   - 需要刷新 GitHub 凭据或接受 collaborator 邀请后重新 push。
+
+2. Maxwell 工作台：
+   - 已有手动 API 和持久层 MVP。
+   - 还没有独立前端工作台页面。
+   - 凌晨 1 点自动推送还未实现。
+
+3. 长期任务状态流：
+   - 已有 complete / pushed / missed。
+   - 还缺修改、删除、延期、跳过、reschedule UI。
+
+中优先级：
+
+1. LLM 逾期自动重排：
+   - 已有 missed 标记。
+   - 还未按剩余天数重新分配未完成任务。
+
+2. daily_plan schema：
+   - 当前偏规则模板。
+   - 后续应升级为 LLM schema 输出，并由后端做字段校验和兜底。
+
+3. 主动打扰策略层：
+   - 可继续做合并/降级、用户反馈、quiet hours 个性化、打扰预算细分。
+
+4. routine 个性化：
+   - 当前时间窗写死。
+   - 后续可由用户作息、偏好学习、历史接受率动态调整。
+
+低优先级：
+
+1. 给长期任务列表增加按 task/day 的筛选和搜索。
+2. 在历史对话 UI 里更清楚地区分“新私聊 session”和“恢复历史 session”。
+3. 给跨 Agent 路由增加前端单元测试，替代临时状态机脚本。
+4. Agent consult 可从规则解析升级为 LLM router。
+5. 长期记忆后续可在 memory_recall.py 内部替换为 embedding / vector recall。
+
+--------------------------------------------------------------------
+十五、后续日志规则
+--------------------------------------------------------------------
+
+1. 日志统一写入：
+   docs/ohmori-worklog/
+
+2. 每次功能或 bugfix 记录至少包含：
+   - 问题
+   - 修复思路
+   - 实现过程
+   - 测试与验证
+   - 当前边界
+   - 下一步待办
+
+3. 每次准备提交前记录量化指标：
+   - 新增文件数
+   - 修改文件数
+   - 重命名/删除文件数
+   - insertions / deletions
+   - 测试通过数量
+   - 当前 commit / branch / remote 状态
+
+4. 最终答复前以最新测试输出为准，不沿用旧测试结果。
+
+                                          — 2026-04-27 整理版

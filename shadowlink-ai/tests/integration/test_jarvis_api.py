@@ -1,8 +1,12 @@
 from unittest.mock import AsyncMock
+import tempfile
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.jarvis import persistence
+from app.jarvis.models import ProactiveMessage
 from app.jarvis.persistence import (
     clear_collaboration_memories,
     save_collaboration_memory,
@@ -100,6 +104,10 @@ async def test_chat_with_agent(client):
     })
     assert resp.status_code == 200
     assert "content" in resp.json()
+
+    context_resp = await client.get("/api/v1/jarvis/context")
+    assert context_resp.status_code == 200
+    assert context_resp.json()["source_agent"] == "user_chat"
 
 
 @pytest.mark.asyncio
@@ -553,7 +561,50 @@ async def test_global_user_constraint_reaches_other_agents(client_with_mock_llm)
 
 
 @pytest.mark.asyncio
-async def test_get_pending_proactive_messages(client):
-    resp = await client.get("/api/v1/jarvis/messages")
-    assert resp.status_code == 200
-    assert isinstance(resp.json(), list)
+async def test_get_proactive_messages_is_non_destructive(client, monkeypatch):
+    tmp = Path(tempfile.mkdtemp()) / "jarvis.db"
+    monkeypatch.setattr(persistence, "_DB_PATH", tmp)
+    persistence._initialized = False
+    saved = await persistence.save_proactive_message(
+        ProactiveMessage(
+            agent_id="alfred",
+            agent_name="Alfred",
+            content="压力偏高，我来帮你看今天的重点。",
+            trigger="stress_spike",
+        )
+    )
+
+    first = await client.get("/api/v1/jarvis/messages")
+    second = await client.get("/api/v1/jarvis/messages")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert [msg["id"] for msg in first.json()] == [saved["id"]]
+    assert [msg["id"] for msg in second.json()] == [saved["id"]]
+    persistence._initialized = False
+
+
+@pytest.mark.asyncio
+async def test_mark_proactive_message_read_updates_state(client, monkeypatch):
+    tmp = Path(tempfile.mkdtemp()) / "jarvis.db"
+    monkeypatch.setattr(persistence, "_DB_PATH", tmp)
+    persistence._initialized = False
+    saved = await persistence.save_proactive_message(
+        ProactiveMessage(
+            agent_id="mira",
+            agent_name="Mira",
+            content="我注意到你最近情绪有些下降。",
+            trigger="mood_declining",
+        )
+    )
+
+    read_resp = await client.post(f"/api/v1/jarvis/messages/{saved['id']}/read")
+    unread_resp = await client.get("/api/v1/jarvis/messages")
+    history_resp = await client.get("/api/v1/jarvis/messages?include_read=true")
+
+    assert read_resp.status_code == 200
+    assert read_resp.json()["status"] == "read"
+    assert read_resp.json()["read"] is True
+    assert unread_resp.json() == []
+    assert [msg["id"] for msg in history_resp.json()] == [saved["id"]]
+    persistence._initialized = False
