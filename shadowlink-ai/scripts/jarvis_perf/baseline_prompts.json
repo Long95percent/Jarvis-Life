@@ -1,0 +1,162 @@
+﻿[
+  {
+    "id": "normal_01",
+    "category": "normal_chat",
+    "agent_id": "mira",
+    "message": "我今天有点累，想随便聊两句。",
+    "new_session": true,
+    "expected": "普通陪伴聊天，不触发工具，不触发 consult。"
+  },
+  {
+    "id": "normal_02",
+    "category": "normal_chat",
+    "agent_id": "leo",
+    "message": "推荐一个今晚可以放松一下的小活动。",
+    "new_session": true,
+    "expected": "普通体验建议，轻量回复。"
+  },
+  {
+    "id": "normal_03",
+    "category": "normal_chat",
+    "agent_id": "athena",
+    "message": "帮我用三句话分析一下为什么我最近效率下降。",
+    "new_session": true,
+    "expected": "普通分析回复，不写库动作。"
+  },
+  {
+    "id": "normal_04",
+    "category": "normal_chat",
+    "agent_id": "maxwell",
+    "message": "今天先不用安排任务，只帮我梳理一下现在该先做什么。",
+    "new_session": true,
+    "expected": "普通秘书建议，不生成确认卡。"
+  },
+  {
+    "id": "normal_05",
+    "category": "normal_chat",
+    "agent_id": "mira",
+    "message": "我想听一句鼓励，但不要太鸡汤。",
+    "new_session": false,
+    "expected": "短回复，复用同一会话上下文。"
+  },
+  {
+    "id": "route_01",
+    "category": "schedule_route",
+    "agent_id": "mira",
+    "message": "明天下午 3 点提醒我复习英语听力 1 小时。",
+    "new_session": true,
+    "expected": "从 Mira 路由到 Maxwell，生成待确认日程。"
+  },
+  {
+    "id": "route_02",
+    "category": "schedule_route",
+    "agent_id": "leo",
+    "message": "周六上午帮我安排一次户外散步和买菜。",
+    "new_session": true,
+    "expected": "从 Leo 路由到 Maxwell，生成日程/任务建议。"
+  },
+  {
+    "id": "route_03",
+    "category": "schedule_route",
+    "agent_id": "athena",
+    "message": "我想在两周内准备完考试第一轮复习，帮我拆成每天任务。",
+    "new_session": true,
+    "expected": "长期任务规划，路由 Maxwell。"
+  },
+  {
+    "id": "route_04",
+    "category": "schedule_route",
+    "agent_id": "mira",
+    "message": "我状态很差，但今晚还要学 2 小时，你帮我重新安排一下。",
+    "new_session": true,
+    "expected": "心理+日程混合，可能 consult，最终 Maxwell 接管。"
+  },
+  {
+    "id": "route_05",
+    "category": "schedule_route",
+    "agent_id": "athena",
+    "message": "把我明天上午的复盘、运动和阅读排一个合理顺序。",
+    "new_session": false,
+    "expected": "路由 Maxwell，复用历史上下文。"
+  },
+  {
+    "id": "memory_01",
+    "category": "memory_recall",
+    "agent_id": "mira",
+    "message": "结合我之前的状态，你觉得我最近最需要注意什么？",
+    "new_session": true,
+    "expected": "触发长期记忆/偏好画像召回。"
+  },
+  {
+    "id": "memory_02",
+    "category": "memory_recall",
+    "agent_id": "maxwell",
+    "message": "按照我以往更容易坚持的方式，给今天学习安排一点建议。",
+    "new_session": true,
+    "expected": "触发偏好画像和记忆召回。"
+  },
+  {
+    "id": "memory_03",
+    "category": "memory_recall",
+    "agent_id": "athena",
+    "message": "我之前提到过的长期目标里，现在最该推进哪一个？",
+    "new_session": true,
+    "expected": "长期目标相关召回。"
+  },
+  {
+    "id": "memory_04",
+    "category": "memory_recall",
+    "agent_id": "leo",
+    "message": "根据我以前喜欢的放松方式，推荐一个今晚能做的事情。",
+    "new_session": true,
+    "expected": "偏好召回，普通回复。"
+  },
+  {
+    "id": "mood_01",
+    "category": "mood_care",
+    "agent_id": "mira",
+    "message": "我今天特别累，不想学了，也有点自责。",
+    "new_session": true,
+    "expected": "心理关怀回复，后续 Step2 可观察 care action。"
+  },
+  {
+    "id": "mood_02",
+    "category": "mood_care",
+    "agent_id": "mira",
+    "message": "我最近压力很大，睡眠也不好，感觉有点撑不住。",
+    "new_session": true,
+    "expected": "高压力识别，安全温和建议。"
+  },
+  {
+    "id": "mood_03",
+    "category": "mood_care",
+    "agent_id": "mira",
+    "message": "今晚 9 点提醒我休息一下，别一直硬撑。",
+    "new_session": true,
+    "expected": "心理关怀+提醒意图，可能路由 Maxwell。"
+  },
+  {
+    "id": "roundtable_01",
+    "category": "roundtable",
+    "agent_id": "mira",
+    "message": "我今天很累但还有学习任务，要不要继续？我想听听大家意见。",
+    "new_session": true,
+    "expected": "可能触发 decision 圆桌推荐或 escalation hint。"
+  },
+  {
+    "id": "roundtable_02",
+    "category": "roundtable",
+    "agent_id": "athena",
+    "message": "我有三个项目想法，但不知道哪个更值得做，适合开个圆桌讨论吗？",
+    "new_session": true,
+    "expected": "brainstorm/decision 圆桌入口场景。"
+  },
+  {
+    "id": "roundtable_03",
+    "category": "roundtable",
+    "agent_id": "leo",
+    "message": "帮我召集大家 brainstorm 一个周末恢复精力的小计划。",
+    "new_session": true,
+    "expected": "brainstorm 圆桌入口或多 Agent 建议。"
+  }
+]

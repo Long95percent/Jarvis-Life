@@ -8,9 +8,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.codec.ServerSentEvent;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestMethod;
@@ -22,6 +24,7 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Jarvis proxy — transparent pass-through from Java Gateway to Python AI.
@@ -50,33 +53,7 @@ public class JarvisProxyController {
     // ── REST catch-all (SSE paths have more specific mappings and take precedence) ─
     @Operation(summary = "Proxy any REST Jarvis request to Python")
     @RequestMapping(
-            value = {
-                    "/context",
-                    "/profile",
-                    "/agent-config",
-                    "/agent-config/{agentId}",
-                    "/agent-config/shadow/toggle",
-                    "/llm-status",
-                    "/chat",
-                    "/chat/{agentId}/history",
-                    "/messages",
-                    "/agents",
-                    "/calendar/events",
-                    "/calendar/events/{eventId}",
-                    "/pending-actions",
-                    "/pending-actions/{pendingId}",
-                    "/pending-actions/{pendingId}/confirm",
-                    "/pending-actions/{pendingId}/cancel",
-                    "/background-tasks",
-                    "/team/collaborate",
-                    "/scenarios",
-                    "/proactive/fire",
-                    "/proactive/triggers",
-                    "/shadow/profile",
-                    "/local-life",
-                    "/sessions",
-                    "/sessions/{sessionId}/turns"
-            },
+            value = "/**",
             method = {
                     RequestMethod.GET,
                     RequestMethod.POST,
@@ -109,8 +86,18 @@ public class JarvisProxyController {
         } catch (WebClientResponseException e) {
             return ResponseEntity
                     .status(e.getStatusCode())
-                    .headers(e.getHeaders())
+                    .contentType(e.getHeaders().getContentType() != null
+                            ? e.getHeaders().getContentType()
+                            : MediaType.APPLICATION_JSON)
+                    .header("X-Request-ID", e.getHeaders().getFirst("X-Request-ID"))
                     .body(e.getResponseBodyAsByteArray());
+        } catch (WebClientRequestException e) {
+            log.warn("Jarvis REST proxy could not reach Python AI service: {} {} -> {}",
+                    method, upstream, e.getMessage());
+            return ResponseEntity
+                    .status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(aiServiceUnavailableBody(e).getBytes(StandardCharsets.UTF_8));
         }
     }
 
@@ -209,5 +196,27 @@ public class JarvisProxyController {
             // Client already gone
         }
         emitter.completeWithError(error);
+    }
+
+    private String aiServiceUnavailableBody(WebClientRequestException e) {
+        String message = escapeJson(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+        return "{"
+                + "\"success\":false,"
+                + "\"code\":503,"
+                + "\"message\":\"Python AI service is unavailable\","
+                + "\"data\":{"
+                + "\"error_type\":\"" + e.getClass().getSimpleName() + "\","
+                + "\"error\":\"" + message + "\","
+                + "\"suggestion\":\"请确认 shadowlink-ai 服务已启动，且 shadowlink.ai-service.rest-base-url 指向正确的 Python AI 地址。\""
+                + "}"
+                + "}";
+    }
+
+    private String escapeJson(String value) {
+        return value
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r", "\\r")
+                .replace("\n", "\\n");
     }
 }

@@ -122,8 +122,31 @@ class ProactiveRoutineScheduler:
     ) -> list[dict]:
         now_utc = (now_utc or now or datetime.utcnow()).replace(tzinfo=None)
         local_now = (now or (now_utc + timedelta(hours=8))).replace(tzinfo=None)
+        maintenance_created: list[dict] = []
+        if local_now.time() >= time(1, 0):
+            from app.core.dependencies import get_resource
+            from app.jarvis.mood_snapshot_maintenance import ensure_mood_snapshots
+            from app.jarvis.planner_maintenance import run_planner_daily_maintenance_once
+
+            mood_maintenance = await ensure_mood_snapshots(today=local_now.date().isoformat(), backfill_days=3, include_today=True)
+            if not mood_maintenance.get("skipped"):
+                maintenance_created.append({"routine_id": "mood_snapshot_maintenance", "result": mood_maintenance})
+
+            maintenance = await run_planner_daily_maintenance_once(
+                today=local_now.date().isoformat(),
+                llm_client=get_resource("llm_client"),
+                auto_reschedule=True,
+                push_today=True,
+            )
+            if not maintenance.get("skipped"):
+                maintenance_created.append({"routine_id": "planner_daily_maintenance", "result": maintenance})
         if _is_quiet_hour(local_now):
-            return []
+            return maintenance_created
+        from app.jarvis.care_triggers import evaluate_care_triggers
+
+        care_results = await evaluate_care_triggers(local_now.date().isoformat())
+        for result in care_results:
+            maintenance_created.append({"routine_id": "care_trigger", "result": result})
 
         from app.jarvis.persistence import (
             has_proactive_routine_run,
@@ -134,7 +157,7 @@ class ProactiveRoutineScheduler:
 
         active = _is_user_recently_active(ctx, now_utc)
         run_date = local_now.date().isoformat()
-        created: list[dict] = []
+        created: list[dict] = [*maintenance_created]
 
         for rule in self.rules:
             if not rule.is_due(local_now):

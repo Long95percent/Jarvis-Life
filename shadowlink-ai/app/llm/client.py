@@ -1,4 +1,4 @@
-"""Unified LLM client — single interface to multiple LLM providers.
+﻿"""Unified LLM client — single interface to multiple LLM providers.
 
 Routes requests to the appropriate provider based on model name.
 Applies middleware chain: rate limiting -> caching -> token counting.
@@ -12,6 +12,7 @@ import structlog
 
 from app.config import settings
 from app.llm.providers.openai import OpenAIProvider
+from app.llm.runtime_config import LLMRuntimeError, validate_current_llm_config
 
 logger = structlog.get_logger("llm.client")
 
@@ -37,18 +38,37 @@ class LLMClient:
     def __init__(self) -> None:
         self._providers: dict[str, Any] = {}
         self._default_provider: Any = None
+        self._initialization_error: LLMRuntimeError | None = None
 
     def initialize(self) -> None:
         """Initialize providers from config. Called during app startup."""
+        try:
+            config = validate_current_llm_config()
+        except LLMRuntimeError as exc:
+            self._initialization_error = exc
+            logger.warning(
+                "llm_client_config_invalid",
+                error_code=exc.code,
+                error=str(exc),
+                suggestion=exc.suggestion,
+            )
+            return
+
         # Default: OpenAI-compatible provider
         self._default_provider = OpenAIProvider(
-            base_url=settings.llm.base_url,
-            api_key=settings.llm.api_key,
-            default_model=settings.llm.model,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            default_model=config.model,
         )
         self._providers["openai"] = self._default_provider
 
-        logger.info("llm_client_initialized", providers=list(self._providers.keys()))
+        logger.info(
+            "llm_client_initialized",
+            providers=list(self._providers.keys()),
+            base_url=config.base_url,
+            model=config.model,
+            api_key_masked=config.masked_api_key(),
+        )
 
     def _resolve_provider(self, model: str | None = None) -> Any:
         """Resolve the provider for a given model name."""
@@ -71,7 +91,9 @@ class LLMClient:
         """Send a chat message and get a response."""
         provider = self._resolve_provider(model)
         if provider is None:
-            return "[LLM Client] No provider configured"
+            if self._initialization_error is not None:
+                raise self._initialization_error
+            raise LLMRuntimeError("LLM_CONFIG_NO_PROVIDER", "No LLM provider configured.")
 
         return await provider.chat(
             message=message,
@@ -92,8 +114,9 @@ class LLMClient:
         """Send a chat message and stream the response."""
         provider = self._resolve_provider(model)
         if provider is None:
-            yield "[LLM Client] No provider configured"
-            return
+            if self._initialization_error is not None:
+                raise self._initialization_error
+            raise LLMRuntimeError("LLM_CONFIG_NO_PROVIDER", "No LLM provider configured.")
 
         async for chunk in provider.chat_stream(
             message=message,
@@ -112,3 +135,4 @@ class LLMClient:
         if provider and hasattr(provider, "get_langchain_llm"):
             return provider.get_langchain_llm(model)
         return None
+

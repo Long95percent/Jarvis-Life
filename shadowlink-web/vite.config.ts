@@ -12,6 +12,13 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
+      // Jarvis Life OS APIs are served by the Python AI service. Keep this
+      // direct in dev so newly added Jarvis routes do not depend on restarting
+      // the Java gateway allow-list first.
+      '/api/v1/jarvis': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
       // Forward AI requests to Java Gateway instead of directly to Python
       // (Jarvis routes /api/v1/jarvis/* are caught by the generic /api rule below,
       //  which forwards to the Java Gateway JarvisProxyController → Python :8000)

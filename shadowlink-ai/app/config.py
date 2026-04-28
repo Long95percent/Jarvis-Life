@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_ENV_FILE = _PROJECT_ROOT / ".env"
 
 
 class _LLMSettings(BaseSettings):
     """LLM provider configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="SHADOWLINK_LLM_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="SHADOWLINK_LLM_",
+        env_file=(".env", _PROJECT_ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     base_url: str = Field(default="https://api.openai.com/v1", description="OpenAI-compatible API base URL")
     model: str = Field(default="gpt-4o-mini", description="Default model name")
@@ -23,7 +34,12 @@ class _LLMSettings(BaseSettings):
 class _GRPCSettings(BaseSettings):
     """gRPC server configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="SHADOWLINK_GRPC_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="SHADOWLINK_GRPC_",
+        env_file=(".env", _PROJECT_ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     port: int = Field(default=50051, description="gRPC listen port")
     max_workers: int = Field(default=10, ge=1)
@@ -34,7 +50,12 @@ class _GRPCSettings(BaseSettings):
 class _RAGSettings(BaseSettings):
     """RAG pipeline configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="SHADOWLINK_RAG_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="SHADOWLINK_RAG_",
+        env_file=(".env", _PROJECT_ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     embedding_model: str = Field(default="sentence-transformers/all-MiniLM-L6-v2")
     embedding_device: str = Field(default="cpu")
@@ -52,7 +73,12 @@ class _RAGSettings(BaseSettings):
 class _AgentSettings(BaseSettings):
     """Agent engine configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="SHADOWLINK_AGENT_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="SHADOWLINK_AGENT_",
+        env_file=(".env", _PROJECT_ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     default_strategy: str = Field(default="react", description="Default agent strategy")
     max_iterations: int = Field(default=15, ge=1, le=50)
@@ -65,7 +91,12 @@ class _AgentSettings(BaseSettings):
 class _MemorySettings(BaseSettings):
     """Agent memory system configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="SHADOWLINK_MEMORY_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="SHADOWLINK_MEMORY_",
+        env_file=(".env", _PROJECT_ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     short_term_max_messages: int = Field(default=50, ge=5)
     long_term_enabled: bool = True
@@ -77,7 +108,12 @@ class _MemorySettings(BaseSettings):
 class _FileProcessingSettings(BaseSettings):
     """File processing configuration."""
 
-    model_config = SettingsConfigDict(env_prefix="SHADOWLINK_FILE_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="SHADOWLINK_FILE_",
+        env_file=(".env", _PROJECT_ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     upload_dir: str = Field(default="./data/uploads")
     max_file_size_mb: int = Field(default=100, ge=1)
@@ -93,7 +129,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="SHADOWLINK_",
-        env_file=".env",
+        env_file=(".env", _PROJECT_ENV_FILE),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -118,6 +154,15 @@ class Settings(BaseSettings):
     agent: _AgentSettings = Field(default_factory=_AgentSettings)
     memory: _MemorySettings = Field(default_factory=_MemorySettings)
     file_processing: _FileProcessingSettings = Field(default_factory=_FileProcessingSettings)
+
+    def model_post_init(self, __context: object) -> None:
+        data_path = Path(self.data_dir)
+        if not data_path.is_absolute():
+            self.data_dir = str((_PROJECT_ROOT / data_path).resolve())
+
+        upload_path = Path(self.file_processing.upload_dir)
+        if not upload_path.is_absolute():
+            self.file_processing.upload_dir = str((_PROJECT_ROOT / upload_path).resolve())
 
 
 settings = Settings()

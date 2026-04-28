@@ -89,7 +89,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     llm_client = LLMClient()
     llm_client.initialize()
     set_resource("llm_client", llm_client)
-    await logger.ainfo("llm_client_ready", model=settings.llm.model, base_url=settings.llm.base_url)
+    if getattr(llm_client, "_initialization_error", None) is None:
+        await logger.ainfo("llm_client_ready", model=settings.llm.model, base_url=settings.llm.base_url)
+    else:
+        await logger.awarning("llm_client_not_ready", model=settings.llm.model, base_url=settings.llm.base_url)
 
     # ── 2. Initialize Tool Registry ──
     from app.mcp.registry import ToolRegistry
@@ -298,6 +301,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await logger.ainfo("jarvis_sessions_rehydrated", count=restored)
     except Exception as exc:
         await logger.awarning("jarvis_rehydrate_failed", error=str(exc))
+
+    try:
+        from app.jarvis.mood_snapshot_maintenance import ensure_mood_snapshots
+
+        mood_result = await ensure_mood_snapshots(backfill_days=3, include_today=True)
+        await logger.ainfo(
+            "jarvis_mood_snapshots_ensured",
+            checked=mood_result.get("checked"),
+            created_count=len(mood_result.get("created") or []),
+            skipped=mood_result.get("skipped"),
+        )
+    except Exception as exc:
+        await logger.awarning("jarvis_mood_snapshot_ensure_failed", error=str(exc))
 
     await logger.ainfo("startup_complete", message="All resources initialized")
 

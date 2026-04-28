@@ -10,6 +10,7 @@ import { CalendarPanel } from "./CalendarPanel";
 import { MemoryPanel } from "./MemoryPanel";
 import { ConversationHistoryPanel } from "./ConversationHistoryPanel";
 import { ProactiveMessageFeed } from "./ProactiveMessageFeed";
+import { CareTrendsPanel } from "./CareTrendsPanel";
 
 /**
  * JarvisHome 鈥?the unified command center.
@@ -29,10 +30,13 @@ export const JarvisHome: React.FC = () => {
   const activeRoundtableInput = useJarvisStore(
     (s) => s.activeRoundtableInput,
   );
+  const activeRoundtableSourceSessionId = useJarvisStore((s) => s.activeRoundtableSourceSessionId);
+  const activeRoundtableSourceAgentId = useJarvisStore((s) => s.activeRoundtableSourceAgentId);
 
   const openPrivateChat = useJarvisStore((s) => s.openPrivateChat);
   const startRoundtable = useJarvisStore((s) => s.startRoundtable);
   const closeRoundtable = useJarvisStore((s) => s.closeRoundtable);
+  const openExistingPrivateChat = useJarvisStore((s) => s.openExistingPrivateChat);
   const resetToScenarioGrid = useJarvisStore((s) => s.resetToScenarioGrid);
   const markMessageRead = useJarvisStore((s) => s.markMessageRead);
 
@@ -45,6 +49,13 @@ export const JarvisHome: React.FC = () => {
         ]),
       ),
     [agents, proactiveMessages],
+  );
+  const recentCareMessages = useMemo(
+    () => proactiveMessages.filter((message) => {
+      const trigger = message.trigger || "";
+      return message.agent_id === "mira" || trigger.startsWith("care") || trigger.includes("risk") || trigger.includes("overload") || trigger.includes("streak") || trigger.includes("planner_missed");
+    }),
+    [proactiveMessages],
   );
 
   return (
@@ -109,7 +120,10 @@ export const JarvisHome: React.FC = () => {
             scenarioId={activeRoundtableScenario}
             userInput={activeRoundtableInput}
             sessionId={sessionId}
+            sourceSessionId={activeRoundtableSourceSessionId}
+            sourceAgentId={activeRoundtableSourceAgentId}
             onClose={closeRoundtable}
+            onReturnToPrivateChat={(agentId, sourceSessionId) => openExistingPrivateChat(agentId, sourceSessionId)}
           />
         )}
 
@@ -125,10 +139,13 @@ export const JarvisHome: React.FC = () => {
       <aside
         className="col-start-2 row-start-1 row-span-2 min-h-0 flex flex-col gap-4 overflow-hidden"
       >
-        <div className="min-h-0 flex-[1.15]">
+        <div className="flex-shrink-0">
+          <CareTrendsPanel recentCareMessages={recentCareMessages} onOpenMira={() => openPrivateChat("mira")} />
+        </div>
+        <div className="min-h-0 flex-1">
           <MemoryPanel />
         </div>
-        <section className="min-h-0 flex-1 rounded-2xl border border-gray-200 bg-white p-4 overflow-hidden flex flex-col">
+        <section className="min-h-0 flex-[0.9] rounded-2xl border border-gray-200 bg-white p-4 overflow-hidden flex flex-col">
           <div className="flex items-start justify-between gap-2 mb-3">
             <div>
               <h3 className="text-sm font-semibold text-gray-700">主动提醒</h3>

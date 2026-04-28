@@ -32,6 +32,9 @@ contextBridge.exposeInMainWorld('shadowlink', {
   onScreenshotCaptured: (callback: (base64: string) => void) => {
     ipcRenderer.on('screenshot-captured', (_event, base64: string) => callback(base64))
   },
+  onJarvisBehaviorLifecycle: (callback: (payload: { type: string; occurredAt: number }) => void) => {
+    ipcRenderer.on('jarvis-behavior-lifecycle', (_event, payload: { type: string; occurredAt: number }) => callback(payload))
+  },
 
   // ── Cleanup ──
   removeAllListeners: (channel: string) => {
@@ -54,6 +57,7 @@ declare global {
       minimizeWindow: () => Promise<void>
       onClipboardContent: (callback: (text: string) => void) => void
       onScreenshotCaptured: (callback: (base64: string) => void) => void
+      onJarvisBehaviorLifecycle: (callback: (payload: { type: string; occurredAt: number }) => void) => void
       removeAllListeners: (channel: string) => void
     }
   }

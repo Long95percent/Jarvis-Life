@@ -33,6 +33,13 @@ let mainWindow: BrowserWindow | null = null
 let quickAssistWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 
+function sendBehaviorLifecycle(type: string): void {
+  mainWindow?.webContents.send('jarvis-behavior-lifecycle', {
+    type,
+    occurredAt: Math.floor(Date.now() / 1000),
+  })
+}
+
 // ── Main Window ──
 
 function createMainWindow(): BrowserWindow {
@@ -63,9 +70,16 @@ function createMainWindow(): BrowserWindow {
   win.once('ready-to-show', () => {
     win.show()
     win.focus()
+    sendBehaviorLifecycle('app_opened')
   })
 
+  win.on('focus', () => sendBehaviorLifecycle('app_activated'))
+  win.on('restore', () => sendBehaviorLifecycle('app_restored'))
+  win.on('minimize', () => sendBehaviorLifecycle('app_minimized'))
+  win.on('hide', () => sendBehaviorLifecycle('app_minimized'))
+
   win.on('close', (e) => {
+    sendBehaviorLifecycle('app_closed')
     // Minimize to tray instead of quitting
     if (tray) {
       e.preventDefault()
@@ -298,10 +312,12 @@ app.on('activate', () => {
     mainWindow = createMainWindow()
   } else {
     mainWindow?.show()
+    sendBehaviorLifecycle('app_activated')
   }
 })
 
 app.on('will-quit', () => {
+  sendBehaviorLifecycle('app_closed')
   globalShortcut.unregisterAll()
   tray?.destroy()
 })

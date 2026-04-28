@@ -1,4 +1,4 @@
-"""Settings API — LLM provider management and runtime configuration."""
+﻿"""Settings API — LLM provider management and runtime configuration."""
 
 from __future__ import annotations
 
@@ -338,8 +338,9 @@ def _apply_provider(provider: dict) -> None:
 @router.get("/llm")
 async def get_llm_settings() -> Result[dict[str, Any]]:
     """Get current LLM configuration (API key masked)."""
-    key = settings.llm.api_key
-    masked = f"{key[:8]}...{key[-4:]}" if len(key) > 12 else "***"
+    from app.llm.runtime_config import mask_api_key
+
+    masked = mask_api_key(settings.llm.api_key)
     return Result.ok(data={
         "base_url": settings.llm.base_url,
         "model": settings.llm.model,
@@ -396,3 +397,4 @@ async def get_service_info() -> Result[dict[str, Any]]:
             list(agent_engine._strategy_executors.keys()) if agent_engine else []
         ),
     })
+

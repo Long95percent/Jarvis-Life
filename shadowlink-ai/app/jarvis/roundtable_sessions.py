@@ -113,6 +113,12 @@ async def create_session_async(
     scenario_name: str,
     participants: list[str],
     agent_roster: Literal["jarvis", "brainstorm"] = "jarvis",
+    mode: str = "brainstorm",
+    source_session_id: str | None = None,
+    source_agent_id: str | None = None,
+    title: str | None = None,
+    user_prompt: str | None = None,
+    status: str = "active",
 ) -> RoundtableSession:
     """Async variant that creates the in-memory session AND writes a
     roundtable_sessions row to SQLite so it survives a restart."""
@@ -132,6 +138,12 @@ async def create_session_async(
         participants=session.participants,
         agent_roster=session.agent_roster,
         round_count=session.round_count,
+        title=title or scenario_name,
+        user_prompt=user_prompt or "",
+        mode=mode,
+        source_session_id=source_session_id,
+        source_agent_id=source_agent_id,
+        status=status,
     )
     return session
 

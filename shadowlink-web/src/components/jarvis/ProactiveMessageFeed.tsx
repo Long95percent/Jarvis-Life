@@ -2,6 +2,7 @@
 import React from "react";
 import type { ProactiveMessage } from "@/services/jarvisApi";
 import { JARVIS_AGENTS } from "./agentMeta";
+import { CareCard } from "./CareCard";
 
 interface Props {
   messages: ProactiveMessage[];
@@ -17,6 +18,15 @@ export const ProactiveMessageFeed: React.FC<Props> = ({ messages, onRead }) => {
     <div className="space-y-2">
       {messages.map((msg) => {
         const meta = JARVIS_AGENTS[msg.agent_id];
+        if (msg.trigger?.startsWith("care") || msg.trigger?.includes("risk") || msg.trigger?.includes("overload") || msg.trigger?.includes("streak")) {
+          return (
+            <CareCard
+              key={msg.id}
+              message={msg}
+              onFeedback={() => onRead(msg.id)}
+            />
+          );
+        }
         return (
           <div
             key={msg.id}

@@ -4,13 +4,17 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Send } from "lucide-react";
 import { JARVIS_AGENTS } from "./agentMeta";
 import { jarvisApi } from "@/services/jarvisApi";
+import type { JarvisMemory, PendingAction, RoundtableBrainstormResult, RoundtableDecisionResult } from "@/services/jarvisApi";
 
 interface Props {
   scenarioId: string;
   userInput: string;
   sessionId: string;
+  sourceSessionId?: string | null;
+  sourceAgentId?: string | null;
   modeId?: string;
   onClose: () => void;
+  onReturnToPrivateChat?: (agentId: string, sessionId: string) => void | Promise<void>;
 }
 
 type TurnKind = "user" | "agent";
@@ -33,12 +37,26 @@ interface SpeakPayload {
   agent_color?: string;
   content?: string;
   phase?: string;
+  progress?: RoundtableProgress;
 }
 
 interface TokenPayload {
   agent_id: string;
   agent_name: string;
   content: string;
+  progress?: RoundtableProgress;
+}
+
+interface RoundtableProgress {
+  current?: number;
+  total?: number;
+  status?: string;
+}
+
+interface AgentDegradedPayload extends SpeakPayload {
+  error?: string;
+  fallback_content?: string;
+  continue_next_agent?: boolean;
 }
 
 interface PhasePayload {
@@ -46,6 +64,12 @@ interface PhasePayload {
   scenario_name?: string;
   participants?: string[];
   round_count?: number;
+  mode?: string;
+}
+
+interface TimingPayload {
+  total_ms?: number;
+  spans?: Array<Record<string, unknown>>;
 }
 
 interface AgentMeta {
@@ -65,6 +89,7 @@ const SCENARIO_META: Record<string, { icon: string; name: string; subtitle: stri
   emotional_care: { icon: "🌸", name: "情绪压力疏导", subtitle: "Emotional Care" },
   weekend_recharge: { icon: "🌿", name: "周末恢复规划", subtitle: "Weekend Recharge" },
   work_brainstorm: { icon: "💡", name: "工作难题头脑风暴", subtitle: "Work Brainstorm" },
+  study_energy_decision: { icon: "⚖️", name: "疲惫学习决策", subtitle: "Decision Roundtable" },
 };
 
 function parseSSEFrames(buffer: string): {
@@ -106,12 +131,20 @@ function computeAgentPositions(n: number, radius: number): Array<{ x: number; y:
   return positions;
 }
 
+type DecisionResult = RoundtableDecisionResult;
+type BrainstormResult = RoundtableBrainstormResult;
+
 function normalizeAgentReply(content: string, agentName: string): string {
   const trimmed = content.trim();
   if (/^\(?Agent\s+[^\s)]+\s+暂无回复\)?$/i.test(trimmed)) {
     return `${agentName} 当前没有拿到模型回复。请检查 AI 服务是否已重启，并确认设置里的 Provider API Key、Base URL、模型名称可用。`;
   }
   return content;
+}
+
+function clampSpeech(content: string, maxChars = 420): string {
+  const trimmed = content.trim();
+  return trimmed.length > maxChars ? `${trimmed.slice(0, maxChars)}…` : trimmed;
 }
 
 function transcriptEntryFromTurn(turn: { role: string; speaker_name: string; content: string; timestamp: number }, index: number): TranscriptEntry {
@@ -139,12 +172,29 @@ function transcriptEntryFromTurn(turn: { role: string; speaker_name: string; con
   };
 }
 
+function contextExplanationItems(result: { context?: Record<string, unknown> } | null): Array<{ key: string; label: string; summary: string; impact: string }> {
+  const explanation = result?.context?.context_explanation;
+  if (!explanation || typeof explanation !== "object") return [];
+  return Object.entries(explanation as Record<string, unknown>).map(([key, raw]) => {
+    const item = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+    return {
+      key,
+      label: typeof item.label === "string" ? item.label : key,
+      summary: typeof item.summary === "string" ? item.summary : "暂无摘要",
+      impact: typeof item.impact === "string" ? item.impact : "用于辅助圆桌判断。",
+    };
+  });
+}
+
 export const RoundtableStage: React.FC<Props> = ({
   scenarioId,
   userInput,
   sessionId,
+  sourceSessionId,
+  sourceAgentId,
   modeId = "general",
   onClose,
+  onReturnToPrivateChat,
 }) => {
   const [participants, setParticipants] = useState<AgentMeta[]>([]);
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
@@ -153,11 +203,24 @@ export const RoundtableStage: React.FC<Props> = ({
   const [phase, setPhase] = useState<string>("connecting");
   const [status, setStatus] = useState<"connecting" | "streaming" | "idle" | "error">("connecting");
   const [roundCount, setRoundCount] = useState<number>(0);
+  const [roundtableMode, setRoundtableMode] = useState<string>(scenarioId === "work_brainstorm" ? "brainstorm" : "decision");
+  const [timing, setTiming] = useState<TimingPayload | null>(null);
+  const [progress, setProgress] = useState<RoundtableProgress | null>(null);
+  const [degradedMessages, setDegradedMessages] = useState<Array<{ agentId: string; agentName: string; message: string }>>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [showTranscript, setShowTranscript] = useState(false);
 
   const [userDraft, setUserDraft] = useState<string>("");
   const [userBubble, setUserBubble] = useState<string | null>(null);
+  const [decisionResult, setDecisionResult] = useState<DecisionResult | null>(null);
+  const [acceptedPendingAction, setAcceptedPendingAction] = useState<PendingAction | null>(null);
+  const [decisionBusy, setDecisionBusy] = useState(false);
+  const [returnBusy, setReturnBusy] = useState(false);
+  const [returnNotice, setReturnNotice] = useState<string | null>(null);
+  const [brainstormResult, setBrainstormResult] = useState<BrainstormResult | null>(null);
+  const [savedBrainstormMemory, setSavedBrainstormMemory] = useState<JarvisMemory | null>(null);
+  const [brainstormPendingAction, setBrainstormPendingAction] = useState<PendingAction | null>(null);
+  const [brainstormBusy, setBrainstormBusy] = useState<"save" | "plan" | null>(null);
 
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -176,6 +239,7 @@ export const RoundtableStage: React.FC<Props> = ({
       emotional_care: ["mira", "nora", "leo", "alfred"],
       weekend_recharge: ["leo", "nora", "mira", "alfred"],
       work_brainstorm: ["moderator", "explorer", "critic", "synthesizer"],
+      study_energy_decision: ["mira", "maxwell", "athena", "alfred"],
     };
     const ids = scenarioAgents[scenarioId] ?? [];
     const resolved = ids.map((id) => ({
@@ -203,6 +267,8 @@ export const RoundtableStage: React.FC<Props> = ({
     try {
       setStatus("streaming");
       setPhase("讨论进行中");
+      setTiming(null);
+      setProgress(null);
       setErrorMsg(null);
       const res = await fetch(endpoint, {
         method: "POST",
@@ -229,7 +295,7 @@ export const RoundtableStage: React.FC<Props> = ({
       }
       if (isMountedRef.current) {
         setStatus("idle");
-        setPhase("等待你的回应");
+      setPhase("等待你的回应");
         setActiveAgentId(null);
         setCurrentContent("");
       }
@@ -251,6 +317,8 @@ export const RoundtableStage: React.FC<Props> = ({
       if (!isMountedRef.current) return;
       if (existingTurns.length > 0) {
         setTranscript(existingTurns.map(transcriptEntryFromTurn));
+        jarvisApi.getRoundtableDecisionResult(sessionId).then(setDecisionResult).catch(() => undefined);
+        jarvisApi.getRoundtableBrainstormResult(sessionId).then(setBrainstormResult).catch(() => undefined);
         setStatus("idle");
         setPhase("已恢复历史讨论");
         setRoundCount(Math.max(1, Math.ceil(existingTurns.filter((turn) => turn.role !== "user").length / Math.max(1, participants.length || 1))));
@@ -261,6 +329,8 @@ export const RoundtableStage: React.FC<Props> = ({
         user_input: userInput,
         session_id: sessionId,
         mode_id: modeId,
+        source_session_id: sourceSessionId ?? undefined,
+        source_agent_id: sourceAgentId ?? undefined,
       });
     })();
     return () => {
@@ -292,6 +362,8 @@ export const RoundtableStage: React.FC<Props> = ({
       };
       setPhase(phaseMap[payload.phase] ?? payload.phase);
       if (payload.round_count) setRoundCount(payload.round_count);
+      if (payload.mode) setRoundtableMode(payload.mode);
+      setProgress(null);
       setCurrentContent("");
       setActiveAgentId(null);
       return;
@@ -304,6 +376,7 @@ export const RoundtableStage: React.FC<Props> = ({
         : "";
       setActiveAgentId(payload.agent_id);
       setCurrentContent(normalizedContent);
+      if (payload.progress) setProgress(payload.progress);
       // Clear user bubble once the first agent starts speaking
       setUserBubble(null);
       if (normalizedContent.trim()) {
@@ -329,6 +402,7 @@ export const RoundtableStage: React.FC<Props> = ({
       const meta = JARVIS_AGENTS[payload.agent_id];
       const normalizedContent = normalizeAgentReply(payload.content, payload.agent_name);
       setCurrentContent(normalizedContent);
+      if (payload.progress) setProgress(payload.progress);
       setTranscript((prev) => [
         ...prev,
         {
@@ -347,6 +421,33 @@ export const RoundtableStage: React.FC<Props> = ({
     if (event === "done") {
       setActiveAgentId(null);
       setCurrentContent("");
+      return;
+    }
+
+    if (event === "agent_degraded") {
+      const payload = data as AgentDegradedPayload;
+      const meta = JARVIS_AGENTS[payload.agent_id];
+      const message = payload.error ? `模型暂时不可用：${payload.error}` : "模型暂时不可用，已用降级回复继续下一位。";
+      if (payload.progress) setProgress(payload.progress);
+      setDegradedMessages((prev) => [
+        ...prev,
+        { agentId: payload.agent_id, agentName: payload.agent_name || meta?.name || payload.agent_id, message },
+      ].slice(-3));
+      return;
+    }
+
+    if (event === "roundtable_timing") {
+      setTiming(data as TimingPayload);
+      return;
+    }
+
+    if (event === "decision_result") {
+      setDecisionResult(data as DecisionResult);
+      return;
+    }
+
+    if (event === "brainstorm_result") {
+      setBrainstormResult(data as BrainstormResult);
       return;
     }
   };
@@ -383,6 +484,62 @@ export const RoundtableStage: React.FC<Props> = ({
     onClose();
   };
 
+  const handleAcceptDecision = async () => {
+    if (!decisionResult || decisionBusy) return;
+    setDecisionBusy(true);
+    try {
+      const res = await jarvisApi.acceptRoundtableDecision(sessionId, decisionResult.id);
+      setDecisionResult(res.result);
+      setAcceptedPendingAction(res.pending_action);
+    } finally {
+      setDecisionBusy(false);
+    }
+  };
+
+  const handleSaveBrainstorm = async () => {
+    if (!brainstormResult || brainstormBusy) return;
+    setBrainstormBusy("save");
+    try {
+      const res = await jarvisApi.saveRoundtableBrainstorm(sessionId, brainstormResult.id);
+      setBrainstormResult(res.result);
+      setSavedBrainstormMemory(res.memory);
+    } finally {
+      setBrainstormBusy(null);
+    }
+  };
+
+  const handleBrainstormToPlan = async () => {
+    if (!brainstormResult || brainstormBusy) return;
+    setBrainstormBusy("plan");
+    try {
+      const res = await jarvisApi.convertRoundtableBrainstormToPlan(sessionId, brainstormResult.id);
+      setBrainstormResult(res.result);
+      setBrainstormPendingAction(res.pending_action);
+    } finally {
+      setBrainstormBusy(null);
+    }
+  };
+
+  const handleReturnToPrivateChat = async (choice: string) => {
+    const resultId = roundtableMode === "brainstorm" ? brainstormResult?.id : decisionResult?.id;
+    if (returnBusy) return;
+    setReturnBusy(true);
+    setReturnNotice(null);
+    try {
+      const res = await jarvisApi.returnRoundtableToPrivateChat(sessionId, {
+        result_id: resultId,
+        user_choice: choice,
+        note: "用户在圆桌页面选择带总结回到原私聊继续。",
+      });
+      setReturnNotice("圆桌总结已写回原私聊，正在返回对话。");
+      await onReturnToPrivateChat?.(res.source_agent_id || "alfred", res.source_session_id);
+    } catch (error) {
+      setReturnNotice(error instanceof Error ? error.message : "返回私聊失败，请稍后重试。若本圆桌不是从私聊发起，请先保存结果。");
+    } finally {
+      setReturnBusy(false);
+    }
+  };
+
   const stageRadius = 220;
   const positions = useMemo(
     () => computeAgentPositions(participants.length, stageRadius),
@@ -390,6 +547,15 @@ export const RoundtableStage: React.FC<Props> = ({
   );
 
   const activeAgent = participants.find((p) => p.id === activeAgentId);
+  const modeTone = roundtableMode === "brainstorm"
+    ? { label: "Brainstorm", accent: "#A78BFA", panel: "border-violet-300/25", hint: "先发散，不自动执行" }
+    : { label: "Decision", accent: "#34D399", panel: "border-emerald-300/25", hint: "先判断，再交给确认" };
+  const hostSummary = decisionResult
+    ? `主持总结：建议「${decisionResult.recommended_option}」，接受后只生成待确认动作。`
+    : brainstormResult
+      ? `主持总结：已沉淀 ${brainstormResult.ideas.length} 个想法，可保存灵感或转给 Maxwell。`
+      : `${modeTone.label} 圆桌进行中：${modeTone.hint}`;
+  const decisionContextItems = contextExplanationItems(decisionResult);
 
   return (
     <AnimatePresence>
@@ -401,7 +567,7 @@ export const RoundtableStage: React.FC<Props> = ({
         className="fixed inset-0 z-50 overflow-hidden"
         style={{
           background:
-            "radial-gradient(ellipse at center, color-mix(in srgb, var(--color-primary) 18%, #0a0a12) 0%, #05050a 75%)",
+            `radial-gradient(ellipse at center, color-mix(in srgb, ${modeTone.accent} 18%, #0a0a12) 0%, #05050a 75%)`,
           backdropFilter: "blur(8px)",
         }}
       >
@@ -426,6 +592,9 @@ export const RoundtableStage: React.FC<Props> = ({
                 {scenarioMeta.subtitle}
                 {roundCount > 0 && ` · Round ${roundCount}`}
               </p>
+              <p className="mt-1 text-[11px] text-white/45">
+                {modeTone.hint}
+              </p>
             </div>
           </div>
 
@@ -443,6 +612,16 @@ export const RoundtableStage: React.FC<Props> = ({
               }`} />
               {phase}
             </motion.div>
+            {timing?.total_ms && (
+              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-white/55">
+                {Math.round(timing.total_ms)}ms
+              </span>
+            )}
+            {progress?.total ? (
+              <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-white/70">
+                进度 {progress.current ?? 0}/{progress.total} · {progress.status === "degraded" ? "已降级继续" : progress.status === "completed" ? "已完成" : "发言中"}
+              </span>
+            ) : null}
 
             <button
               onClick={() => setShowTranscript((s) => !s)}
@@ -461,6 +640,23 @@ export const RoundtableStage: React.FC<Props> = ({
           </div>
         </div>
 
+        {degradedMessages.length > 0 && (
+          <div className="absolute left-8 top-24 z-30 max-w-sm space-y-2">
+            {degradedMessages.map((item, index) => (
+              <div key={`${item.agentId}-${index}`} className="rounded-xl border border-amber-300/25 bg-amber-300/10 px-3 py-2 text-xs text-amber-50 backdrop-blur-md">
+                <div className="font-semibold">{item.agentName} 已降级继续</div>
+                <div className="mt-0.5 text-amber-50/75">{item.message}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {returnNotice && (
+          <div className="absolute left-1/2 top-24 z-30 max-w-md -translate-x-1/2 rounded-xl border border-white/15 bg-white/10 px-4 py-2 text-xs text-white/85 backdrop-blur-md">
+            {returnNotice}
+          </div>
+        )}
+
         {/* Main stage: circular arrangement */}
         <div className="absolute inset-0 flex items-center justify-center pb-36">
           <div
@@ -478,14 +674,17 @@ export const RoundtableStage: React.FC<Props> = ({
                 className="w-40 h-40 rounded-full flex flex-col items-center justify-center backdrop-blur-md border border-white/20"
                 style={{
                   background:
-                    "radial-gradient(circle, color-mix(in srgb, var(--color-primary) 25%, transparent) 0%, color-mix(in srgb, var(--color-primary) 5%, transparent) 100%)",
+                    `radial-gradient(circle, color-mix(in srgb, ${modeTone.accent} 28%, transparent) 0%, color-mix(in srgb, ${modeTone.accent} 6%, transparent) 100%)`,
                   boxShadow:
-                    "0 0 60px color-mix(in srgb, var(--color-primary) 30%, transparent), inset 0 0 40px color-mix(in srgb, var(--color-primary) 10%, transparent)",
+                    `0 0 60px color-mix(in srgb, ${modeTone.accent} 30%, transparent), inset 0 0 40px color-mix(in srgb, ${modeTone.accent} 10%, transparent)`,
                 }}
               >
                 <span className="text-5xl mb-1">{scenarioMeta.icon}</span>
                 <span className="text-[11px] text-white/70 uppercase tracking-widest">
-                  Roundtable
+                  {modeTone.label}
+                </span>
+                <span className="mt-1 max-w-[120px] text-center text-[10px] leading-tight text-white/45">
+                  {hostSummary}
                 </span>
               </div>
             </motion.div>
@@ -578,6 +777,11 @@ export const RoundtableStage: React.FC<Props> = ({
                         {agent.icon}
                       </motion.div>
                       <div className="mt-2 text-center whitespace-nowrap">
+                        {isActive && (
+                          <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: agent.color }}>
+                            Speaking
+                          </div>
+                        )}
                         <div
                           className="text-sm font-semibold"
                           style={{ color: isActive ? agent.color : "rgba(255,255,255,0.7)" }}
@@ -641,8 +845,11 @@ export const RoundtableStage: React.FC<Props> = ({
                     {activeAgent.name} · {activeAgent.role}
                   </div>
                   <p className="text-[15px] leading-relaxed text-gray-800 whitespace-pre-wrap">
-                    {currentContent}
+                    {clampSpeech(currentContent)}
                   </p>
+                  {currentContent.length > 420 && (
+                    <p className="mt-2 text-xs text-gray-500">完整内容已进入左侧完整记录。</p>
+                  )}
                 </div>
               </div>
             </motion.div>
@@ -681,6 +888,159 @@ export const RoundtableStage: React.FC<Props> = ({
             </motion.div>
           )}
         </AnimatePresence>
+
+        {/* Decision result card */}
+        {decisionResult && !showTranscript && (
+          <div className="absolute right-8 top-24 z-30 w-[360px] rounded-2xl border border-emerald-300/25 bg-slate-950/90 p-4 text-white shadow-2xl backdrop-blur-xl">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.2em] text-emerald-200/70">Decision</p>
+                <h3 className="text-base font-semibold">推荐：{decisionResult.recommended_option}</h3>
+              </div>
+              <span className="rounded-full bg-emerald-400/15 px-2 py-1 text-[11px] text-emerald-100">{decisionResult.status}</span>
+            </div>
+            {decisionResult.handoff_status && decisionResult.handoff_status !== "none" ? (
+              <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-2 text-xs text-white/65">
+                交接状态：{decisionResult.handoff_status}{decisionResult.user_choice ? ` · 选择：${decisionResult.user_choice}` : ""}
+              </div>
+            ) : null}
+            {decisionContextItems.length > 0 ? (
+              <div className="mb-3 rounded-xl border border-emerald-300/20 bg-emerald-300/10 p-2 text-xs text-emerald-50">
+                <div className="mb-1 font-semibold">为什么这样建议</div>
+                <div className="space-y-1.5">
+                  {decisionContextItems.map((item) => (
+                    <div key={item.key}>
+                      <div className="font-medium">{item.label}：{item.summary}</div>
+                      <div className="text-emerald-50/70">{item.impact}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <p className="mb-3 text-sm leading-relaxed text-white/75">{decisionResult.summary}</p>
+            <div className="mb-3 space-y-2">
+              {decisionResult.tradeoffs.slice(0, 2).map((item, idx) => (
+                <div key={`${item.option}-${idx}`} className="rounded-xl bg-white/5 p-2 text-xs text-white/70">
+                  <div className="font-medium text-white/90">{item.option}</div>
+                  <div>利：{item.pros?.join("、") || "—"}</div>
+                  <div>弊：{item.cons?.join("、") || "—"}</div>
+                </div>
+              ))}
+            </div>
+            <div className="mb-4">
+              <div className="mb-1 text-xs font-semibold text-white/80">下一步动作</div>
+              <ul className="space-y-1 text-xs text-white/65">
+                {decisionResult.actions.slice(0, 3).map((action, idx) => (
+                  <li key={idx}>• {String(action.title ?? action.owner ?? "待执行动作")}</li>
+                ))}
+              </ul>
+            </div>
+            {acceptedPendingAction && (
+              <div className="mb-3 rounded-xl border border-amber-300/25 bg-amber-300/10 p-2 text-xs text-amber-50">
+                已生成待确认卡：{acceptedPendingAction.title}。请到 Maxwell / 待确认动作中最终确认，不会直接改日程。
+              </div>
+            )}
+            <div className="grid grid-cols-3 gap-2 text-xs">
+              <button
+                onClick={handleAcceptDecision}
+                disabled={decisionBusy || decisionResult.status === "accepted"}
+                className="rounded-lg bg-emerald-400 px-2 py-2 font-medium text-slate-950 disabled:opacity-50"
+              >
+                接受建议
+              </button>
+              <button onClick={handleClose} className="rounded-lg bg-white/10 px-2 py-2 text-white/80 hover:bg-white/15">
+                关闭圆桌
+              </button>
+              <button
+                onClick={() => handleReturnToPrivateChat(decisionResult.recommended_option || "return_to_private_chat")}
+                disabled={returnBusy || decisionResult.handoff_status === "returned"}
+                className="rounded-lg bg-indigo-400/90 px-2 py-2 font-medium text-white disabled:opacity-50"
+              >
+                带总结回私聊
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Brainstorm result card */}
+        {brainstormResult && !decisionResult && !showTranscript && (
+          <div className="absolute right-8 top-24 z-30 w-[380px] rounded-2xl border border-violet-300/25 bg-slate-950/90 p-4 text-white shadow-2xl backdrop-blur-xl">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.2em] text-violet-200/70">Brainstorm</p>
+                <h3 className="text-base font-semibold">灵感结果</h3>
+              </div>
+              <span className="rounded-full bg-violet-400/15 px-2 py-1 text-[11px] text-violet-100">{brainstormResult.status}</span>
+            </div>
+            {brainstormResult.handoff_status && brainstormResult.handoff_status !== "none" ? (
+              <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-2 text-xs text-white/65">
+                交接状态：{brainstormResult.handoff_status}{brainstormResult.user_choice ? ` · 选择：${brainstormResult.user_choice}` : ""}
+              </div>
+            ) : null}
+            <p className="mb-3 line-clamp-4 text-sm leading-relaxed text-white/75">{brainstormResult.summary}</p>
+            <div className="mb-3">
+              <div className="mb-1 text-xs font-semibold text-white/80">主题</div>
+              <div className="flex flex-wrap gap-1.5">
+                {brainstormResult.themes.slice(0, 3).map((theme, idx) => (
+                  <span key={`${theme.title}-${idx}`} className="rounded-full bg-white/10 px-2 py-1 text-[11px] text-white/75">
+                    {theme.title || "主题"}
+                  </span>
+                ))}
+              </div>
+            </div>
+            <div className="mb-3 space-y-2">
+              <div className="text-xs font-semibold text-white/80">候选想法</div>
+              {brainstormResult.ideas.slice(0, 4).map((idea, idx) => (
+                <div key={`${idea.id}-${idx}`} className="rounded-xl bg-white/5 p-2 text-xs text-white/70">
+                  <div className="font-medium text-white/90">{idea.title}</div>
+                  {idea.source_agent && <div className="text-white/40">from {idea.source_agent}</div>}
+                </div>
+              ))}
+            </div>
+            <div className="mb-4 rounded-xl bg-amber-300/10 p-2 text-xs text-amber-50">
+              不会自动写计划或改日程；保存灵感或转计划都需要你点击确认。
+            </div>
+            {savedBrainstormMemory && (
+              <div className="mb-3 rounded-xl border border-emerald-300/25 bg-emerald-300/10 p-2 text-xs text-emerald-50">
+                已保存为记忆：#{savedBrainstormMemory.id}
+              </div>
+            )}
+            {brainstormPendingAction && (
+              <div className="mb-3 rounded-xl border border-amber-300/25 bg-amber-300/10 p-2 text-xs text-amber-50">
+                已生成 Maxwell 待确认计划卡：{brainstormPendingAction.title}
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <button
+                onClick={handleSaveBrainstorm}
+                disabled={brainstormBusy !== null || brainstormResult.save_as_memory}
+                className="rounded-lg bg-violet-400 px-2 py-2 font-medium text-slate-950 disabled:opacity-50"
+              >
+                保存灵感
+              </button>
+              <button
+                onClick={() => setUserDraft("我想继续沿着这个方向发散：")}
+                className="rounded-lg bg-white/10 px-2 py-2 text-white/80 hover:bg-white/15"
+              >
+                继续讨论
+              </button>
+              <button
+                onClick={handleBrainstormToPlan}
+                disabled={brainstormBusy !== null || brainstormResult.status === "handoff_pending"}
+                className="rounded-lg bg-indigo-400/90 px-2 py-2 font-medium text-white disabled:opacity-50"
+              >
+                转成计划
+              </button>
+              <button
+                onClick={() => handleReturnToPrivateChat("brainstorm_return_to_private_chat")}
+                disabled={returnBusy || brainstormResult.handoff_status === "returned"}
+                className="rounded-lg bg-white/10 px-2 py-2 text-white/80 hover:bg-white/15 disabled:opacity-50"
+              >
+                带总结回私聊
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Bottom: user input bar */}
         <div

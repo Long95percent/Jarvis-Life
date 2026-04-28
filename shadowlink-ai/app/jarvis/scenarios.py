@@ -60,6 +60,20 @@ JARVIS_SCENARIOS: dict[str, Scenario] = {
         ),
         agent_roster="jarvis",
     ),
+    "study_energy_decision": Scenario(
+        id="study_energy_decision",
+        name="疲惫学习决策",
+        name_en="Study Energy Decision",
+        icon="⚖️",
+        description="当用户很累但还有学习任务时，Mira/Maxwell/Athena 给出可执行决策",
+        agents=["mira", "maxwell", "athena", "alfred"],
+        opening_prompt=(
+            "这是 decision 圆桌，不做诊断、不直接改日程。Mira 评估情绪与恢复边界，"
+            "Maxwell 评估任务与日程可行性，Athena 评估学习收益与取舍，"
+            "Alfred 汇总为一个可接受或继续讨论的结构化建议。"
+        ),
+        agent_roster="jarvis",
+    ),
     "weekend_recharge": Scenario(
         id="weekend_recharge",
         name="周末恢复规划",

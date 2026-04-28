@@ -1,4 +1,4 @@
-"""OpenAI-compatible LLM provider.
+﻿"""OpenAI-compatible LLM provider.
 
 Supports any API that implements the OpenAI chat completions format,
 including local models served via vLLM, Ollama, LM Studio, etc.
@@ -12,6 +12,7 @@ import httpx
 import structlog
 
 from app.config import settings
+from app.llm.runtime_config import LLMErrorCode, LLMRuntimeError
 
 logger = structlog.get_logger("llm.providers.openai")
 
@@ -35,6 +36,33 @@ def _summarize_http_error(response: httpx.Response) -> str:
         message = response.text[:500]
     return f"LLM HTTP {response.status_code} from {response.request.url}: {message}".strip()
 
+
+
+def _map_http_error(response: httpx.Response) -> LLMRuntimeError:
+    status_code = response.status_code
+    message = _summarize_http_error(response)
+    lowered = message.lower()
+    if status_code in {401, 403}:
+        code = LLMErrorCode.PROVIDER_AUTH_FAILED
+    elif status_code == 404 and "model" in lowered:
+        code = LLMErrorCode.PROVIDER_MODEL_NOT_FOUND
+    elif status_code == 404:
+        code = LLMErrorCode.PROVIDER_ENDPOINT_NOT_FOUND
+    elif status_code == 429:
+        code = LLMErrorCode.PROVIDER_RATE_LIMITED
+    else:
+        code = LLMErrorCode.PROVIDER_HTTP_ERROR
+    return LLMRuntimeError(code, message, status_code=status_code)
+
+
+def _map_request_error(exc: httpx.RequestError) -> LLMRuntimeError:
+    if isinstance(exc, httpx.TimeoutException):
+        code = LLMErrorCode.PROVIDER_TIMEOUT
+    elif isinstance(exc, httpx.ConnectError):
+        code = LLMErrorCode.PROVIDER_UNREACHABLE
+    else:
+        code = LLMErrorCode.PROVIDER_UNREACHABLE
+    return LLMRuntimeError(code, str(exc) or exc.__class__.__name__)
 
 class OpenAIProvider:
     """OpenAI-compatible API provider."""
@@ -74,25 +102,36 @@ class OpenAIProvider:
         payload: dict[str, Any] = {
             "model": model or self.default_model,
             "messages": messages,
-            "temperature": temperature or settings.llm.temperature,
-            "max_tokens": max_tokens or settings.llm.max_tokens,
+            "temperature": temperature if temperature is not None else settings.llm.temperature,
+            "max_tokens": max_tokens if max_tokens is not None else settings.llm.max_tokens,
         }
 
-        async with httpx.AsyncClient(timeout=float(self.timeout)) as client:
-            response = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=self._headers(),
-                json=payload,
-            )
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise RuntimeError(_summarize_http_error(response)) from exc
-            data = response.json()
-            try:
-                return data["choices"][0]["message"]["content"]
-            except (KeyError, IndexError, TypeError) as exc:
-                raise RuntimeError(f"LLM response format invalid: {str(data)[:500]}") from exc
+        try:
+            async with httpx.AsyncClient(timeout=float(self.timeout)) as client:
+                response = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self._headers(),
+                    json=payload,
+                )
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise _map_http_error(response) from exc
+                data = response.json()
+        except LLMRuntimeError:
+            raise
+        except httpx.RequestError as exc:
+            raise _map_request_error(exc) from exc
+        except ValueError as exc:
+            raise LLMRuntimeError(LLMErrorCode.PROVIDER_BAD_RESPONSE, "LLM response is not valid JSON.") from exc
+
+        try:
+            return data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMRuntimeError(
+                LLMErrorCode.PROVIDER_BAD_RESPONSE,
+                f"LLM response format invalid: {str(data)[:500]}",
+            ) from exc
 
     async def chat_stream(
         self,
@@ -111,32 +150,40 @@ class OpenAIProvider:
         payload: dict[str, Any] = {
             "model": model or self.default_model,
             "messages": messages,
-            "temperature": temperature or settings.llm.temperature,
+            "temperature": temperature if temperature is not None else settings.llm.temperature,
             "stream": True,
         }
 
-        async with httpx.AsyncClient(timeout=float(self.timeout)) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                headers=self._headers(),
-                json=payload,
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str.strip() == "[DONE]":
-                            break
-                        try:
-                            import json
+        try:
+            async with httpx.AsyncClient(timeout=float(self.timeout)) as client:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    headers=self._headers(),
+                    json=payload,
+                ) as response:
+                    try:
+                        response.raise_for_status()
+                    except httpx.HTTPStatusError as exc:
+                        raise _map_http_error(response) from exc
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            if data_str.strip() == "[DONE]":
+                                break
+                            try:
+                                import json
 
-                            data = json.loads(data_str)
-                            delta = data["choices"][0].get("delta", {})
-                            if content := delta.get("content"):
-                                yield content
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            continue
+                                data = json.loads(data_str)
+                                delta = data["choices"][0].get("delta", {})
+                                if content := delta.get("content"):
+                                    yield content
+                            except (json.JSONDecodeError, KeyError, IndexError):
+                                continue
+        except LLMRuntimeError:
+            raise
+        except httpx.RequestError as exc:
+            raise _map_request_error(exc) from exc
 
     def get_langchain_llm(self, model: str | None = None) -> Any:
         """Return a LangChain ChatOpenAI instance."""
@@ -150,3 +197,5 @@ class OpenAIProvider:
             max_tokens=settings.llm.max_tokens,
             streaming=True,
         )
+
+

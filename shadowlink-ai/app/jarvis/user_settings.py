@@ -58,6 +58,7 @@ class JarvisSettings(BaseModel):
     profile: UserProfile = Field(default_factory=UserProfile)
     agents: dict[str, AgentConfig] = Field(default_factory=_default_agent_configs)
     shadow_learner_enabled: bool = True
+    psychological_tracking_enabled: bool = True
 
 
 # ── Persistence ──────────────────────────────────────────────
@@ -130,6 +131,19 @@ def update_shadow_enabled(enabled: bool) -> JarvisSettings:
     global _cached
     _cached = new_settings
     return new_settings
+
+
+def update_psychological_tracking_enabled(enabled: bool) -> JarvisSettings:
+    current = get_settings()
+    new_settings = current.model_copy(update={"psychological_tracking_enabled": enabled})
+    _save(new_settings)
+    global _cached
+    _cached = new_settings
+    return new_settings
+
+
+def is_psychological_tracking_enabled() -> bool:
+    return bool(get_settings().psychological_tracking_enabled)
 
 
 def build_profile_prefix() -> str:

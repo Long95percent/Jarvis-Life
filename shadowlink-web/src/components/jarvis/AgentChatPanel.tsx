@@ -1,7 +1,8 @@
 ﻿import React, { useEffect, useRef, useState } from "react";
 import { useJarvisStore } from "@/stores/jarvisStore";
-import { jarvisApi, type ActionResult, type EscalationHint } from "@/services/jarvisApi";
+import { jarvisApi, type ActionResult, type BehaviorEventType, type EscalationHint } from "@/services/jarvisApi";
 import { JARVIS_CONVERSATION_HISTORY_CHANGED } from "./ConversationHistoryPanel";
+import { CareCard } from "./CareCard";
 
 interface Props {
   agentId: string;
@@ -9,7 +10,17 @@ interface Props {
   onClose: () => void;
 }
 
+declare global {
+  interface Window {
+    shadowlink?: {
+      onJarvisBehaviorLifecycle?: (callback: (payload: { type: string; occurredAt: number }) => void) => void;
+      removeAllListeners?: (channel: string) => void;
+    };
+  }
+}
+
 type ConfirmationState = "confirmed" | "cancelled";
+type CareActionState = "read" | "dismissed" | "snoozed" | "helpful" | "too_frequent" | "not_needed" | "handled" | string;
 
 interface TaskPlanFormState {
   goal?: string;
@@ -62,6 +73,10 @@ function asList(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => item !== null && typeof item === "object" && !Array.isArray(item)) : [];
 }
 
+function asStringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+}
+
 function routingTitle(routing: Record<string, unknown>): string {
   const source = toText(routing.source_agent, "当前 Agent");
   const target = toText(routing.target_agent, "maxwell");
@@ -92,10 +107,12 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
   const [escalation, setEscalation] = useState<EscalationHint | null>(null);  const [confirmations, setConfirmations] = useState<Record<string, ConfirmationState>>({});
   const [confirmationErrors, setConfirmationErrors] = useState<Record<string, string>>({});
   const [confirmationMessages, setConfirmationMessages] = useState<Record<string, string>>({});
+  const [careActionStates, setCareActionStates] = useState<Record<string, CareActionState>>({});
   const [taskPlanForms, setTaskPlanForms] = useState<Record<string, TaskPlanFormState>>({});
   const [confirmingKey, setConfirmingKey] = useState<string | null>(null);
 
   const escalationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const openedAtRef = useRef(Date.now());
   const lastUserMessageRef = useRef("");
   const endRef = useRef<HTMLDivElement>(null);
 
@@ -124,6 +141,78 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     };
   }, []);
 
+  useEffect(() => {
+    openedAtRef.current = Date.now();
+    let lastActivityAt = Date.now();
+    let idle = false;
+    const sessionStartedAt = Math.floor(openedAtRef.current / 1000);
+    const recordLifecycle = async (observationType: BehaviorEventType) => {
+      const durationMinutes = Math.max(0, Math.round((Date.now() - openedAtRef.current) / 60000));
+      await jarvisApi.recordBehaviorEvent({ agent_id: agentId, session_id: sessionId, observation_type: observationType, duration_minutes: durationMinutes, occurred_at: Math.floor(Date.now() / 1000), session_started_at: sessionStartedAt }).catch(() => undefined);
+    };
+    const recordLifecycleBeacon = (observationType: BehaviorEventType) => {
+      const durationMinutes = Math.max(0, Math.round((Date.now() - openedAtRef.current) / 60000));
+      jarvisApi.recordBehaviorEventBeacon({ agent_id: agentId, session_id: sessionId, observation_type: observationType, duration_minutes: durationMinutes, occurred_at: Math.floor(Date.now() / 1000), session_started_at: sessionStartedAt });
+    };
+    const markActive = () => {
+      lastActivityAt = Date.now();
+      if (idle) {
+        idle = false;
+        void recordLifecycle("idle_end");
+      }
+    };
+
+    void recordLifecycle("app_opened");
+    const heartbeatTimer = window.setInterval(() => { void recordLifecycle("heartbeat"); }, 30000);
+    const idleTimer = window.setInterval(() => {
+      if (!idle && Date.now() - lastActivityAt > 5 * 60 * 1000) {
+        idle = true;
+        void recordLifecycle("idle_start");
+      }
+    }, 60000);
+    const handleVisibilityChange = () => {
+      void recordLifecycle(document.visibilityState === "hidden" ? "visibility_hidden" : "visibility_visible");
+      if (document.visibilityState === "visible") markActive();
+    };
+    const handlePageHide = () => recordLifecycleBeacon("closed");
+    const handleFocus = () => { markActive(); void recordLifecycle("app_activated"); };
+    const handleBlur = () => { void recordLifecycle("visibility_hidden"); };
+    const handleOnline = () => { markActive(); void recordLifecycle("resume"); };
+    const handleElectronLifecycle = (payload: { type: string; occurredAt: number }) => {
+      const allowed: BehaviorEventType[] = ["app_opened", "app_closed", "app_minimized", "app_activated", "app_restored"];
+      if (!allowed.includes(payload.type as BehaviorEventType)) return;
+      markActive();
+      void jarvisApi.recordBehaviorEvent({
+        agent_id: agentId,
+        session_id: sessionId,
+        observation_type: payload.type as BehaviorEventType,
+        duration_minutes: Math.max(0, Math.round((Date.now() - openedAtRef.current) / 60000)),
+        occurred_at: payload.occurredAt,
+        session_started_at: sessionStartedAt,
+      }).catch(() => undefined);
+    };
+    const activityEvents: Array<keyof WindowEventMap> = ["mousemove", "keydown", "pointerdown", "scroll"];
+    activityEvents.forEach((eventName) => window.addEventListener(eventName, markActive, { passive: true }));
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("pagehide", handlePageHide);
+    window.addEventListener("focus", handleFocus);
+    window.addEventListener("blur", handleBlur);
+    window.addEventListener("online", handleOnline);
+    window.shadowlink?.onJarvisBehaviorLifecycle?.(handleElectronLifecycle);
+    return () => {
+      window.clearInterval(heartbeatTimer);
+      window.clearInterval(idleTimer);
+      activityEvents.forEach((eventName) => window.removeEventListener(eventName, markActive));
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("pagehide", handlePageHide);
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("blur", handleBlur);
+      window.removeEventListener("online", handleOnline);
+      window.shadowlink?.removeAllListeners?.("jarvis-behavior-lifecycle");
+      recordLifecycleBeacon("closed");
+    };
+  }, [agentId, sessionId]);
+
   const clearEscalationTimer = () => {
     if (escalationTimerRef.current) {
       clearInterval(escalationTimerRef.current);
@@ -140,7 +229,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     const scenarioId = escalation.scenario_id;
     const message = lastUserMessageRef.current;
     handleCancelEscalation();
-    startRoundtable(scenarioId, message);
+    startRoundtable(scenarioId, message, { sessionId, agentId });
   };
 
   const saveAndClose = async () => {
@@ -298,6 +387,29 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     }
   };
 
+  const updateCareAction = async (action: ActionResult, index: number, nextState: CareActionState, stateLabel?: string) => {
+    const key = actionKey(action, index);
+    const args = action.arguments ?? {};
+    const proactiveId = toText(args.proactive_message_id);
+    setCareActionStates((prev) => ({ ...prev, [key]: nextState }));
+    try {
+      if (proactiveId) {
+        const feedback = nextState === "snoozed" ? "snooze" : nextState === "read" ? "handled" : nextState;
+        await jarvisApi.sendCareFeedback(proactiveId, {
+          feedback: feedback as "helpful" | "too_frequent" | "not_needed" | "snooze" | "handled",
+          snooze_minutes: nextState === "snoozed" ? 120 : undefined,
+        });
+        useJarvisStore.getState().loadProactiveMessages().catch(() => undefined);
+      }
+      if (stateLabel) setCareActionStates((prev) => ({ ...prev, [key]: stateLabel }));
+    } catch (error) {
+      setConfirmationErrors((prev) => ({
+        ...prev,
+        [key]: error instanceof Error ? error.message : "更新关怀状态失败，请稍后重试。",
+      }));
+    }
+  };
+
   const renderAction = (action: ActionResult, index: number) => {
     const key = actionKey(action, index);
     const state = confirmations[key];
@@ -311,6 +423,73 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     const guardRecommendation = toText(scheduleGuard.recommendation);
     const guardConflicts = asList(scheduleGuard.conflicts);
     const guardAlternatives = asList(scheduleGuard.alternatives);
+
+    if (action.type === "mood.snapshot" || action.type === "care.intervention" || action.type === "care.followup") {
+      if (action.type === "care.intervention" || action.type === "care.followup") {
+        return (
+          <CareCard
+            key={key}
+            action={action}
+            state={careActionStates[key]}
+            error={confirmationErrors[key]}
+            onFeedback={(feedback, stateLabel) => updateCareAction(action, index, feedback === "snooze" ? "snoozed" : feedback, stateLabel)}
+            submitFeedback={false}
+          />
+        );
+      }
+      const moodLabel = toText(args.mood_label, "状态记录");
+      const riskLevel = toText(args.risk_level, "low");
+      const supportNeed = toText(args.support_need, "companionship");
+      const signals = asStringList(args.signals);
+      const stressLevel = typeof args.stress_level === "number" ? args.stress_level : null;
+      const energyLevel = typeof args.energy_level === "number" ? args.energy_level : null;
+      const nextCheckinAt = toText(args.next_checkin_at);
+      const proactiveId = toText(args.proactive_message_id);
+      const isHighRisk = riskLevel === "high";
+      const border = isHighRisk ? "border-red-200" : "border-rose-200";
+      const bg = isHighRisk ? "bg-red-50" : "bg-rose-50";
+      const text = isHighRisk ? "text-red-900" : "text-rose-900";
+
+      return (
+        <div key={key} className={`w-full rounded-2xl border ${border} ${bg} p-3 text-xs ${text}`}>
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-sm font-semibold">
+              {action.type === "mood.snapshot" ? "Mira 状态记录" : action.type === "care.followup" ? "Mira 后续回访" : "Mira 关怀建议"}
+            </div>
+            <span className="rounded-full bg-white/70 px-2 py-0.5 text-[10px] font-medium">
+              {riskLevel === "high" ? "高风险" : riskLevel === "medium" ? "需要关怀" : "轻量记录"}
+            </span>
+          </div>
+          {action.description ? <div className="mt-1 leading-relaxed">{action.description}</div> : null}
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <div className="rounded-xl bg-white/70 px-2 py-1.5">
+              <div className="text-[10px] opacity-70">状态</div>
+              <div className="font-medium">{moodLabel}</div>
+            </div>
+            <div className="rounded-xl bg-white/70 px-2 py-1.5">
+              <div className="text-[10px] opacity-70">支持需求</div>
+              <div className="font-medium">{supportNeed}</div>
+            </div>
+            {stressLevel !== null ? (
+              <div className="rounded-xl bg-white/70 px-2 py-1.5">
+                <div className="text-[10px] opacity-70">压力</div>
+                <div className="font-medium">{stressLevel}/10</div>
+              </div>
+            ) : null}
+            {energyLevel !== null ? (
+              <div className="rounded-xl bg-white/70 px-2 py-1.5">
+                <div className="text-[10px] opacity-70">能量</div>
+                <div className="font-medium">{energyLevel}/10</div>
+              </div>
+            ) : null}
+          </div>
+          {signals.length > 0 ? <div className="mt-2 opacity-80">识别信号：{signals.join("、")}</div> : null}
+          {nextCheckinAt ? <div className="mt-2 font-medium">回访时间：{formatDateTime(nextCheckinAt)}</div> : null}
+          {proactiveId ? <div className="mt-1 text-[10px] opacity-70">回访 ID：{proactiveId}</div> : null}
+          {error ? <div className="mt-2 text-red-600">{error}</div> : null}
+        </div>
+      );
+    }
 
     if (action.type === "schedule_intent" || action.type === "task_intent") {
       const intent = asRecord(action.arguments);
@@ -543,7 +722,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
               {message.content}
             </div>
             {message.role === "agent" && message.actions && message.actions.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 max-w-[75%]">
+              <div className="flex w-full max-w-[75%] flex-col gap-1.5">
                 {message.actions.map((action, actionIndex) => renderAction(action, actionIndex))}
               </div>
             )}

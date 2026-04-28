@@ -2,11 +2,12 @@
 
 import asyncio
 import json
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -32,34 +33,38 @@ router = APIRouter(prefix="/jarvis", tags=["jarvis"])
 
 
 def _chat_error_detail(stage: str, exc: Exception, *, agent_id: str | None = None) -> dict[str, Any]:
-    from app.config import settings
+    from app.llm.runtime_config import LLMRuntimeError, current_llm_config
 
+    config = current_llm_config()
     error_text = str(exc) or exc.__class__.__name__
-    suggestion = "请查看 AI 服务日志中的同一请求，或把该错误详情发给开发者。"
+    error_code = getattr(exc, "code", None)
+    suggestion = getattr(exc, "suggestion", None) or "请查看 AI 服务日志中的同一请求，或把该错误详情发给开发者。"
     lowered = error_text.lower()
-    if "401" in error_text or "unauthorized" in lowered:
-        suggestion = "LLM Provider 鉴权失败：请检查设置里的 API Key、Base URL 和模型名。"
-    elif "404" in error_text or "model" in lowered and "not" in lowered:
-        suggestion = "LLM Provider 或模型不可用：请检查设置里的 Base URL 和模型名称是否被当前服务支持。"
-    elif "timeout" in lowered or "timed out" in lowered:
-        suggestion = "LLM 请求超时：请检查网络、Provider 可用性，或降低模型延迟/增大超时时间。"
-    elif "connection" in lowered or "connect" in lowered or "network" in lowered:
-        suggestion = "连接 LLM Provider 失败：请检查网络、代理、Base URL 是否可访问。"
-    elif "tool registry" in lowered:
-        suggestion = "工具注册表未初始化：请重启 AI 服务，确认 startup 日志出现 tool_registry_ready。"
+    if not isinstance(exc, LLMRuntimeError):
+        if "401" in error_text or "unauthorized" in lowered:
+            error_code = error_code or "LLM_PROVIDER_AUTH_FAILED"
+            suggestion = "LLM Provider 鉴权失败：请检查设置里的 API Key、Base URL 和模型名。"
+        elif "404" in error_text or "model" in lowered and "not" in lowered:
+            error_code = error_code or "LLM_PROVIDER_MODEL_NOT_FOUND"
+            suggestion = "LLM Provider 或模型不可用：请检查设置里的 Base URL 和模型名称是否被当前服务支持。"
+        elif "timeout" in lowered or "timed out" in lowered:
+            error_code = error_code or "LLM_PROVIDER_TIMEOUT"
+            suggestion = "LLM 请求超时：请检查网络、Provider 可用性，或降低模型延迟/增大超时时间。"
+        elif "connection" in lowered or "connect" in lowered or "network" in lowered:
+            error_code = error_code or "LLM_PROVIDER_UNREACHABLE"
+            suggestion = "连接 LLM Provider 失败：请检查网络、代理、Base URL 是否可访问。"
+        elif "tool registry" in lowered:
+            suggestion = "工具注册表未初始化：请重启 AI 服务，确认 startup 日志出现 tool_registry_ready。"
 
     return {
         "message": f"Jarvis 对话失败：阶段={stage}；原因={error_text}",
         "stage": stage,
         "agent_id": agent_id,
+        "error_code": error_code,
         "error_type": exc.__class__.__name__,
         "error": error_text,
         "suggestion": suggestion,
-        "llm": {
-            "base_url": settings.llm.base_url,
-            "model": settings.llm.model,
-            "has_api_key": bool(settings.llm.api_key),
-        },
+        "llm": config.summary(),
     }
 
 
@@ -144,6 +149,16 @@ class AgentChatResponse(BaseModel):
     escalation: dict | None = None
     actions: list[dict] | None = None  # structured actions agent executed (calendar etc)
     routing: dict | None = None
+    timing: dict | None = None
+
+
+class BehaviorEventRequest(BaseModel):
+    session_id: str | None = None
+    agent_id: str
+    observation_type: str
+    duration_minutes: int | None = None
+    occurred_at: float | None = None
+    session_started_at: float | None = None
 
 
 class PendingActionUpdateRequest(BaseModel):
@@ -154,6 +169,30 @@ class PendingActionUpdateRequest(BaseModel):
 class PendingActionConfirmRequest(BaseModel):
     arguments: dict[str, Any] | None = None
     title: str | None = None
+
+
+class PlanDayUpdateRequest(BaseModel):
+    plan_date: str | None = None
+    title: str | None = None
+    description: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    estimated_minutes: int | None = None
+    status: str | None = None
+    reschedule_reason: str | None = None
+
+
+class PlanDayMoveRequest(BaseModel):
+    plan_date: str
+    start_time: str | None = None
+    end_time: str | None = None
+    reason: str | None = None
+
+
+class PlanRescheduleRequest(BaseModel):
+    days: list[PlanDayMoveRequest] = Field(default_factory=list)
+    reason: str | None = None
+
 
 
 class TeamCollaborationRequest(BaseModel):
@@ -430,11 +469,42 @@ class ShadowTogglePayload(BaseModel):
     enabled: bool
 
 
+class PsychologicalTrackingTogglePayload(BaseModel):
+    enabled: bool
+
+
+class CareFeedbackRequest(BaseModel):
+    feedback: str
+    snooze_minutes: int | None = None
+
+
 @router.patch("/agent-config/shadow/toggle")
 async def toggle_shadow_learner(req: ShadowTogglePayload) -> dict[str, Any]:
     from app.jarvis.user_settings import update_shadow_enabled
     updated = update_shadow_enabled(req.enabled)
     return {"shadow_learner_enabled": updated.shadow_learner_enabled}
+
+
+@router.patch("/care/settings/tracking")
+async def toggle_psychological_tracking(req: PsychologicalTrackingTogglePayload) -> dict[str, Any]:
+    from app.jarvis.user_settings import update_psychological_tracking_enabled
+
+    updated = update_psychological_tracking_enabled(req.enabled)
+    return {"psychological_tracking_enabled": updated.psychological_tracking_enabled}
+
+
+@router.get("/care/settings")
+async def get_care_settings() -> dict[str, Any]:
+    from app.jarvis.user_settings import get_settings
+
+    return {"psychological_tracking_enabled": get_settings().psychological_tracking_enabled}
+
+
+@router.delete("/care/data")
+async def clear_care_data() -> dict[str, Any]:
+    from app.jarvis.persistence import clear_psychological_care_data
+
+    return {"deleted": await clear_psychological_care_data()}
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -443,44 +513,199 @@ async def toggle_shadow_learner(req: ShadowTogglePayload) -> dict[str, Any]:
 
 
 @router.get("/llm-status")
-async def llm_status(llm_client=Depends(get_llm_client)) -> dict[str, Any]:
-    """Report the currently-active LLM provider settings and test connectivity.
+async def llm_status(
+    probe: bool = Query(default=False, description="When true, perform a real provider probe."),
+) -> dict[str, Any]:
+    """Report LLM runtime config and optionally probe provider connectivity."""
+    from app.llm.runtime_config import LLMRuntimeError, current_llm_config
 
-    Useful for debugging cases where the user updated API key in Settings
-    but the running client still has stale credentials.
-    """
-    from app.config import settings as app_settings
-
-    def _mask(key: str) -> str:
-        if not key:
-            return "(empty)"
-        if len(key) <= 8:
-            return "*" * len(key)
-        return f"{key[:4]}...{key[-4:]}"
-
-    # Probe current runtime settings (these get mutated by _apply_provider)
-    live_config = {
-        "base_url": app_settings.llm.base_url,
-        "model": app_settings.llm.model,
-        "api_key_masked": _mask(app_settings.llm.api_key),
-        "api_key_present": bool(app_settings.llm.api_key),
+    config = current_llm_config()
+    response: dict[str, Any] = {
+        "ok": True,
+        "config": config.summary(),
+        "probe": {"enabled": probe, "ok": None, "reply_preview": None},
+        "error_code": None,
+        "error": None,
+        "suggestion": None,
     }
 
-    # Try a minimal chat call to verify
-    test_result: dict[str, Any] = {"ok": False, "error": None, "reply_preview": None}
     try:
+        config.validate()
+    except LLMRuntimeError as exc:
+        response.update({"ok": False, **exc.to_dict()})
+        return response
+
+    if not probe:
+        return response
+
+    try:
+        llm_client = await get_llm_client()
         reply = await llm_client.chat(
             message="Reply with just the word OK",
             system_prompt="You are a test responder. Reply with at most 2 words.",
             temperature=0,
             max_tokens=10,
         )
-        test_result["ok"] = True
-        test_result["reply_preview"] = (reply or "").strip()[:120]
+        response["probe"] = {"enabled": True, "ok": True, "reply_preview": (reply or "").strip()[:120]}
+    except LLMRuntimeError as exc:
+        response.update({"ok": False, **exc.to_dict()})
+        response["probe"] = {"enabled": True, "ok": False, "reply_preview": None}
     except Exception as exc:
-        test_result["error"] = str(exc)[:300]
+        response.update({
+            "ok": False,
+            "error_code": "LLM_PROVIDER_HTTP_ERROR",
+            "error": str(exc)[:300],
+            "suggestion": "LLM Provider 探测失败：请检查 AI 服务日志和 Provider 控制台。",
+        })
+        response["probe"] = {"enabled": True, "ok": False, "reply_preview": None}
+    return response
 
-    return {"live_config": live_config, "test_result": test_result}
+
+@router.get("/care/snapshots")
+async def list_care_mood_snapshots(
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 60,
+) -> list[dict[str, Any]]:
+    """Return daily mood snapshots for the psychological-care MVP."""
+    from app.jarvis.user_settings import is_psychological_tracking_enabled
+
+    if not is_psychological_tracking_enabled():
+        return []
+    from app.jarvis.persistence import list_mood_snapshots
+
+    return await list_mood_snapshots(start=start, end=end, limit=limit)
+
+
+@router.get("/care/behavior-observations")
+async def list_care_behavior_observations(
+    date: str | None = None,
+    session_id: str | None = None,
+    observation_type: str | None = None,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Return behavior observations for psychological-care debugging and MVP UI."""
+    from app.jarvis.user_settings import is_psychological_tracking_enabled
+
+    if not is_psychological_tracking_enabled():
+        return []
+    from app.jarvis.persistence import list_behavior_observations
+
+    return await list_behavior_observations(
+        date=date,
+        session_id=session_id,
+        observation_type=observation_type,
+        limit=limit,
+    )
+
+
+@router.post("/care/behavior-events")
+async def record_care_behavior_event(req: BehaviorEventRequest) -> dict[str, Any]:
+    """Record frontend lifecycle behavior signals such as heartbeat or close."""
+    from app.jarvis.user_settings import is_psychological_tracking_enabled
+
+    if not is_psychological_tracking_enabled():
+        return {"observation": None, "tracking_enabled": False}
+    if req.agent_id not in JARVIS_AGENTS or req.agent_id == "shadow":
+        raise HTTPException(status_code=404, detail=f"Unknown agent_id {req.agent_id!r}")
+    allowed = {
+        "heartbeat",
+        "closed",
+        "visibility_hidden",
+        "visibility_visible",
+        "idle_start",
+        "idle_end",
+        "sleep",
+        "resume",
+        "app_opened",
+        "app_closed",
+        "app_minimized",
+        "app_activated",
+        "app_restored",
+    }
+    if req.observation_type not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported observation_type {req.observation_type!r}")
+
+    from app.jarvis.behavior_observation import record_behavior_event
+
+    observation = await record_behavior_event(
+        session_id=req.session_id,
+        agent_id=req.agent_id,
+        observation_type=req.observation_type,
+        occurred_at=datetime.fromtimestamp(req.occurred_at) if req.occurred_at else None,
+        session_started_at=datetime.fromtimestamp(req.session_started_at) if req.session_started_at else None,
+        duration_minutes=req.duration_minutes,
+    )
+    return {"observation": observation}
+
+
+@router.get("/care/stress-signals")
+async def list_care_stress_signals(
+    date: str | None = None,
+    signal_type: str | None = None,
+    refresh: bool = False,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Return schedule pressure signals for psychological-care debugging and MVP UI."""
+    from app.jarvis.user_settings import is_psychological_tracking_enabled
+
+    if not is_psychological_tracking_enabled():
+        return []
+    from app.jarvis.persistence import list_stress_signals
+    from app.jarvis.stress_observation import aggregate_schedule_pressure_signals
+
+    if refresh and date:
+        return await aggregate_schedule_pressure_signals(date)
+    return await list_stress_signals(date=date, signal_type=signal_type, limit=limit)
+
+
+@router.get("/care/trends")
+async def get_care_trends(
+    range: str = Query(default="week", pattern="^(week|month|year)$"),
+    end: str | None = None,
+) -> dict[str, Any]:
+    """Return mood/stress/energy/sleep/schedule pressure trend series."""
+    from app.jarvis.user_settings import is_psychological_tracking_enabled
+
+    if not is_psychological_tracking_enabled():
+        from app.jarvis.care_trends import empty_care_trends
+
+        return empty_care_trends(range_name=range, end=end, tracking_enabled=False)
+    from app.jarvis.care_trends import build_care_trends
+
+    try:
+        return await build_care_trends(range_name=range, end=end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/care/days/{day}")
+async def get_care_day_detail(day: str) -> dict[str, Any]:
+    """Return explainable evidence for one psychological-care day."""
+    from app.jarvis.user_settings import is_psychological_tracking_enabled
+
+    try:
+        parsed_day = datetime.fromisoformat(day[:10]).date().isoformat()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="day must be YYYY-MM-DD") from exc
+    if not is_psychological_tracking_enabled():
+        from app.jarvis.care_trends import empty_care_trends
+
+        empty = empty_care_trends(range_name="week", end=parsed_day, tracking_enabled=False)
+        return empty["details"].get(parsed_day) or {
+            "date": parsed_day,
+            "snapshot": {"date": parsed_day},
+            "emotion_observations": [],
+            "stress_signals": [],
+            "behavior_observations": [],
+            "care_triggers": [],
+            "positive_events": [],
+            "negative_events": [],
+            "explanations": ["心理趋势追踪已关闭。"],
+        }
+    from app.jarvis.care_trends import build_care_day_detail
+
+    return await build_care_day_detail(parsed_day)
 
 
 @router.post("/chat", response_model=AgentChatResponse)
@@ -488,18 +713,42 @@ async def chat_with_agent(
     req: AgentChatRequest,
     llm_client=Depends(get_llm_client),
 ) -> AgentChatResponse:
+    timing_started = time.perf_counter()
+    timing_spans: list[dict[str, Any]] = []
+
+    def mark_span(name: str, started: float, **extra: Any) -> None:
+        span = {"name": name, "duration_ms": round((time.perf_counter() - started) * 1000, 1)}
+        if extra:
+            span.update(extra)
+        timing_spans.append(span)
+
+    route_started = time.perf_counter()
     schedule_intent = _build_schedule_intent(req.message, req.agent_id)
     routed_agent_id = "maxwell" if schedule_intent else req.agent_id
     try:
         agent = get_agent(routed_agent_id)
     except KeyError:
-        raise HTTPException(status_code=404, detail=f"Agent {routed_agent_id!r} not found")
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": f"Jarvis 智能体不存在：{routed_agent_id}",
+                "stage": "route_agent",
+                "agent_id": routed_agent_id,
+                "error_type": "AgentNotFound",
+                "error": f"Agent {routed_agent_id!r} not found",
+                "suggestion": "请刷新页面；如果仍出现该问题，请清理浏览器 localStorage 中的旧 Jarvis 会话状态。",
+            },
+        )
+    mark_span("route_decided", route_started, routed_agent_id=routed_agent_id, routed=bool(schedule_intent))
 
+    activity_started = time.perf_counter()
     try:
         await get_life_context_bus().update_fields({}, source="user_chat")
     except Exception as exc:
         logger.warning("jarvis.chat.activity_mark_failed", agent_id=req.agent_id, error=str(exc))
+    mark_span("activity_marked", activity_started)
 
+    conversation_started = time.perf_counter()
     try:
         from app.jarvis.persistence import save_conversation
 
@@ -513,11 +762,16 @@ async def chat_with_agent(
         )
     except Exception as exc:
         logger.warning("jarvis.chat.conversation_save_failed", agent_id=routed_agent_id, error=str(exc))
+    mark_span("conversation_persisted", conversation_started)
 
     try:
         from app.jarvis.user_settings import build_profile_prefix
         from app.jarvis.persistence import get_chat_history, save_chat_turn
+        context_started = time.perf_counter()
         profile_prefix = build_profile_prefix()
+        from app.jarvis.mood_care import detect_mood_snapshot_enhanced
+
+        mood_snapshot = await detect_mood_snapshot_enhanced(req.message, llm_client=llm_client) if routed_agent_id == "mira" or req.agent_id == "mira" else None
 
         ctx = await get_life_context_bus().get_context()
         context_summary = (
@@ -525,6 +779,14 @@ async def chat_with_agent(
             f"schedule_density={ctx.schedule_density}/10, "
             f"sleep={ctx.sleep_quality}/10, mood={ctx.mood_trend}]"
         )
+        mood_context = ""
+        if mood_snapshot is not None:
+            mood_context = (
+                "## Mira 心理陪伴上下文\n"
+                f"识别到的状态: {json.dumps(mood_snapshot.to_dict(), ensure_ascii=False)}\n"
+                "请只做陪伴、状态记录、轻量建议和必要时求助提醒；不要做医疗诊断。"
+                "如果风险较高，优先安全提示和联系可信任的人/当地紧急求助渠道。\n\n"
+            )
 
         history = await get_chat_history(routed_agent_id, limit=12, session_id=req.session_id)
         history_text = ""
@@ -534,10 +796,20 @@ async def chat_with_agent(
                 prefix = "User" if turn["role"] == "user" else agent["name"]
                 lines.append(f"{prefix}: {turn['content']}")
             history_text = "## 最近对话\n" + "\n".join(lines) + "\n\n"
+        mark_span("base_context", context_started, history_turns=len(history or []))
 
+        memory_started = time.perf_counter()
         collaboration_text = await build_collaboration_memory_prefix(routed_agent_id, limit=6)
         memory_text = await build_bounded_memory_recall_prefix(routed_agent_id, req.message, limit=6)
         preference_text = await build_preference_profile_prefix(routed_agent_id, limit=6)
+        mark_span(
+            "memory_context",
+            memory_started,
+            memory_chars=len(memory_text),
+            preference_chars=len(preference_text),
+            collaboration_chars=len(collaboration_text),
+        )
+        consult_started = time.perf_counter()
         consult_result = await run_agent_consultations(
             source_agent=routed_agent_id,
             user_message=req.message,
@@ -545,6 +817,7 @@ async def chat_with_agent(
             llm_client=llm_client,
             context_summary=context_summary,
         )
+        mark_span("consult", consult_started, actions=len(consult_result.actions), prefix_chars=len(consult_result.prompt_prefix))
 
         from zoneinfo import ZoneInfo
         from app.jarvis.user_settings import get_settings
@@ -590,6 +863,7 @@ async def chat_with_agent(
         f"{time_context}"
         f"{common_rules}"
         f"{intent_context}"
+        f"{mood_context}"
         f"{consult_result.prompt_prefix}"
         f"{preference_text}"
         f"{memory_text}"
@@ -598,6 +872,7 @@ async def chat_with_agent(
         f"User: {req.message}"
     )
 
+    llm_started = time.perf_counter()
     try:
         response, tool_results = await run_agent_turn(
             agent_id=routed_agent_id,
@@ -608,10 +883,34 @@ async def chat_with_agent(
         )
     except Exception as exc:
         detail = _chat_error_detail("run_agent_turn", exc, agent_id=routed_agent_id)
+        detail["timing"] = {
+            "total_ms": round((time.perf_counter() - timing_started) * 1000, 1),
+            "spans": timing_spans,
+        }
         logger.error("jarvis.api.chat_failed", **detail)
         raise HTTPException(status_code=502, detail=detail) from exc
+    mark_span("llm_turn", llm_started, tool_calls=len(tool_results or []))
 
+    actions_started = time.perf_counter()
     clean_reply = (response or "").strip()
+    user_turn_id: int | None = None
+    care_actions: list[dict[str, Any]] = []
+    from app.jarvis.user_settings import is_psychological_tracking_enabled
+    psychological_tracking_enabled = is_psychological_tracking_enabled()
+    if psychological_tracking_enabled and "mood_snapshot" in locals() and mood_snapshot is not None:
+        try:
+            from app.jarvis.mood_care import persist_mood_care
+
+            user_turn_id = await save_chat_turn(agent_id=routed_agent_id, role="user", content=req.message, session_id=req.session_id)
+            care_actions = await persist_mood_care(
+                mood_snapshot,
+                user_message=req.message,
+                session_id=req.session_id,
+                source_agent=routed_agent_id,
+                turn_id=user_turn_id,
+            )
+        except Exception as exc:
+            logger.warning("jarvis.chat.mood_care_failed", agent_id=req.agent_id, error=str(exc))
     if schedule_intent and not tool_results:
         fallback_tool_name = "jarvis_task_plan_decompose" if schedule_intent.get("type") == "task_intent" else "jarvis_calendar_add"
         fallback_arguments: dict[str, Any] = {"user_request": req.message, "source_agent": req.agent_id}
@@ -626,7 +925,7 @@ async def chat_with_agent(
             if not clean_reply:
                 clean_reply = "我先接管这条日程需求，给你生成一个待确认卡；时间不合适可以先取消再补充具体时间。"
         tool_results = await execute_tool_calls(routed_agent_id, [{"tool_name": fallback_tool_name, "arguments": fallback_arguments}])
-    action_results = [*consult_result.actions, *to_action_results(tool_results)]
+    action_results = [*care_actions, *consult_result.actions, *to_action_results(tool_results)]
     if schedule_intent:
         action_results.insert(0, {
             "type": schedule_intent["type"],
@@ -663,7 +962,9 @@ async def chat_with_agent(
             )
             action["ok"] = False
             action["error"] = f"待确认动作保存失败：{exc}"
+    mark_span("actions_built", actions_started, actions=len(action_results), pending=sum(1 for action in action_results if action.get("pending_confirmation")))
 
+    memory_save_started = time.perf_counter()
     try:
         if is_user_constraint(req.message):
             await remember_user_constraint(req.message, source_agent=routed_agent_id)
@@ -678,10 +979,20 @@ async def chat_with_agent(
         await maybe_compact_old_raw_memories(cutoff_days=7, min_interval_seconds=3600)
     except Exception as exc:
         logger.warning("jarvis.chat.memory_save_failed", agent_id=req.agent_id, error=str(exc))
+    mark_span("memory_save", memory_save_started)
 
     # Persist both sides of the exchange so the next request has history
+    persist_started = time.perf_counter()
     try:
-        await save_chat_turn(agent_id=routed_agent_id, role="user", content=req.message, session_id=req.session_id)
+        if user_turn_id is None:
+            user_turn_id = await save_chat_turn(agent_id=routed_agent_id, role="user", content=req.message, session_id=req.session_id)
+        try:
+            from app.jarvis.behavior_observation import record_chat_activity_observations
+
+            if psychological_tracking_enabled:
+                await record_chat_activity_observations(session_id=req.session_id, agent_id=routed_agent_id)
+        except Exception as exc:
+            logger.warning("jarvis.chat.behavior_observation_failed", agent_id=req.agent_id, error=str(exc))
         await save_chat_turn(
             agent_id=routed_agent_id,
             role="agent",
@@ -691,10 +1002,12 @@ async def chat_with_agent(
         )
     except Exception as exc:
         logger.warning("jarvis.chat.persist_failed", agent_id=req.agent_id, error=str(exc))
+    mark_span("persist_final_turns", persist_started)
 
     # Evaluate whether this message should auto-escalate to a roundtable
     from app.jarvis.escalation import evaluate_escalation
     hint = None
+    escalation_started = time.perf_counter()
     try:
         ctx_for_eval = await get_life_context_bus().get_context()
         hint = evaluate_escalation(
@@ -704,6 +1017,7 @@ async def chat_with_agent(
         )
     except Exception as exc:
         logger.warning("jarvis.chat.escalation_eval_failed", agent_id=req.agent_id, error=str(exc))
+    mark_span("escalation_eval", escalation_started, escalated=hint is not None)
     escalation_payload = None
     if hint is not None:
         escalation_payload = {
@@ -716,6 +1030,7 @@ async def chat_with_agent(
     # Feed observation to Shadow (if enabled)
     from app.jarvis.user_settings import get_settings as _get_jarvis_settings
     if _get_jarvis_settings().shadow_learner_enabled:
+        shadow_started = time.perf_counter()
         from app.core.lifespan import get_preference_learner
         learner = get_preference_learner()
         if learner is not None:
@@ -727,6 +1042,21 @@ async def chat_with_agent(
                 )
             except Exception as exc:
                 logger.warning("jarvis.shadow.observe_failed", error=str(exc))
+        mark_span("shadow_observe", shadow_started)
+
+    total_ms = round((time.perf_counter() - timing_started) * 1000, 1)
+    timing_payload = {
+        "total_ms": total_ms,
+        "spans": timing_spans,
+    }
+    logger.info(
+        "jarvis.chat.timing",
+        agent_id=req.agent_id,
+        routed_agent_id=routed_agent_id,
+        session_id=req.session_id,
+        total_ms=total_ms,
+        spans=timing_spans,
+    )
 
     return AgentChatResponse(
         agent_id=routed_agent_id,
@@ -735,6 +1065,7 @@ async def chat_with_agent(
         escalation=escalation_payload,
         actions=action_results if action_results else None,
         routing=schedule_intent,
+        timing=timing_payload,
     )
 
 
@@ -806,6 +1137,41 @@ async def dismiss_proactive_message_endpoint(message_id: str) -> dict[str, Any]:
     if msg is None:
         raise HTTPException(status_code=404, detail=f"Proactive message {message_id!r} not found")
     return msg
+
+
+@router.post("/messages/{message_id}/care-feedback")
+async def care_message_feedback_endpoint(message_id: str, req: CareFeedbackRequest) -> dict[str, Any]:
+    allowed = {"helpful", "too_frequent", "not_needed", "snooze", "handled"}
+    if req.feedback not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unsupported feedback {req.feedback!r}")
+    from app.jarvis.persistence import snooze_proactive_message, update_care_intervention_feedback
+
+    status = "resolved" if req.feedback in {"helpful", "handled"} else "dismissed"
+    snoozed_until = None
+    message = None
+    if req.feedback == "snooze":
+        status = "snoozed"
+        snooze_minutes = req.snooze_minutes or 120
+        snoozed_until = time.time() + max(15, snooze_minutes) * 60
+        message = await snooze_proactive_message(message_id, snoozed_until)
+    intervention = await update_care_intervention_feedback(
+        message_id=message_id,
+        feedback=req.feedback,
+        status=status,
+        snoozed_until=snoozed_until,
+    )
+    if message is None:
+        if status == "resolved":
+            from app.jarvis.persistence import mark_proactive_message_read
+
+            message = await mark_proactive_message_read(message_id)
+        else:
+            from app.jarvis.persistence import dismiss_proactive_message
+
+            message = await dismiss_proactive_message(message_id)
+    if intervention is None and message is None:
+        raise HTTPException(status_code=404, detail="Care message not found")
+    return {"message": message, "intervention": intervention}
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1070,10 +1436,10 @@ async def list_maxwell_workbench_items(
 async def push_maxwell_daily_tasks(plan_date: str | None = None) -> dict[str, Any]:
     from zoneinfo import ZoneInfo
 
-    from app.jarvis.persistence import push_background_task_days_to_workbench
+    from app.jarvis.persistence import push_planner_days_to_workbench
 
     effective_date = plan_date or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-    items = await push_background_task_days_to_workbench(effective_date)
+    items = await push_planner_days_to_workbench(effective_date)
     return {"plan_date": effective_date[:10], "pushed_count": len(items), "items": items}
 
 
@@ -1081,11 +1447,329 @@ async def push_maxwell_daily_tasks(plan_date: str | None = None) -> dict[str, An
 async def mark_overdue_background_task_day_items(today: str | None = None) -> dict[str, Any]:
     from zoneinfo import ZoneInfo
 
-    from app.jarvis.persistence import mark_overdue_background_task_days_missed
+    from app.jarvis.persistence import mark_overdue_planner_days_missed
 
     effective_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
-    missed = await mark_overdue_background_task_days_missed(effective_today)
-    return {"today": effective_today[:10], "missed_count": len(missed), "task_days": missed}
+    missed = await mark_overdue_planner_days_missed(effective_today)
+    total = len(missed["background_task_days"]) + len(missed["plan_days"])
+    return {"today": effective_today[:10], "missed_count": total, **missed}
+
+
+@router.post("/planner/mark-overdue-missed")
+async def mark_overdue_planner_day_items(today: str | None = None) -> dict[str, Any]:
+    return await mark_overdue_background_task_day_items(today=today)
+
+
+
+
+
+
+@router.post("/planner/daily-maintenance")
+async def run_planner_daily_maintenance_item(
+    today: str | None = None,
+    auto_reschedule: bool = True,
+    push_today: bool = True,
+    llm_client: Any = Depends(get_llm_client),
+) -> dict[str, Any]:
+    from zoneinfo import ZoneInfo
+
+    from app.jarvis.planner_maintenance import run_planner_daily_maintenance
+
+    effective_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    return await run_planner_daily_maintenance(
+        today=effective_today,
+        llm_client=llm_client,
+        auto_reschedule=auto_reschedule,
+        push_today=push_today,
+    )
+
+
+@router.post("/planner/daily-maintenance/once")
+async def run_planner_daily_maintenance_once_item(
+    today: str | None = None,
+    auto_reschedule: bool = True,
+    push_today: bool = True,
+    llm_client: Any = Depends(get_llm_client),
+) -> dict[str, Any]:
+    from zoneinfo import ZoneInfo
+
+    from app.jarvis.planner_maintenance import run_planner_daily_maintenance_once
+
+    effective_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    return await run_planner_daily_maintenance_once(
+        today=effective_today,
+        llm_client=llm_client,
+        auto_reschedule=auto_reschedule,
+        push_today=push_today,
+    )
+
+
+def _combine_plan_day_datetime(plan_day: dict[str, Any], time_value: str | None, fallback: datetime | None = None) -> datetime | None:
+    if not time_value:
+        return fallback
+    try:
+        return datetime.fromisoformat(f"{str(plan_day.get('plan_date') or '')[:10]}T{time_value[:5]}:00")
+    except ValueError:
+        return fallback
+
+
+def _sync_plan_day_calendar_event(plan_day: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any] | None:
+    calendar_event_id = plan_day.get("calendar_event_id")
+    if not isinstance(calendar_event_id, str) or not calendar_event_id:
+        return None
+    from app.mcp.adapters.calendar_adapter import get_event, update_event
+
+    existing = get_event(calendar_event_id)
+    event_patch: dict[str, Any] = {}
+    if "title" in patch:
+        event_patch["title"] = plan_day.get("title")
+    if "description" in patch:
+        event_patch["notes"] = plan_day.get("description")
+    if "status" in patch:
+        event_patch["status"] = "cancelled" if plan_day.get("status") == "cancelled" else "confirmed"
+    if any(key in patch for key in ("plan_date", "start_time", "end_time")):
+        start_dt = _combine_plan_day_datetime(plan_day, plan_day.get("start_time"), existing.start if existing else None)
+        end_dt = _combine_plan_day_datetime(plan_day, plan_day.get("end_time"), existing.end if existing else None)
+        if start_dt is not None:
+            event_patch["start"] = start_dt
+        if end_dt is not None:
+            event_patch["end"] = end_dt
+    if not event_patch:
+        return existing.model_dump() if existing else None
+    updated = update_event(calendar_event_id, **event_patch)
+    return updated.model_dump() if updated else None
+
+
+
+def _plan_day_has_time(day: dict[str, Any]) -> bool:
+    return bool(day.get("plan_date") and day.get("start_time") and day.get("end_time"))
+
+
+async def _project_plan_day_to_calendar(day: dict[str, Any], *, source_agent: str | None = None, reason: str = "?? day ?????") -> dict[str, Any] | None:
+    if day.get("calendar_event_id") or not _plan_day_has_time(day):
+        return None
+    event_req = CalendarEventRequest(
+        title=str(day.get("title") or "????"),
+        start=datetime.fromisoformat(f"{str(day['plan_date'])[:10]}T{str(day['start_time'])[:5]}:00"),
+        end=datetime.fromisoformat(f"{str(day['plan_date'])[:10]}T{str(day['end_time'])[:5]}:00"),
+        stress_weight=1.0,
+        notes=day.get("description") if isinstance(day.get("description"), str) else None,
+        source="planner_projection",
+        source_agent=source_agent,
+        created_reason=reason,
+        status="confirmed",
+    )
+    result = await add_calendar_event(event_req)
+    from app.jarvis.persistence import update_jarvis_plan_day
+    updated = await update_jarvis_plan_day(day["id"], {"calendar_event_id": result["event_id"], "status": day.get("status") or "scheduled"}, event_type="calendar.changed")
+    return {"event": result["event"], "plan_day": updated}
+
+@router.get("/plans")
+async def list_plan_items(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    from app.jarvis.persistence import list_jarvis_plans
+
+    return await list_jarvis_plans(status=status, limit=limit)
+
+
+@router.get("/plans/{plan_id}/events")
+async def list_plan_agent_events(plan_id: str, event_type: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    from app.jarvis.persistence import list_agent_events
+
+    return await list_agent_events(plan_id=plan_id, event_type=event_type, limit=limit)
+
+
+@router.get("/plan-days")
+async def list_plan_day_items(
+    plan_id: str | None = None,
+    status: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    from app.jarvis.persistence import list_jarvis_plan_days
+
+    return await list_jarvis_plan_days(plan_id=plan_id, status=status, start=start, end=end, limit=limit)
+
+
+
+
+def _item_start_end(item: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+    try:
+        if item.get("item_type") == "calendar_event":
+            return datetime.fromisoformat(str(item.get("start"))), datetime.fromisoformat(str(item.get("end")))
+        date = str(item.get("date") or "")[:10]
+        start_time = item.get("start_time")
+        end_time = item.get("end_time")
+        if date and start_time and end_time:
+            return datetime.fromisoformat(f"{date}T{str(start_time)[:5]}:00"), datetime.fromisoformat(f"{date}T{str(end_time)[:5]}:00")
+    except ValueError:
+        return None, None
+    return None, None
+
+
+def _build_planner_conflicts_and_free_windows(items: list[dict[str, Any]], start: datetime, end: datetime) -> dict[str, Any]:
+    timed = []
+    for item in items:
+        if item.get("status") in {"completed", "cancelled", "deleted"}:
+            continue
+        start_dt, end_dt = _item_start_end(item)
+        if start_dt is None or end_dt is None or end_dt <= start_dt:
+            continue
+        timed.append({"item": item, "start": start_dt, "end": end_dt})
+    timed.sort(key=lambda row: row["start"])
+    conflicts = []
+    for index, current in enumerate(timed):
+        for other in timed[index + 1:]:
+            if other["start"] >= current["end"]:
+                break
+            conflicts.append({
+                "start": max(current["start"], other["start"]).isoformat(),
+                "end": min(current["end"], other["end"]).isoformat(),
+                "items": [current["item"], other["item"]],
+                "reason": "time_overlap",
+            })
+    free_windows = []
+    cursor = start
+    for row in timed:
+        if row["start"] > cursor and (row["start"] - cursor).total_seconds() >= 30 * 60:
+            free_windows.append({"start": cursor.isoformat(), "end": row["start"].isoformat(), "minutes": int((row["start"] - cursor).total_seconds() / 60)})
+        if row["end"] > cursor:
+            cursor = row["end"]
+    if end > cursor and (end - cursor).total_seconds() >= 30 * 60:
+        free_windows.append({"start": cursor.isoformat(), "end": end.isoformat(), "minutes": int((end - cursor).total_seconds() / 60)})
+    return {"conflicts": conflicts, "free_windows": free_windows}
+
+@router.get("/planner/calendar-items")
+async def list_planner_calendar_items(start: datetime, end: datetime) -> dict[str, Any]:
+    from app.jarvis.persistence import list_background_task_days, list_jarvis_plan_days
+    from app.mcp.adapters.calendar_adapter import get_events_between
+
+    start_day = start.date().isoformat()
+    end_day = end.date().isoformat()
+    events = [
+        {"item_type": "calendar_event", "id": event.id, "date": event.start.date().isoformat(), "start": event.start.isoformat(), "end": event.end.isoformat(), "title": event.title, "status": event.status, "source": event.source, "payload": event.model_dump()}
+        for event in get_events_between(start, end)
+    ]
+    plan_days = await list_jarvis_plan_days(start=start_day, end=end_day, limit=1000)
+    plan_items = [
+        {"item_type": "plan_day", "id": day["id"], "date": day["plan_date"], "start_time": day.get("start_time"), "end_time": day.get("end_time"), "title": day["title"], "status": day["status"], "plan_id": day["plan_id"], "calendar_event_id": day.get("calendar_event_id"), "payload": day}
+        for day in plan_days
+    ]
+    background_days = await list_background_task_days(limit=1000)
+    background_items = [
+        {"item_type": "background_task_day", "id": day["id"], "date": day["plan_date"], "start_time": day.get("start_time"), "end_time": day.get("end_time"), "title": day["title"], "status": day["status"], "task_id": day["task_id"], "calendar_event_id": day.get("calendar_event_id"), "payload": day}
+        for day in background_days
+        if start_day <= str(day.get("plan_date") or "")[:10] <= end_day
+    ]
+    items = sorted([*events, *plan_items, *background_items], key=lambda item: (item.get("date") or "", item.get("start") or item.get("start_time") or ""))
+    availability = _build_planner_conflicts_and_free_windows(items, start, end)
+    return {"start": start.isoformat(), "end": end.isoformat(), "items": items, **availability}
+
+
+@router.get("/planner/availability")
+async def get_planner_availability(start: datetime, end: datetime) -> dict[str, Any]:
+    calendar = await list_planner_calendar_items(start=start, end=end)
+    return {"start": calendar["start"], "end": calendar["end"], "conflicts": calendar.get("conflicts", []), "free_windows": calendar.get("free_windows", [])}
+
+
+@router.patch("/plan-days/{day_id}")
+async def update_plan_day_item(day_id: str, req: PlanDayUpdateRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import update_jarvis_plan_day
+
+    patch = req.model_dump(exclude_unset=True)
+    updated = await update_jarvis_plan_day(day_id, patch, event_type="plan_day.updated")
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Plan day {day_id!r} not found")
+    calendar_event = _sync_plan_day_calendar_event(updated, patch)
+    return {"plan_day": updated, "calendar_event": calendar_event}
+
+
+@router.post("/plan-days/{day_id}/complete")
+async def complete_plan_day_item(day_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import update_jarvis_plan_day
+
+    patch = {"status": "completed"}
+    updated = await update_jarvis_plan_day(day_id, patch, event_type="day.completed")
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Plan day {day_id!r} not found")
+    calendar_event = _sync_plan_day_calendar_event(updated, patch)
+    return {"plan_day": updated, "calendar_event": calendar_event}
+
+
+@router.post("/plan-days/{day_id}/move")
+async def move_plan_day_item(day_id: str, req: PlanDayMoveRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import update_jarvis_plan_day
+
+    patch = {"plan_date": req.plan_date[:10], "start_time": req.start_time, "end_time": req.end_time, "status": "rescheduled", "reschedule_reason": req.reason or "??????/??"}
+    updated = await update_jarvis_plan_day(
+        day_id,
+        patch,
+        event_type="plan.rescheduled",
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Plan day {day_id!r} not found")
+    calendar_event = _sync_plan_day_calendar_event(updated, patch)
+    return {"plan_day": updated, "calendar_event": calendar_event}
+
+
+@router.post("/plans/{plan_id}/cancel")
+async def cancel_plan_item(plan_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import cancel_jarvis_plan, list_jarvis_plan_days
+
+    cancelled = await cancel_jarvis_plan(plan_id)
+    if cancelled is None:
+        raise HTTPException(status_code=404, detail=f"Plan {plan_id!r} not found")
+    days = await list_jarvis_plan_days(plan_id=plan_id, limit=2000)
+    synced_events = [
+        event
+        for day in days
+        if (event := _sync_plan_day_calendar_event(day, {"status": "cancelled"})) is not None
+    ]
+    return {"plan": cancelled, "cancelled_days": days, "calendar_events": synced_events}
+
+
+@router.post("/plans/{plan_id}/project-calendar")
+async def project_plan_calendar_items(plan_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import get_jarvis_plan, list_jarvis_plan_days
+
+    plan = await get_jarvis_plan(plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail=f"Plan {plan_id!r} not found")
+    days = await list_jarvis_plan_days(plan_id=plan_id, limit=2000)
+    projected = []
+    skipped = []
+    for day in days:
+        if day.get("status") in {"completed", "cancelled", "missed"}:
+            skipped.append({"id": day["id"], "reason": "????????"})
+            continue
+        result = await _project_plan_day_to_calendar(day, source_agent=plan.get("source_agent"), reason="?????????????????")
+        if result is None:
+            skipped.append({"id": day["id"], "reason": "???????????"})
+        else:
+            projected.append(result)
+    return {"plan": plan, "projected_count": len(projected), "projected": projected, "skipped": skipped}
+
+
+@router.post("/plans/{plan_id}/reschedule")
+async def reschedule_plan_days(plan_id: str, req: PlanRescheduleRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import list_jarvis_plan_days, record_agent_event, update_jarvis_plan_day
+
+    existing_days = await list_jarvis_plan_days(plan_id=plan_id, limit=2000)
+    if not existing_days:
+        raise HTTPException(status_code=404, detail=f"Plan {plan_id!r} has no days")
+    active_days = [day for day in existing_days if day.get("status") not in {"completed", "cancelled"}]
+    updates = req.days[:len(active_days)]
+    if not updates:
+        raise HTTPException(status_code=400, detail="Reschedule requires at least one future day")
+    changed = []
+    for day, move in zip(active_days, updates):
+        patch = {"plan_date": move.plan_date[:10], "start_time": move.start_time, "end_time": move.end_time, "status": "rescheduled", "reschedule_reason": move.reason or req.reason or "??/Maxwell ????"}
+        updated = await update_jarvis_plan_day(day["id"], patch, event_type="plan.rescheduled")
+        if updated:
+            calendar_event = _sync_plan_day_calendar_event(updated, patch)
+            changed.append({"plan_day": updated, "calendar_event": calendar_event})
+    await record_agent_event(event_type="plan.rescheduled", agent_id="maxwell", plan_id=plan_id, payload={"reason": req.reason, "changed_count": len(changed)})
+    return {"plan_id": plan_id, "changed_count": len(changed), "changed": changed}
 
 
 @router.patch("/pending-actions/{pending_id}")
@@ -1150,7 +1834,7 @@ async def confirm_pending_action_item(pending_id: str, req: PendingActionConfirm
 
     arguments = req.arguments if req.arguments is not None else item.get("arguments", {})
     if item.get("action_type") == "task.plan":
-        from app.jarvis.persistence import get_background_task, save_background_task, save_background_task_days
+        from app.jarvis.persistence import get_background_task, save_background_task, save_background_task_days, save_jarvis_plan
 
         plan = arguments.get("plan") if isinstance(arguments.get("plan"), dict) else arguments
         task_id = str(plan.get("id") or arguments.get("task_id") or pending_id)
@@ -1187,6 +1871,33 @@ async def confirm_pending_action_item(pending_id: str, req: PendingActionConfirm
                 status_code=500,
                 detail=f"后台任务 {task_id!r} 已保存，但每日任务写入失败：请检查 background_task_days 写入。",
             )
+        plan_type = "short_term" if len({str(day.get("date") or day.get("plan_date") or "")[:10] for day in daily_plan if isinstance(day, dict)}) <= 1 else "long_term"
+        plan_days_payload = []
+        for day in persisted_days:
+            payload = dict(day)
+            payload["source_task_day_id"] = day.get("id")
+            plan_days_payload.append(payload)
+        persisted_plan = await save_jarvis_plan(
+            plan_id=str(plan.get("plan_id") or f"plan_{task_id}"),
+            title=str(plan.get("title") or arguments.get("title") or item.get("title") or "计划"),
+            plan_type=plan_type,
+            status="active",
+            source_agent=plan.get("source_agent") if isinstance(plan.get("source_agent"), str) else item.get("agent_id"),
+            source_pending_id=pending_id,
+            source_background_task_id=task_id,
+            original_user_request=str(plan.get("original_user_request") or arguments.get("user_request") or ""),
+            goal=str(plan.get("goal") or plan.get("title") or item.get("title") or ""),
+            time_horizon=plan.get("time_horizon") if isinstance(plan.get("time_horizon"), dict) else {},
+            raw_payload=plan,
+            days=plan_days_payload,
+        )
+        from app.jarvis.persistence import list_jarvis_plan_days
+        saved_plan_days = await list_jarvis_plan_days(plan_id=persisted_plan["id"], limit=2000)
+        projected_calendar = []
+        for plan_day in saved_plan_days:
+            projected = await _project_plan_day_to_calendar(plan_day, source_agent=persisted_plan.get("source_agent"), reason="?????????????????")
+            if projected:
+                projected_calendar.append(projected)
         updated = await update_pending_action(pending_id, status="confirmed", arguments=arguments, title=saved_task.get("title"))
         return {
             "pending_action": updated,
@@ -1194,13 +1905,17 @@ async def confirm_pending_action_item(pending_id: str, req: PendingActionConfirm
                 "task": persisted_task,
                 "task_days": persisted_days,
                 "task_day_count": len(persisted_days),
+                "plan": persisted_plan,
+                "plan_day_count": len(plan_days_payload),
+                "calendar_projection_count": len(projected_calendar),
+                "calendar_projection": projected_calendar,
                 "persisted": True,
             },
             "fallback": False,
         }
 
     if item.get("action_type") != "calendar.add":
-        raise HTTPException(status_code=400, detail="Only calendar.add pending actions can be confirmed in this MVP")
+        raise HTTPException(status_code=400, detail="Only task.plan and calendar.add pending actions can be confirmed")
 
     title = str(arguments.get("title") or req.title or item.get("title") or "")
     start = arguments.get("start")
@@ -1222,13 +1937,51 @@ async def confirm_pending_action_item(pending_id: str, req: PendingActionConfirm
         route_required=bool(arguments.get("route_required") or False),
     )
     result = await add_calendar_event(event_req)
+    from app.jarvis.persistence import save_jarvis_plan, update_jarvis_plan_day
+
+    plan_day_result = None
+    if isinstance(arguments.get("plan_day_id"), str):
+        plan_day_result = await update_jarvis_plan_day(
+            arguments["plan_day_id"],
+            {"calendar_event_id": result["event_id"], "status": "scheduled"},
+            event_type="calendar.changed",
+        )
+    else:
+        plan_date = datetime.fromisoformat(str(start).replace("Z", "+00:00")).date().isoformat()
+        plan = await save_jarvis_plan(
+            plan_id=str(arguments.get("plan_id") or f"plan_{pending_id}"),
+            title=title,
+            plan_type="short_term",
+            status="active",
+            source_agent=item.get("agent_id"),
+            source_pending_id=pending_id,
+            original_user_request=str(arguments.get("created_reason") or item.get("title") or title),
+            goal=title,
+            time_horizon={"start": str(start), "end": str(end)},
+            raw_payload=arguments,
+            days=[{
+                "id": str(arguments.get("plan_day_id") or f"planday_{pending_id}"),
+                "date": plan_date,
+                "title": title,
+                "description": arguments.get("notes"),
+                "start_time": datetime.fromisoformat(str(start).replace("Z", "+00:00")).time().isoformat(timespec="minutes"),
+                "end_time": datetime.fromisoformat(str(end).replace("Z", "+00:00")).time().isoformat(timespec="minutes"),
+                "status": "scheduled",
+                "calendar_event_id": result["event_id"],
+            }],
+        )
+        from app.jarvis.persistence import list_jarvis_plan_days
+        plan_days = await list_jarvis_plan_days(plan_id=plan["id"], limit=5)
+        plan_day_result = plan_days[0] if plan_days else None
     updated = await update_pending_action(
         pending_id,
         status="confirmed",
         arguments=arguments,
         title=title,
     )
-    return {"pending_action": updated, "result": result}
+    return {"pending_action": updated, "result": {**result, "plan_day": plan_day_result}}
+
+    
 
 
 class CalendarEventRequest(BaseModel):
@@ -1289,12 +2042,39 @@ async def add_calendar_event(req: CalendarEventRequest) -> dict[str, Any]:
         status=req.status,
         route_required=req.route_required,
     )
+    plan_day = None
+    if req.source == "user_ui":
+        from app.jarvis.persistence import list_jarvis_plan_days, save_jarvis_plan
+
+        plan = await save_jarvis_plan(
+            plan_id=f"plan_calendar_{event.id}",
+            title=req.title,
+            plan_type="short_term",
+            status="active",
+            source_agent=req.source_agent,
+            original_user_request=req.created_reason or "????????",
+            goal=req.title,
+            time_horizon={"start": req.start.isoformat(), "end": req.end.isoformat()},
+            raw_payload={"calendar_event": event.model_dump()},
+            days=[{
+                "id": f"planday_calendar_{event.id}",
+                "date": req.start.date().isoformat(),
+                "title": req.title,
+                "description": req.notes,
+                "start_time": req.start.time().isoformat(timespec="minutes"),
+                "end_time": req.end.time().isoformat(timespec="minutes"),
+                "status": "scheduled",
+                "calendar_event_id": event.id,
+            }],
+        )
+        plan_days = await list_jarvis_plan_days(plan_id=plan["id"], limit=1)
+        plan_day = plan_days[0] if plan_days else None
     density = compute_schedule_density()
     await get_life_context_bus().update_fields(
         {"schedule_density": density, "active_events": get_upcoming_events(hours_ahead=24)},
         source="user_ui",
     )
-    return {"event_id": event.id, "new_schedule_density": density, "event": event.model_dump()}
+    return {"event_id": event.id, "new_schedule_density": density, "event": event.model_dump(), "plan_day": plan_day}
 
 
 @router.delete("/calendar/events/{event_id}")
@@ -1354,12 +2134,176 @@ class RoundtableStartRequest(BaseModel):
     user_input: str = ""
     session_id: str
     mode_id: str = "general"
+    source_session_id: str | None = None
+    source_agent_id: str | None = None
+
+
+class RoundtableAcceptRequest(BaseModel):
+    result_id: str | None = None
+    note: str | None = None
+
+
+class RoundtableReturnRequest(BaseModel):
+    result_id: str | None = None
+    user_choice: str | None = None
+    note: str | None = None
+
+
+class RoundtableSaveRequest(BaseModel):
+    result_id: str | None = None
+    note: str | None = None
+
+
+class RoundtablePlanRequest(BaseModel):
+    result_id: str | None = None
+    note: str | None = None
 
 
 @router.get("/scenarios")
 async def list_jarvis_scenarios() -> list[dict[str, Any]]:
     from app.jarvis.scenarios import list_scenarios
     return list_scenarios()
+
+
+def _roundtable_mode_for_scenario(scenario_id: str) -> str:
+    return "decision" if scenario_id in {"study_energy_decision", "schedule_coord"} else "brainstorm"
+
+
+def _build_brainstorm_result(session_id: str, scenario_id: str, topic: str, synthesis: str, ideas: list[dict[str, Any]]) -> dict[str, Any]:
+    cleaned_ideas = []
+    for idx, idea in enumerate(ideas[:8], start=1):
+        title = str(idea.get("content") or idea.get("title") or "").strip()
+        if not title:
+            continue
+        cleaned_ideas.append({
+            "id": idea.get("id") or f"idea_{idx}",
+            "title": title[:140],
+            "source_agent": idea.get("agent_id") or idea.get("source_agent"),
+            "round": idea.get("round"),
+        })
+    if not cleaned_ideas and synthesis:
+        for idx, line in enumerate([line.strip("- 0123456789.、") for line in synthesis.splitlines() if line.strip()][:5], start=1):
+            cleaned_ideas.append({"id": f"synthesis_{idx}", "title": line[:140], "source_agent": "moderator"})
+    themes = [
+        {"title": "核心方向", "summary": synthesis[:220] if synthesis else "围绕当前主题继续发散。"},
+        {"title": "可探索想法", "summary": f"已沉淀 {len(cleaned_ideas)} 条候选想法。"},
+    ]
+    tensions = []
+    lowered = synthesis.lower()
+    if any(keyword in lowered for keyword in ["risk", "风险", "问题", "挑战", "但是", "however"]):
+        tensions.append({"title": "创意与可行性", "description": "部分想法需要进一步验证成本、风险和执行条件。"})
+    else:
+        tensions.append({"title": "发散与收敛", "description": "当前结果偏发散，转计划前需要用户选择优先方向。"})
+    return {
+        "id": f"rt_result_{session_id}",
+        "session_id": session_id,
+        "mode": "brainstorm",
+        "status": "draft",
+        "summary": synthesis or "Brainstorm 已结束，结果可保存为灵感或转交 Maxwell 生成待确认计划。",
+        "themes": themes,
+        "ideas": cleaned_ideas,
+        "tensions": tensions,
+        "followup_questions": [
+            "你最想优先推进哪一个方向？",
+            "这些想法里哪些只是灵感，哪些需要转成计划？",
+            "有没有预算、时间或风险边界需要补充？",
+        ],
+        "save_as_memory": False,
+        "handoff_target": "maxwell",
+        "context": {"topic": topic, "scenario_id": scenario_id, "raw_idea_count": len(ideas)},
+    }
+
+
+async def _prepare_decision_context() -> dict[str, Any]:
+    from zoneinfo import ZoneInfo
+
+    from app.jarvis.persistence import list_background_task_days, list_maxwell_workbench_items, list_mood_snapshots, list_stress_signals
+    from app.mcp.adapters.calendar_adapter import get_events_between
+
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    start = datetime.combine(today, datetime.min.time())
+    end = datetime.combine(today, datetime.max.time())
+    snapshots = await list_mood_snapshots(start=today.isoformat(), end=today.isoformat(), limit=1)
+    stress_signals = await list_stress_signals(date=today.isoformat(), limit=20)
+    task_days = await list_background_task_days(plan_date=today.isoformat(), limit=20)
+    workbench_items = await list_maxwell_workbench_items(status="pending", plan_date=today.isoformat(), limit=20)
+    events = [event.model_dump() for event in get_events_between(start, end)]
+    return {
+        "date": today.isoformat(),
+        "psychological_snapshot": snapshots[0] if snapshots else None,
+        "schedule_pressure": stress_signals,
+        "today_tasks": task_days,
+        "calendar_events": events,
+        "maxwell_workbench_items": workbench_items,
+        "rag_summary": "MVP: 使用当前心理快照、压力信号、今日任务和日程事件作为决策上下文。",
+    }
+
+
+def _build_decision_context_prefix(context: dict[str, Any]) -> str:
+    snapshot = context.get("psychological_snapshot") or {}
+    stress = context.get("schedule_pressure") or []
+    tasks = context.get("today_tasks") or []
+    events = context.get("calendar_events") or []
+    return (
+        "## Decision 预取上下文\n"
+        f"- 心理快照: mood={snapshot.get('mood_score', 'n/a')}, stress={snapshot.get('stress_score', 'n/a')}, "
+        f"energy={snapshot.get('energy_score', 'n/a')}, flags={snapshot.get('risk_flags', [])}\n"
+        f"- 日程压力信号: {len(stress)} 条；今日任务: {len(tasks)} 条；日程事件: {len(events)} 条\n"
+        f"- RAG 摘要: {context.get('rag_summary')}\n\n"
+    )
+
+
+def _build_decision_result(session_id: str, scenario_id: str, user_input: str, transcript: str, context: dict[str, Any]) -> dict[str, Any]:
+    snapshot = context.get("psychological_snapshot") or {}
+    stress = float(snapshot.get("stress_score") or 0)
+    energy = float(snapshot.get("energy_score") or 5)
+    pressure = float(snapshot.get("schedule_pressure_score") or 0)
+    tasks = context.get("today_tasks") or []
+    events = context.get("calendar_events") or []
+    overloaded = stress >= 7 or pressure >= 7 or len(tasks) + len(events) >= 5
+    recommended = "缩小学习任务 + 安排恢复窗口" if overloaded or energy <= 4 else "继续学习但降低强度"
+    context_explanation = {
+        "psychological": {
+            "label": "心理状态",
+            "summary": f"压力 {stress:g}/10，能量 {energy:g}/10；用于判断是否需要降低强度。",
+            "impact": "压力高或能量低时，圆桌优先保护恢复边界。",
+        },
+        "schedule": {
+            "label": "日程压力",
+            "summary": f"压力信号 {len(context.get('schedule_pressure') or [])} 条，今日日程 {len(events)} 条。",
+            "impact": "日程/压力越密集，越倾向拆小任务而不是追加承诺。",
+        },
+        "plan": {
+            "label": "今日计划",
+            "summary": f"今日任务 {len(tasks)} 条，Maxwell 工作台 {len(context.get('maxwell_workbench_items') or [])} 条。",
+            "impact": "任务较多时，建议只保留最小可完成动作，并交给 Maxwell 生成待确认调整。",
+        },
+    }
+    actions = [
+        {"title": "先做 25 分钟低强度学习", "owner": "athena", "duration_minutes": 25},
+        {"title": "插入 20 分钟恢复休息", "owner": "mira", "duration_minutes": 20},
+        {"title": "由 Maxwell 生成待确认日程调整卡", "owner": "maxwell", "requires_confirmation": True},
+    ]
+    return {
+        "id": f"rt_result_{session_id}",
+        "session_id": session_id,
+        "mode": "decision",
+        "status": "draft",
+        "summary": "圆桌建议先保护恢复边界，再保留一个可完成的最小学习动作；这不是心理诊断，也不会直接改动日程。",
+        "options": [
+            {"id": "continue_light", "title": "继续但降强度", "description": "只做最小学习块，避免把疲惫扩大成挫败感。"},
+            {"id": "recover_first", "title": "先恢复再学习", "description": "先休息，再重新确认是否还有精力学习。"},
+            {"id": "reschedule", "title": "改到明天", "description": "让 Maxwell 生成待确认调整，不直接修改日程。"},
+        ],
+        "recommended_option": recommended,
+        "tradeoffs": [
+            {"option": "继续但降强度", "pros": ["保留学习连续性"], "cons": ["仍会消耗精力"]},
+            {"option": "先恢复再学习", "pros": ["降低过载风险"], "cons": ["今晚学习产出更少"]},
+        ],
+        "actions": actions,
+        "handoff_target": "maxwell",
+        "context": {**context, "user_input": user_input, "transcript_excerpt": transcript[-1200:], "scenario_id": scenario_id, "context_explanation": context_explanation},
+    }
 
 
 @router.post("/roundtable/start")
@@ -1383,11 +2327,15 @@ async def start_roundtable(
     profile_prefix = build_profile_prefix()
 
     ctx = await get_life_context_bus().get_context()
+    roundtable_mode = _roundtable_mode_for_scenario(scenario.id)
+    decision_context = await _prepare_decision_context() if roundtable_mode == "decision" else None
     context_prefix = (
         f"[当前生活状态: 压力{ctx.stress_level:.1f}/10, "
         f"日程密度{ctx.schedule_density:.1f}/10, "
         f"心情{ctx.mood_trend}]\n\n"
     )
+    if decision_context is not None:
+        context_prefix += _build_decision_context_prefix(decision_context)
     user_ask = req.user_input or "(用户未具体说明,请根据当前状态主动展开)"
     composed_message = (
         f"{profile_prefix}{context_prefix}{scenario.opening_prompt}\n\n用户诉求: {user_ask}"
@@ -1404,10 +2352,28 @@ async def start_roundtable(
                 title=f"{scenario.name} · Brainstorm",
                 scenario_id=scenario.id,
                 session_id=req.session_id,
-                route_payload={"mode": "roundtable", "scenario_id": scenario.id, "user_input": req.user_input, "mode_id": req.mode_id},
+                route_payload={"mode": "roundtable", "scenario_id": scenario.id, "user_input": req.user_input, "mode_id": req.mode_id, "source_session_id": req.source_session_id, "source_agent_id": req.source_agent_id},
             )
         except Exception as exc:
             logger.warning("jarvis.roundtable.conversation_save_failed", session_id=req.session_id, error=str(exc))
+
+        from app.jarvis.roundtable_sessions import add_turn_async, create_session_async
+
+        session = await create_session_async(
+            session_id=req.session_id,
+            scenario_id=scenario.id,
+            scenario_name=scenario.name,
+            participants=list(scenario.agents),
+            agent_roster="brainstorm",
+            mode="brainstorm",
+            source_session_id=req.source_session_id,
+            source_agent_id=req.source_agent_id,
+            title=f"{scenario.name}：{req.user_input[:40]}" if req.user_input else scenario.name,
+            user_prompt=req.user_input,
+        )
+        if req.user_input:
+            await add_turn_async(session, "user", "You", req.user_input)
+        session.round_count = 1
 
         from app.agent.brainstorm.executor import BrainstormExecutor
         from app.models.agent import AgentRequest
@@ -1420,9 +2386,58 @@ async def start_roundtable(
         )
 
         async def bs_event_gen():
+            from app.jarvis.roundtable_sessions import add_turn_async
+            from app.jarvis.persistence import save_roundtable_result
+
+            timing_started = time.perf_counter()
+            timing_spans: list[dict[str, Any]] = [{"name": "context_prepare", "ms": 0.0, "mode": "brainstorm", "participants": len(scenario.agents)}]
+            synthesis = ""
+            ideas: list[dict[str, Any]] = []
             async for ev in executor.execute_stream(agent_req):
                 event_name = ev.event.value if hasattr(ev.event, "value") else str(ev.event)
+                if event_name == "agent_speak":
+                    agent_span_started = time.perf_counter()
+                    agent_id = str(ev.data.get("agent_id") or "brainstorm")
+                    agent_name = str(ev.data.get("agent_name") or agent_id)
+                    content = str(ev.data.get("content") or "")
+                    await add_turn_async(session, agent_id, agent_name, content)
+                    timing_spans.append({"name": "agent_turn", "agent_id": agent_id, "ms": round((time.perf_counter() - agent_span_started) * 1000, 1), "chars": len(content)})
+                elif event_name == "idea_created":
+                    ideas.append(dict(ev.data))
+                elif event_name == "brainstorm_done":
+                    synthesis = str(ev.data.get("synthesis") or "")
                 yield {"event": event_name, "data": ev.model_dump_json()}
+            result_persist_started = time.perf_counter()
+            result_payload = _build_brainstorm_result(
+                session_id=req.session_id,
+                scenario_id=scenario.id,
+                topic=req.user_input or composed_message,
+                synthesis=synthesis,
+                ideas=ideas,
+            )
+            saved_result = await save_roundtable_result(
+                result_id=result_payload["id"],
+                session_id=req.session_id,
+                mode="brainstorm",
+                status="draft",
+                summary=result_payload["summary"],
+                options=result_payload["themes"],
+                recommended_option="",
+                tradeoffs=result_payload["tensions"],
+                actions=[{"type": "save_as_memory", "enabled": False}, {"type": "handoff_to_maxwell", "enabled": False}],
+                handoff_target="maxwell",
+                context={
+                    **result_payload["context"],
+                    "themes": result_payload["themes"],
+                    "ideas": result_payload["ideas"],
+                    "tensions": result_payload["tensions"],
+                    "followup_questions": result_payload["followup_questions"],
+                    "save_as_memory": False,
+                },
+            )
+            yield {"event": "brainstorm_result", "data": json.dumps(jsonable_encoder({**result_payload, **saved_result}), ensure_ascii=False)}
+            timing_spans.append({"name": "result_persist", "ms": round((time.perf_counter() - result_persist_started) * 1000, 1), "result_type": "brainstorm"})
+            yield {"event": "roundtable_timing", "data": json.dumps({"total_ms": round((time.perf_counter() - timing_started) * 1000, 1), "spans": timing_spans, "mode": "brainstorm", "strategy": "sequential_agent_turns"}, ensure_ascii=False)}
 
         return EventSourceResponse(bs_event_gen())
 
@@ -1444,7 +2459,7 @@ async def start_roundtable(
             title=f"{scenario.name} · 圆桌",
             scenario_id=scenario.id,
             session_id=req.session_id,
-            route_payload={"mode": "roundtable", "scenario_id": scenario.id, "user_input": req.user_input, "mode_id": req.mode_id},
+            route_payload={"mode": "roundtable", "scenario_id": scenario.id, "user_input": req.user_input, "mode_id": req.mode_id, "source_session_id": req.source_session_id, "source_agent_id": req.source_agent_id},
         )
     except Exception as exc:
         logger.warning("jarvis.roundtable.conversation_save_failed", session_id=req.session_id, error=str(exc))
@@ -1457,6 +2472,11 @@ async def start_roundtable(
         scenario_name=scenario.name,
         participants=participants,
         agent_roster="jarvis",
+        mode=roundtable_mode,
+        source_session_id=req.source_session_id,
+        source_agent_id=req.source_agent_id,
+        title=f"{scenario.name}：{req.user_input[:40]}" if req.user_input else scenario.name,
+        user_prompt=req.user_input,
     )
     # Seed the transcript with the user's initial request (if any)
     if req.user_input:
@@ -1475,6 +2495,9 @@ async def start_roundtable(
             profile_prefix=profile_prefix,
             context_prefix=context_prefix,
             phase_label="open",
+            mode=roundtable_mode,
+            initial_user_input=req.user_input,
+            decision_context=decision_context,
         )
     )
 
@@ -1568,8 +2591,301 @@ async def continue_roundtable(
             profile_prefix=profile_prefix,
             context_prefix=context_prefix,
             phase_label="user_turn",
+            mode=_roundtable_mode_for_scenario(session.scenario_id),
+            initial_user_input=req.user_message,
+            decision_context=await _prepare_decision_context() if _roundtable_mode_for_scenario(session.scenario_id) == "decision" else None,
         )
     )
+
+
+@router.get("/roundtable/{session_id}/decision-result")
+async def get_roundtable_decision_result(session_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import get_latest_roundtable_result
+
+    result = await get_latest_roundtable_result(session_id, mode="decision")
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Decision result for session {session_id!r} not found")
+    return result
+
+
+def _public_brainstorm_result(result: dict[str, Any]) -> dict[str, Any]:
+    context = result.get("context") if isinstance(result.get("context"), dict) else {}
+    return {
+        **result,
+        "themes": context.get("themes") if isinstance(context.get("themes"), list) else result.get("options", []),
+        "ideas": context.get("ideas") if isinstance(context.get("ideas"), list) else [],
+        "tensions": context.get("tensions") if isinstance(context.get("tensions"), list) else result.get("tradeoffs", []),
+        "followup_questions": context.get("followup_questions") if isinstance(context.get("followup_questions"), list) else [],
+        "save_as_memory": bool(context.get("save_as_memory")),
+    }
+
+
+@router.get("/roundtable/{session_id}/brainstorm-result")
+async def get_roundtable_brainstorm_result(session_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import get_latest_roundtable_result
+
+    result = await get_latest_roundtable_result(session_id, mode="brainstorm")
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Brainstorm result for session {session_id!r} not found")
+    return _public_brainstorm_result(result)
+
+
+@router.post("/roundtable/{session_id}/accept")
+async def accept_roundtable_decision(session_id: str, req: RoundtableAcceptRequest) -> dict[str, Any]:
+    from uuid import uuid4
+
+    from app.jarvis.persistence import get_latest_roundtable_result, get_roundtable_result, save_pending_action, save_roundtable_result
+
+    result = await get_roundtable_result(req.result_id) if req.result_id else await get_latest_roundtable_result(session_id, mode="decision")
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Decision result for session {session_id!r} not found")
+    if result.get("mode") != "decision":
+        raise HTTPException(status_code=400, detail="Only decision roundtable results can be accepted")
+    pending_id = result.get("pending_action_id") or f"pending_roundtable_{uuid4().hex}"
+    context = result.get("context") if isinstance(result.get("context"), dict) else {}
+    pending = await save_pending_action(
+        pending_id=pending_id,
+        action_type="calendar.add",
+        tool_name="calendar.add",
+        agent_id=str(result.get("handoff_target") or "maxwell"),
+        session_id=session_id,
+        title=f"待确认：{result.get('recommended_option') or '圆桌日程调整'}",
+        arguments={
+            "title": "低强度学习 + 恢复休息",
+            "start": context.get("suggested_start") or f"{context.get('date') or datetime.now().date().isoformat()}T20:00:00+08:00",
+            "end": context.get("suggested_end") or f"{context.get('date') or datetime.now().date().isoformat()}T20:45:00+08:00",
+            "stress_weight": 0.6,
+            "notes": "由 Decision 圆桌接受后生成，仍需用户在待确认卡上最终确认；不会自动改日程。",
+            "created_reason": f"用户接受圆桌建议：{result.get('recommended_option')}",
+            "route_required": False,
+            "roundtable_result_id": result.get("id"),
+            "decision_actions": result.get("actions", []),
+            "user_note": req.note,
+        },
+    )
+    updated_result = await save_roundtable_result(
+        result_id=str(result["id"]),
+        session_id=session_id,
+        mode="decision",
+        status="accepted",
+        summary=str(result.get("summary") or ""),
+        options=result.get("options") if isinstance(result.get("options"), list) else [],
+        recommended_option=str(result.get("recommended_option") or ""),
+        tradeoffs=result.get("tradeoffs") if isinstance(result.get("tradeoffs"), list) else [],
+        actions=result.get("actions") if isinstance(result.get("actions"), list) else [],
+        handoff_target=str(result.get("handoff_target") or "maxwell"),
+        context=context,
+        pending_action_id=pending_id,
+        user_choice="accepted",
+        handoff_status="pending",
+    )
+    return {"result": updated_result, "pending_action": pending, "direct_calendar_mutation": False}
+
+
+@router.post("/roundtable/{session_id}/save")
+async def save_roundtable_brainstorm_memory(session_id: str, req: RoundtableSaveRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import get_latest_roundtable_result, get_roundtable_result, save_jarvis_memory, save_roundtable_result
+
+    result = await get_roundtable_result(req.result_id) if req.result_id else await get_latest_roundtable_result(session_id, mode="brainstorm")
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Brainstorm result for session {session_id!r} not found")
+    if result.get("mode") != "brainstorm":
+        raise HTTPException(status_code=400, detail="Only brainstorm roundtable results can be saved as inspiration")
+    public_result = _public_brainstorm_result(result)
+    content = "\n".join([
+        "Brainstorm 灵感保存",
+        f"主题：{public_result.get('context', {}).get('topic', '')}" if isinstance(public_result.get("context"), dict) else "",
+        f"总结：{public_result.get('summary', '')}",
+        "想法：" + "；".join(str(item.get("title") or "") for item in public_result.get("ideas", [])[:6] if isinstance(item, dict)),
+    ]).strip()
+    memory = await save_jarvis_memory(
+        memory_kind="brainstorm_inspiration",
+        content=content,
+        source_agent="brainstorm",
+        session_id=session_id,
+        source_text=req.note,
+        structured_payload=public_result,
+        sensitivity="normal",
+        confidence=0.75,
+        importance=0.7,
+        memory_tier="raw",
+        visibility="global",
+    )
+    context = result.get("context") if isinstance(result.get("context"), dict) else {}
+    updated = await save_roundtable_result(
+        result_id=str(result["id"]),
+        session_id=session_id,
+        mode="brainstorm",
+        status="saved",
+        summary=str(result.get("summary") or ""),
+        options=result.get("options") if isinstance(result.get("options"), list) else [],
+        recommended_option=str(result.get("recommended_option") or ""),
+        tradeoffs=result.get("tradeoffs") if isinstance(result.get("tradeoffs"), list) else [],
+        actions=result.get("actions") if isinstance(result.get("actions"), list) else [],
+        handoff_target=str(result.get("handoff_target") or "maxwell"),
+        context={**context, "save_as_memory": True, "memory_id": memory.get("id")},
+        user_choice="save_as_memory",
+        handoff_status="saved_memory",
+    )
+    return {"result": _public_brainstorm_result(updated), "memory": memory, "direct_calendar_mutation": False, "direct_plan_mutation": False}
+
+
+@router.post("/roundtable/{session_id}/plan")
+async def convert_roundtable_brainstorm_to_plan(session_id: str, req: RoundtablePlanRequest) -> dict[str, Any]:
+    from uuid import uuid4
+
+    from app.jarvis.persistence import get_latest_roundtable_result, get_roundtable_result, save_pending_action, save_roundtable_result
+
+    result = await get_roundtable_result(req.result_id) if req.result_id else await get_latest_roundtable_result(session_id, mode="brainstorm")
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"Brainstorm result for session {session_id!r} not found")
+    if result.get("mode") != "brainstorm":
+        raise HTTPException(status_code=400, detail="Only brainstorm results can be converted to a Maxwell plan")
+    public_result = _public_brainstorm_result(result)
+    pending_id = result.get("pending_action_id") or f"pending_brainstorm_{uuid4().hex}"
+    topic = public_result.get("context", {}).get("topic", "Brainstorm 转计划") if isinstance(public_result.get("context"), dict) else "Brainstorm 转计划"
+    pending = await save_pending_action(
+        pending_id=pending_id,
+        action_type="task.plan",
+        tool_name="maxwell.plan_from_brainstorm",
+        agent_id="maxwell",
+        session_id=session_id,
+        title=f"待确认：将 Brainstorm 转成计划 - {str(topic)[:40]}",
+        arguments={
+            "plan": {
+                "id": f"brainstorm_plan_{uuid4().hex}",
+                "title": str(topic)[:80] or "Brainstorm 转计划",
+                "type": "brainstorm_followup",
+                "source_agent": "maxwell",
+                "original_user_request": str(topic),
+                "goal": "把已选择的 brainstorm 灵感转成可执行计划。",
+                "time_horizon": {"type": "user_confirmed_later"},
+                "milestones": [],
+                "subtasks": [
+                    {"title": str(item.get("title") or "待细化想法"), "source": item.get("source_agent")}
+                    for item in public_result.get("ideas", [])[:6]
+                    if isinstance(item, dict)
+                ],
+                "calendar_candidates": [],
+                "daily_plan": [],
+            },
+            "roundtable_result_id": result.get("id"),
+            "brainstorm_result": public_result,
+            "user_note": req.note,
+        },
+    )
+    context = result.get("context") if isinstance(result.get("context"), dict) else {}
+    updated = await save_roundtable_result(
+        result_id=str(result["id"]),
+        session_id=session_id,
+        mode="brainstorm",
+        status="handoff_pending",
+        summary=str(result.get("summary") or ""),
+        options=result.get("options") if isinstance(result.get("options"), list) else [],
+        recommended_option=str(result.get("recommended_option") or ""),
+        tradeoffs=result.get("tradeoffs") if isinstance(result.get("tradeoffs"), list) else [],
+        actions=result.get("actions") if isinstance(result.get("actions"), list) else [],
+        handoff_target="maxwell",
+        context=context,
+        pending_action_id=pending_id,
+        user_choice="convert_to_plan",
+        handoff_status="pending",
+    )
+    return {"result": _public_brainstorm_result(updated), "pending_action": pending, "direct_calendar_mutation": False, "direct_plan_mutation": False}
+
+
+@router.post("/roundtable/{session_id}/return")
+async def return_roundtable_to_private_chat(session_id: str, req: RoundtableReturnRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import (
+        get_latest_roundtable_result,
+        get_roundtable_result,
+        get_roundtable_session,
+        get_session_turns,
+        save_chat_turn,
+        save_roundtable_result,
+        save_session,
+    )
+
+    session_record = await get_roundtable_session(session_id)
+    if session_record is None:
+        raise HTTPException(status_code=404, detail=f"Roundtable session {session_id!r} not found")
+    result = await get_roundtable_result(req.result_id) if req.result_id else await get_latest_roundtable_result(session_id)
+    source_session_id = session_record.get("source_session_id") or (result or {}).get("source_session_id")
+    source_agent_id = session_record.get("source_agent_id") or (result or {}).get("source_agent_id") or "alfred"
+    if not source_session_id:
+        raise HTTPException(status_code=400, detail="This roundtable has no source private chat session to return to")
+
+    turns = await get_session_turns(session_id)
+    recent_points = [f"- {item.get('speaker_name')}: {str(item.get('content') or '').strip()}" for item in turns[-6:] if str(item.get("content") or "").strip()]
+    summary = str((result or {}).get("summary") or "").strip()
+    if not summary:
+        summary = "圆桌已结束：" + ("\n" + "\n".join(recent_points) if recent_points else "已回到原私聊继续处理。")
+    return_note = (
+        f"圆桌讨论总结\n\n{summary}\n\n"
+        f"用户选择：{req.user_choice or '回到原私聊继续'}"
+        + (f"\n补充说明：{req.note}" if req.note else "")
+    )
+    actions = [{
+        "type": "roundtable.return_summary",
+        "title": "圆桌讨论已带回私聊",
+        "description": summary,
+        "arguments": {
+            "roundtable_session_id": session_id,
+            "roundtable_result_id": (result or {}).get("id"),
+            "source_session_id": source_session_id,
+            "user_choice": req.user_choice,
+        },
+    }]
+    turn_id = await save_chat_turn(
+        agent_id=str(source_agent_id),
+        role="agent",
+        content=return_note,
+        actions=actions,
+        session_id=str(source_session_id),
+    )
+    updated_result = None
+    if result is not None:
+        context = result.get("context") if isinstance(result.get("context"), dict) else {}
+        updated_result = await save_roundtable_result(
+            result_id=str(result["id"]),
+            session_id=session_id,
+            mode=str(result.get("mode") or "decision"),
+            status="returned",
+            summary=str(result.get("summary") or summary),
+            options=result.get("options") if isinstance(result.get("options"), list) else [],
+            recommended_option=str(result.get("recommended_option") or ""),
+            tradeoffs=result.get("tradeoffs") if isinstance(result.get("tradeoffs"), list) else [],
+            actions=result.get("actions") if isinstance(result.get("actions"), list) else [],
+            handoff_target=str(result.get("handoff_target") or source_agent_id or "alfred"),
+            context={**context, "returned_to_session_id": source_session_id, "return_turn_id": turn_id},
+            source_session_id=str(source_session_id),
+            source_agent_id=str(source_agent_id),
+            pending_action_id=result.get("pending_action_id"),
+            result_json=result.get("result_json") if isinstance(result.get("result_json"), dict) else None,
+            user_choice=req.user_choice or result.get("user_choice") or "return_to_private_chat",
+            handoff_status="returned",
+        )
+    await save_session(
+        session_id=session_id,
+        scenario_id=str(session_record.get("scenario_id") or "roundtable"),
+        scenario_name=str(session_record.get("scenario_name") or "Roundtable"),
+        participants=session_record.get("participants") if isinstance(session_record.get("participants"), list) else [],
+        agent_roster=str(session_record.get("agent_roster") or "jarvis"),
+        round_count=int(session_record.get("round_count") or 0),
+        title=str(session_record.get("title") or session_record.get("scenario_name") or "Roundtable"),
+        user_prompt=str(session_record.get("user_prompt") or ""),
+        mode=str(session_record.get("mode") or "decision"),
+        source_session_id=str(source_session_id),
+        source_agent_id=str(source_agent_id),
+        status="returned",
+    )
+    return {
+        "source_session_id": source_session_id,
+        "source_agent_id": source_agent_id,
+        "return_turn_id": turn_id,
+        "summary": return_note,
+        "result": updated_result,
+    }
 
 
 async def _run_roundtable_round(
@@ -1584,6 +2900,9 @@ async def _run_roundtable_round(
     profile_prefix: str,
     context_prefix: str,
     phase_label: str,
+    mode: str = "brainstorm",
+    initial_user_input: str = "",
+    decision_context: dict[str, Any] | None = None,
 ):
     """Shared generator for both /start and /continue.
 
@@ -1591,7 +2910,15 @@ async def _run_roundtable_round(
     """
     from app.jarvis.roundtable_sessions import get_session
 
+    timing_started = time.perf_counter()
+    timing_spans: list[dict[str, Any]] = []
+
+    def mark_round_span(name: str, started: float, **extra: Any) -> None:
+        timing_spans.append({"name": name, "ms": round((time.perf_counter() - started) * 1000, 1), **extra})
+
+    context_prepare_started = time.perf_counter()
     session = get_session(session_id)
+    mark_round_span("context_prepare", context_prepare_started, mode=mode, participants=len(participants))
 
     yield {
         "event": "phase_change",
@@ -1602,10 +2929,12 @@ async def _run_roundtable_round(
             "participants": participants,
             "session_id": session_id,
             "round_count": session.round_count if session else 1,
+            "mode": mode,
         }),
     }
 
     for agent_id in participants:
+        agent_started = time.perf_counter()
         agent = JARVIS_AGENTS.get(agent_id)
         if agent is None:
             continue
@@ -1620,6 +2949,7 @@ async def _run_roundtable_round(
                 "agent_icon": agent["icon"],
                 "agent_color": agent["color"],
                 "session_id": session_id,
+                "progress": {"current": len(timing_spans), "total": len(participants), "status": "speaking"},
             }),
         }
 
@@ -1636,6 +2966,12 @@ async def _run_roundtable_round(
             f"请回应用户的最新诉求,或对其他 agent 的观点做补充。"
             f"保持简洁（3-5 句）,针对性强,不要重复已有的观点。"
         )
+        if mode == "decision":
+            prompt += (
+                "\n\n## Decision 规则\n"
+                "讨论阶段默认不要调用工具；只给判断依据、取舍和建议。"
+                "不要做心理诊断，不要直接承诺修改日程。最终接受后由 Maxwell 生成待确认动作。"
+            )
 
         try:
             reply, _tool_results = await run_agent_turn(
@@ -1661,6 +2997,19 @@ async def _run_roundtable_round(
                 )
             else:
                 content = f"{agent['name']} cannot reply right now: {error_text[:180]}"
+            yield {
+                "event": "agent_degraded",
+                "data": json.dumps({
+                    "phase": "degraded",
+                    "agent_id": agent_id,
+                    "agent_name": agent["name"],
+                    "session_id": session_id,
+                    "error": error_text[:240],
+                    "fallback_content": content,
+                    "continue_next_agent": True,
+                    "progress": {"current": len(timing_spans) + 1, "total": len(participants), "status": "degraded"},
+                }, ensure_ascii=False),
+            }
 
 
         # Record this agent's turn in the session transcript (persisted)
@@ -1680,8 +3029,51 @@ async def _run_roundtable_round(
                 "agent_name": agent["name"],
                 "content": content,
                 "session_id": session_id,
+                "progress": {"current": len(timing_spans) + 1, "total": len(participants), "status": "completed"},
             }),
         }
+        mark_round_span("agent_turn", agent_id=agent_id, started=agent_started, chars=len(content))
+
+    if mode == "decision":
+        from app.jarvis.persistence import save_roundtable_result
+
+        result_persist_started = time.perf_counter()
+        transcript_text = session.format_for_prompt(max_chars=5000) if session else ""
+        result_payload = _build_decision_result(
+            session_id=session_id,
+            scenario_id=scenario_id,
+            user_input=initial_user_input,
+            transcript=transcript_text,
+            context=decision_context or {},
+        )
+        saved_result = await save_roundtable_result(
+            result_id=result_payload["id"],
+            session_id=session_id,
+            mode="decision",
+            status="draft",
+            summary=result_payload["summary"],
+            options=result_payload["options"],
+            recommended_option=result_payload["recommended_option"],
+            tradeoffs=result_payload["tradeoffs"],
+            actions=result_payload["actions"],
+            handoff_target=result_payload["handoff_target"],
+            context=result_payload["context"],
+        )
+        yield {
+            "event": "decision_result",
+            "data": json.dumps(jsonable_encoder(saved_result), ensure_ascii=False),
+        }
+        mark_round_span("result_persist", result_persist_started, result_type="decision")
+
+    yield {
+        "event": "roundtable_timing",
+        "data": json.dumps({
+            "total_ms": round((time.perf_counter() - timing_started) * 1000, 1),
+            "spans": timing_spans,
+            "mode": mode,
+            "strategy": "sequential_agent_turns",
+        }, ensure_ascii=False),
+    }
 
     yield {
         "event": "done",
@@ -1712,3 +3104,4 @@ async def get_past_session_turns(session_id: str) -> list[dict[str, Any]]:
     """Return the full transcript for a past session (oldest turn first)."""
     from app.jarvis.persistence import get_session_turns
     return await get_session_turns(session_id)
+

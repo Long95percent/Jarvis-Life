@@ -1,6 +1,21 @@
 ﻿// shadowlink-web/src/services/jarvisApi.ts
 const BASE = "/api/v1/jarvis";
 
+export type BehaviorEventType =
+  | "heartbeat"
+  | "closed"
+  | "visibility_hidden"
+  | "visibility_visible"
+  | "idle_start"
+  | "idle_end"
+  | "sleep"
+  | "resume"
+  | "app_opened"
+  | "app_closed"
+  | "app_minimized"
+  | "app_activated"
+  | "app_restored";
+
 export interface CalendarEvent {
   id?: string;
   title: string;
@@ -160,6 +175,88 @@ export interface ChatResponse {
   escalation?: EscalationHint | null;
   actions?: ActionResult[] | null;
   routing?: Record<string, unknown> | null;
+  timing?: Record<string, unknown> | null;
+}
+
+export interface JarvisPlan {
+  id: string;
+  title: string;
+  plan_type: "short_term" | "long_term" | string;
+  status: string;
+  source_agent?: string | null;
+  source_pending_id?: string | null;
+  source_background_task_id?: string | null;
+  original_user_request: string;
+  goal?: string | null;
+  time_horizon: Record<string, unknown>;
+  raw_payload: Record<string, unknown>;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface JarvisPlanDay {
+  id: string;
+  plan_id: string;
+  plan_date: string;
+  title: string;
+  description?: string | null;
+  start_time?: string | null;
+  end_time?: string | null;
+  estimated_minutes?: number | null;
+  status: "pending" | "scheduled" | "pushed" | "completed" | "missed" | "rescheduled" | "cancelled" | string;
+  calendar_event_id?: string | null;
+  workbench_item_id?: string | null;
+  source_task_day_id?: string | null;
+  sort_order: number;
+  raw_payload: Record<string, unknown>;
+  reschedule_reason?: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface PlannerCalendarItem {
+  item_type: "calendar_event" | "plan_day" | "background_task_day" | string;
+  id: string;
+  date: string;
+  title: string;
+  status: string;
+  start?: string;
+  end?: string;
+  start_time?: string | null;
+  end_time?: string | null;
+  plan_id?: string;
+  task_id?: string;
+  calendar_event_id?: string | null;
+  payload: Record<string, unknown>;
+}
+
+export interface PlannerConflict {
+  start: string;
+  end: string;
+  items: PlannerCalendarItem[];
+  reason: string;
+}
+
+export interface PlannerFreeWindow {
+  start: string;
+  end: string;
+  minutes: number;
+}
+
+export interface PlannerCalendarResponse {
+  items: PlannerCalendarItem[];
+  conflicts: PlannerConflict[];
+  free_windows: PlannerFreeWindow[];
+}
+
+export interface AgentEvent {
+  id: string;
+  event_type: string;
+  agent_id?: string | null;
+  plan_id?: string | null;
+  plan_day_id?: string | null;
+  payload: Record<string, unknown>;
+  created_at: number;
 }
 
 export interface ChatHistoryTurn {
@@ -207,6 +304,98 @@ export interface ConversationHistoryItem {
   last_opened_at?: number | null;
 }
 
+export interface BehaviorObservation {
+  id: string;
+  date: string;
+  session_id?: string | null;
+  agent_id: string;
+  observation_type: string;
+  expected_bedtime?: string | null;
+  expected_wake?: string | null;
+  actual_first_active_at?: number | null;
+  actual_last_active_at?: number | null;
+  deviation_minutes?: number | null;
+  duration_minutes?: number | null;
+  source: string;
+  created_at: number;
+}
+
+export interface StressSignal {
+  id: string;
+  date: string;
+  signal_type: string;
+  severity: string;
+  score: number;
+  reason: string;
+  source_refs: Array<Record<string, unknown>>;
+  source: string;
+  created_at: number;
+}
+
+export interface EmotionObservation {
+  id: string;
+  session_id?: string | null;
+  turn_id?: number | null;
+  agent_id: string;
+  primary_emotion: string;
+  secondary_emotions: string[];
+  valence: number;
+  arousal: number;
+  stress_score: number;
+  fatigue_score: number;
+  risk_level: string;
+  confidence: number;
+  evidence_summary: string;
+  signals_json: string[];
+  source: string;
+  created_at: number;
+}
+
+export interface CareTrigger {
+  id: string;
+  trigger_type: string;
+  severity: string;
+  reason: string;
+  evidence_ids: Array<Record<string, unknown>>;
+  status: string;
+  message_id?: string | null;
+  created_at: string | number;
+}
+
+export interface CareTrendPoint {
+  date: string;
+  mood_score: number | null;
+  stress_score: number | null;
+  energy_score: number | null;
+  sleep_risk_score: number | null;
+  schedule_pressure_score: number | null;
+  dominant_emotions: string[];
+  risk_flags: string[];
+  summary?: string | null;
+  confidence: number;
+}
+
+export interface CareTrendDetail {
+  date?: string;
+  snapshot: CareTrendPoint;
+  emotion_observations: EmotionObservation[];
+  stress_signals: StressSignal[];
+  behavior_observations: BehaviorObservation[];
+  care_triggers: CareTrigger[];
+  positive_events: string[];
+  negative_events: string[];
+  explanations: string[];
+}
+
+export interface CareTrendsResponse {
+  range: "week" | "month" | "year" | string;
+  start: string;
+  end: string;
+  tracking_enabled?: boolean;
+  series: CareTrendPoint[];
+  details: Record<string, CareTrendDetail>;
+}
+
 
 async function errorFromResponse(res: Response, fallback: string): Promise<Error> {
   let detail = fallback;
@@ -239,6 +428,55 @@ export interface PendingAction {
   status: "pending" | "confirmed" | "cancelled" | string;
   created_at: number;
   updated_at: number;
+}
+
+export interface RoundtableDecisionResult {
+  id: string;
+  session_id: string;
+  mode: "decision" | string;
+  status: "draft" | "accepted" | string;
+  summary: string;
+  options: Array<{ id?: string; title?: string; description?: string }>;
+  recommended_option: string;
+  tradeoffs: Array<{ option?: string; pros?: string[]; cons?: string[] }>;
+  actions: Array<Record<string, unknown>>;
+  context?: Record<string, unknown>;
+  handoff_target: string;
+  result_json?: Record<string, unknown>;
+  user_choice?: string | null;
+  handoff_status?: string;
+  source_session_id?: string | null;
+  source_agent_id?: string | null;
+  pending_action_id?: string | null;
+}
+
+export interface RoundtableBrainstormResult {
+  id: string;
+  session_id: string;
+  mode: "brainstorm" | string;
+  status: "draft" | "saved" | "handoff_pending" | string;
+  summary: string;
+  themes: Array<{ title?: string; summary?: string }>;
+  ideas: Array<{ id?: string; title?: string; source_agent?: string; round?: number }>;
+  tensions: Array<{ title?: string; description?: string }>;
+  followup_questions: string[];
+  context?: Record<string, unknown>;
+  save_as_memory: boolean;
+  handoff_target: string;
+  result_json?: Record<string, unknown>;
+  user_choice?: string | null;
+  handoff_status?: string;
+  source_session_id?: string | null;
+  source_agent_id?: string | null;
+  pending_action_id?: string | null;
+}
+
+export interface RoundtableReturnResponse {
+  source_session_id: string;
+  source_agent_id: string;
+  return_turn_id?: number | null;
+  summary: string;
+  result?: RoundtableDecisionResult | RoundtableBrainstormResult | null;
 }
 
 export const jarvisApi = {
@@ -281,6 +519,8 @@ export const jarvisApi = {
         } else if (typeof data?.detail === "string") detail = data.detail;
         else if (typeof data?.message === "string") detail = data.message;
         else if (typeof data?.error === "string") detail = data.error;
+        if (typeof data?.data?.suggestion === "string") detail += `\n建议：${data.data.suggestion}`;
+        if (typeof data?.data?.error === "string") detail += `\n原因：${data.data.error}`;
       } catch {
         const text = await res.text().catch(() => "");
         if (text) detail = text;
@@ -303,6 +543,93 @@ export const jarvisApi = {
     if (sessionId) query.set("session_id", sessionId);
     const suffix = query.toString() ? `?${query.toString()}` : "";
     await fetch(`${BASE}/chat/${agentId}/history${suffix}`, { method: "DELETE" });
+  },
+
+  async recordBehaviorEvent(payload: {
+    agent_id: string;
+    session_id?: string | null;
+    observation_type: BehaviorEventType;
+    duration_minutes?: number | null;
+    occurred_at?: number | null;
+    session_started_at?: number | null;
+  }): Promise<{ observation: BehaviorObservation }> {
+    const res = await fetch(`${BASE}/care/behavior-events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `behavior event HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async listBehaviorObservations(params?: {
+    date?: string;
+    sessionId?: string;
+    observationType?: string;
+    limit?: number;
+  }): Promise<BehaviorObservation[]> {
+    const query = new URLSearchParams();
+    if (params?.date) query.set("date", params.date);
+    if (params?.sessionId) query.set("session_id", params.sessionId);
+    if (params?.observationType) query.set("observation_type", params.observationType);
+    if (params?.limit) query.set("limit", String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const res = await fetch(`${BASE}/care/behavior-observations${suffix}`);
+    if (!res.ok) return [];
+    return res.json();
+  },
+
+  async getCareTrends(params?: { range?: "week" | "month" | "year"; end?: string }): Promise<CareTrendsResponse> {
+    const query = new URLSearchParams();
+    query.set("range", params?.range ?? "week");
+    if (params?.end) query.set("end", params.end);
+    const res = await fetch(`${BASE}/care/trends?${query.toString()}`);
+    if (!res.ok) throw await errorFromResponse(res, `care trends HTTP ${res.status}`);
+    return res.json();
+  },
+
+  recordBehaviorEventBeacon(payload: {
+    agent_id: string;
+    session_id?: string | null;
+    observation_type: BehaviorEventType;
+    duration_minutes?: number | null;
+    occurred_at?: number | null;
+    session_started_at?: number | null;
+  }): boolean {
+    const body = JSON.stringify(payload);
+    if (typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+      return navigator.sendBeacon(`${BASE}/care/behavior-events`, new Blob([body], { type: "application/json" }));
+    }
+    void fetch(`${BASE}/care/behavior-events`, { method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => undefined);
+    return true;
+  },
+
+  async getCareDayDetail(day: string): Promise<CareTrendDetail> {
+    const res = await fetch(`${BASE}/care/days/${encodeURIComponent(day)}`);
+    if (!res.ok) throw await errorFromResponse(res, `care day detail HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async getCareSettings(): Promise<{ psychological_tracking_enabled: boolean }> {
+    const res = await fetch(`${BASE}/care/settings`);
+    if (!res.ok) throw await errorFromResponse(res, `care settings HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async setPsychologicalTracking(enabled: boolean): Promise<{ psychological_tracking_enabled: boolean }> {
+    const res = await fetch(`${BASE}/care/settings/tracking`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `care tracking HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async clearCareData(): Promise<{ deleted: Record<string, number> }> {
+    const res = await fetch(`${BASE}/care/data`, { method: "DELETE" });
+    if (!res.ok) throw await errorFromResponse(res, `clear care data HTTP ${res.status}`);
+    return res.json();
   },
 
   async listMemories(params?: { memoryKind?: string; limit?: number }): Promise<JarvisMemory[]> {
@@ -362,6 +689,70 @@ export const jarvisApi = {
   async getRoundtableTurns(sessionId: string): Promise<RoundtableTurn[]> {
     const res = await fetch(`${BASE}/sessions/${encodeURIComponent(sessionId)}/turns`);
     if (!res.ok) return [];
+    return res.json();
+  },
+
+  async getRoundtableDecisionResult(sessionId: string): Promise<RoundtableDecisionResult> {
+    const res = await fetch(`${BASE}/roundtable/${encodeURIComponent(sessionId)}/decision-result`);
+    if (!res.ok) throw await errorFromResponse(res, `roundtable decision result HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async acceptRoundtableDecision(
+    sessionId: string,
+    resultId?: string,
+  ): Promise<{ result: RoundtableDecisionResult; pending_action: PendingAction; direct_calendar_mutation: boolean }> {
+    const res = await fetch(`${BASE}/roundtable/${encodeURIComponent(sessionId)}/accept`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ result_id: resultId }),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `accept roundtable decision HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async getRoundtableBrainstormResult(sessionId: string): Promise<RoundtableBrainstormResult> {
+    const res = await fetch(`${BASE}/roundtable/${encodeURIComponent(sessionId)}/brainstorm-result`);
+    if (!res.ok) throw await errorFromResponse(res, `roundtable brainstorm result HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async saveRoundtableBrainstorm(
+    sessionId: string,
+    resultId?: string,
+  ): Promise<{ result: RoundtableBrainstormResult; memory: JarvisMemory; direct_calendar_mutation: boolean; direct_plan_mutation: boolean }> {
+    const res = await fetch(`${BASE}/roundtable/${encodeURIComponent(sessionId)}/save`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ result_id: resultId }),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `save brainstorm HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async convertRoundtableBrainstormToPlan(
+    sessionId: string,
+    resultId?: string,
+  ): Promise<{ result: RoundtableBrainstormResult; pending_action: PendingAction; direct_calendar_mutation: boolean; direct_plan_mutation: boolean }> {
+    const res = await fetch(`${BASE}/roundtable/${encodeURIComponent(sessionId)}/plan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ result_id: resultId }),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `brainstorm to plan HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async returnRoundtableToPrivateChat(
+    sessionId: string,
+    payload: { result_id?: string; user_choice?: string; note?: string } = {},
+  ): Promise<RoundtableReturnResponse> {
+    const res = await fetch(`${BASE}/roundtable/${encodeURIComponent(sessionId)}/return`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `return roundtable HTTP ${res.status}`);
     return res.json();
   },
 
@@ -514,6 +905,86 @@ export const jarvisApi = {
     return data.task_day;
   },
 
+  async listPlans(status?: string): Promise<JarvisPlan[]> {
+    const query = new URLSearchParams();
+    if (status) query.set("status", status);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const res = await fetch(`${BASE}/plans${suffix}`);
+    if (!res.ok) return [];
+    return res.json();
+  },
+
+  async listPlanDays(params?: { planId?: string; status?: string; start?: string; end?: string; limit?: number }): Promise<JarvisPlanDay[]> {
+    const query = new URLSearchParams();
+    if (params?.planId) query.set("plan_id", params.planId);
+    if (params?.status) query.set("status", params.status);
+    if (params?.start) query.set("start", params.start);
+    if (params?.end) query.set("end", params.end);
+    if (params?.limit) query.set("limit", String(params.limit));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const res = await fetch(`${BASE}/plan-days${suffix}`);
+    if (!res.ok) return [];
+    return res.json();
+  },
+
+  async getPlannerCalendar(range: { start: string; end: string }): Promise<PlannerCalendarResponse> {
+    const query = new URLSearchParams({ start: range.start, end: range.end });
+    const res = await fetch(`${BASE}/planner/calendar-items?${query.toString()}`);
+    if (!res.ok) return { items: [], conflicts: [], free_windows: [] };
+    const data = await res.json();
+    return {
+      items: Array.isArray(data?.items) ? data.items : [],
+      conflicts: Array.isArray(data?.conflicts) ? data.conflicts : [],
+      free_windows: Array.isArray(data?.free_windows) ? data.free_windows : [],
+    };
+  },
+
+  async listPlannerCalendarItems(range: { start: string; end: string }): Promise<PlannerCalendarItem[]> {
+    return (await this.getPlannerCalendar(range)).items;
+  },
+
+  async completePlanDay(dayId: string): Promise<JarvisPlanDay> {
+    const res = await fetch(`${BASE}/plan-days/${dayId}/complete`, { method: "POST" });
+    if (!res.ok) throw await errorFromResponse(res, `complete plan day HTTP ${res.status}`);
+    const data = await res.json();
+    return data.plan_day;
+  },
+
+  async updatePlanDay(dayId: string, payload: Partial<Pick<JarvisPlanDay, "plan_date" | "title" | "description" | "start_time" | "end_time" | "estimated_minutes" | "status" | "reschedule_reason">>): Promise<JarvisPlanDay> {
+    const res = await fetch(`${BASE}/plan-days/${dayId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `update plan day HTTP ${res.status}`);
+    const data = await res.json();
+    return data.plan_day;
+  },
+
+  async movePlanDay(dayId: string, payload: { plan_date: string; start_time?: string | null; end_time?: string | null; reason?: string | null }): Promise<JarvisPlanDay> {
+    const res = await fetch(`${BASE}/plan-days/${dayId}/move`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `move plan day HTTP ${res.status}`);
+    const data = await res.json();
+    return data.plan_day;
+  },
+
+  async cancelPlan(planId: string): Promise<JarvisPlan> {
+    const res = await fetch(`${BASE}/plans/${planId}/cancel`, { method: "POST" });
+    if (!res.ok) throw await errorFromResponse(res, `cancel plan HTTP ${res.status}`);
+    const data = await res.json();
+    return data.plan;
+  },
+
+  async listPlanEvents(planId: string): Promise<AgentEvent[]> {
+    const res = await fetch(`${BASE}/plans/${planId}/events`);
+    if (!res.ok) return [];
+    return res.json();
+  },
+
   async listMaxwellWorkbenchItems(params?: { status?: string; planDate?: string; limit?: number }): Promise<MaxwellWorkbenchItem[]> {
     const query = new URLSearchParams();
     if (params?.status) query.set("status", params.status);
@@ -575,6 +1046,16 @@ export const jarvisApi = {
       method: "POST",
     });
     if (!res.ok) throw await errorFromResponse(res, `dismiss proactive HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async sendCareFeedback(id: string, payload: { feedback: "helpful" | "too_frequent" | "not_needed" | "snooze" | "handled"; snooze_minutes?: number }): Promise<{ message: ProactiveMessage | null; intervention: Record<string, unknown> | null }> {
+    const res = await fetch(`${BASE}/messages/${encodeURIComponent(id)}/care-feedback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `care feedback HTTP ${res.status}`);
     return res.json();
   },
 

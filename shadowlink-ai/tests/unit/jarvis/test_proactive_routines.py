@@ -1,6 +1,7 @@
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
-import tempfile
+from uuid import uuid4
 from unittest.mock import patch
 
 import pytest
@@ -12,15 +13,16 @@ from app.jarvis.proactive_routines import ProactiveRoutineScheduler
 
 @pytest.fixture(autouse=True)
 def temp_db(monkeypatch):
-    tmp = Path(tempfile.mkdtemp()) / "jarvis.db"
+    db_dir = Path("data") / "test_dbs"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    tmp = db_dir / f"jarvis-{uuid4().hex}.db"
     monkeypatch.setattr(persistence, "_DB_PATH", tmp)
     persistence._initialized = False
     yield tmp
     persistence._initialized = False
 
 
-@pytest.mark.asyncio
-async def test_morning_brief_fires_once_when_user_recently_active():
+def test_morning_brief_fires_once_when_user_recently_active():
     scheduler = ProactiveRoutineScheduler()
     now = datetime(2026, 4, 27, 8, 30)
     ctx = LifeContext(
@@ -31,9 +33,12 @@ async def test_morning_brief_fires_once_when_user_recently_active():
         source_agent="user_chat",
     )
 
-    with patch("app.jarvis.user_settings.get_enabled_agents", return_value=["maxwell"]):
-        first = await scheduler.check_routines(ctx, now=now)
-        second = await scheduler.check_routines(ctx, now=now)
+    with patch("app.jarvis.user_settings.get_enabled_agents", return_value=["maxwell"]), patch(
+        "app.jarvis.mood_snapshot_maintenance.ensure_mood_snapshots",
+        return_value={"skipped": True},
+    ), patch("app.jarvis.planner_maintenance.run_planner_daily_maintenance_once", return_value={"skipped": True}):
+        first = asyncio.run(scheduler.check_routines(ctx, now=now))
+        second = asyncio.run(scheduler.check_routines(ctx, now=now))
 
     assert len(first) == 1
     assert second == []
@@ -43,8 +48,7 @@ async def test_morning_brief_fires_once_when_user_recently_active():
     assert "今天" in first[0]["content"]
 
 
-@pytest.mark.asyncio
-async def test_midday_appetite_inactive_user_is_low_priority_but_persisted():
+def test_midday_appetite_inactive_user_is_low_priority_but_persisted():
     scheduler = ProactiveRoutineScheduler()
     now = datetime(2026, 4, 27, 12, 10)
     ctx = LifeContext(
@@ -55,8 +59,11 @@ async def test_midday_appetite_inactive_user_is_low_priority_but_persisted():
         source_agent="system",
     )
 
-    with patch("app.jarvis.user_settings.get_enabled_agents", return_value=["nora"]):
-        messages = await scheduler.check_routines(ctx, now=now)
+    with patch("app.jarvis.user_settings.get_enabled_agents", return_value=["nora"]), patch(
+        "app.jarvis.mood_snapshot_maintenance.ensure_mood_snapshots",
+        return_value={"skipped": True},
+    ), patch("app.jarvis.planner_maintenance.run_planner_daily_maintenance_once", return_value={"skipped": True}):
+        messages = asyncio.run(scheduler.check_routines(ctx, now=now))
 
     assert len(messages) == 1
     assert messages[0]["agent_id"] == "nora"
@@ -65,8 +72,7 @@ async def test_midday_appetite_inactive_user_is_low_priority_but_persisted():
     assert messages[0]["status"] == "pending"
 
 
-@pytest.mark.asyncio
-async def test_evening_checkin_becomes_high_priority_when_stress_is_high():
+def test_evening_checkin_becomes_high_priority_when_stress_is_high():
     scheduler = ProactiveRoutineScheduler()
     now = datetime(2026, 4, 27, 22, 5)
     ctx = LifeContext(
@@ -78,8 +84,11 @@ async def test_evening_checkin_becomes_high_priority_when_stress_is_high():
         source_agent="user_ui",
     )
 
-    with patch("app.jarvis.user_settings.get_enabled_agents", return_value=["mira"]):
-        messages = await scheduler.check_routines(ctx, now=now)
+    with patch("app.jarvis.user_settings.get_enabled_agents", return_value=["mira"]), patch(
+        "app.jarvis.mood_snapshot_maintenance.ensure_mood_snapshots",
+        return_value={"skipped": True},
+    ), patch("app.jarvis.planner_maintenance.run_planner_daily_maintenance_once", return_value={"skipped": True}):
+        messages = asyncio.run(scheduler.check_routines(ctx, now=now))
 
     assert len(messages) == 1
     assert messages[0]["agent_id"] == "mira"
@@ -88,12 +97,49 @@ async def test_evening_checkin_becomes_high_priority_when_stress_is_high():
     assert "压力" in messages[0]["content"]
 
 
-@pytest.mark.asyncio
-async def test_routines_do_not_fire_during_quiet_hours():
+def test_routines_do_not_fire_during_quiet_hours():
     scheduler = ProactiveRoutineScheduler()
     now = datetime(2026, 4, 27, 2, 30)
     ctx = LifeContext(last_updated=now - timedelta(minutes=10), source_agent="user_chat")
 
-    messages = await scheduler.check_routines(ctx, now=now)
+    with patch(
+        "app.jarvis.mood_snapshot_maintenance.ensure_mood_snapshots",
+        return_value={"skipped": True},
+    ), patch("app.jarvis.planner_maintenance.run_planner_daily_maintenance_once", return_value={"skipped": True}):
+        messages = asyncio.run(scheduler.check_routines(ctx, now=now))
 
     assert messages == []
+
+
+def test_mood_snapshot_maintenance_runs_after_one_am():
+    scheduler = ProactiveRoutineScheduler()
+    now = datetime(2026, 5, 4, 1, 10)
+    ctx = LifeContext(last_updated=now - timedelta(minutes=10), source_agent="user_chat")
+    asyncio.run(persistence.save_emotion_observation(
+        session_id="s-routine-mood",
+        agent_id="mira",
+        primary_emotion="stressed",
+        secondary_emotions=[],
+        valence=-0.4,
+        arousal=0.7,
+        stress_score=7,
+        fatigue_score=6,
+        risk_level="medium",
+        confidence=0.7,
+        evidence_summary="今天压力偏高",
+        signals=["stress_signal"],
+        source="test",
+        created_at=datetime(2026, 5, 4, 0, 30).timestamp(),
+    ))
+
+    with patch("app.jarvis.user_settings.is_psychological_tracking_enabled", return_value=True), patch(
+        "app.jarvis.planner_maintenance.run_planner_daily_maintenance_once",
+        return_value={"skipped": True},
+    ):
+        messages = asyncio.run(scheduler.check_routines(ctx, now=now))
+
+    mood_item = next(item for item in messages if item.get("routine_id") == "mood_snapshot_maintenance")
+    assert mood_item["result"]["skipped"] is False
+    assert "2026-05-04" in mood_item["result"]["checked"]
+    snapshots = asyncio.run(persistence.list_mood_snapshots(start="2026-05-04", end="2026-05-04"))
+    assert len(snapshots) == 1

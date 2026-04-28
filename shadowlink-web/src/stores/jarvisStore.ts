@@ -11,6 +11,8 @@ interface PersistedUiState {
   activeAgentId?: string;
   activeRoundtableScenario?: string | null;
   activeRoundtableInput?: string;
+  activeRoundtableSourceSessionId?: string | null;
+  activeRoundtableSourceAgentId?: string | null;
   sessionId?: string;
 }
 
@@ -55,6 +57,8 @@ interface JarvisState {
   interactionMode: InteractionMode;
   activeRoundtableScenario: string | null;
   activeRoundtableInput: string;
+  activeRoundtableSourceSessionId: string | null;
+  activeRoundtableSourceAgentId: string | null;
   sessionId: string;
 
   loadContext: () => Promise<void>;
@@ -105,7 +109,8 @@ interface JarvisState {
   // New interaction actions
   setInteractionMode: (mode: InteractionMode) => void;
   openPrivateChat: (agentId: string) => void;
-  startRoundtable: (scenarioId: string, userInput: string) => void;
+  openExistingPrivateChat: (agentId: string, sessionId: string) => Promise<void>;
+  startRoundtable: (scenarioId: string, userInput: string, source?: { sessionId?: string; agentId?: string }) => void;
   openConversation: (conversation: ConversationHistoryItem) => Promise<void>;
   startTeamCollaboration: (goal: string, userMessage: string, agents?: string[]) => Promise<TeamCollaborationResponse>;
   closeRoundtable: () => void;
@@ -124,6 +129,8 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
   interactionMode: persistedUiState.interactionMode ?? "scenario_grid",
   activeRoundtableScenario: persistedUiState.activeRoundtableScenario ?? null,
   activeRoundtableInput: persistedUiState.activeRoundtableInput ?? "",
+  activeRoundtableSourceSessionId: persistedUiState.activeRoundtableSourceSessionId ?? null,
+  activeRoundtableSourceAgentId: persistedUiState.activeRoundtableSourceAgentId ?? null,
   sessionId: persistedUiState.sessionId ?? `jarvis-${Date.now()}`,
 
   loadContext: async () => {
@@ -138,6 +145,14 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
 
   loadAgents: async () => {
     const agents = await jarvisApi.listAgents();
+    const currentAgentId = get().activeAgentId;
+    const currentAgentIsValid = agents.some((agent) => agent.id === currentAgentId);
+    if (!currentAgentIsValid && agents.length > 0) {
+      const nextAgentId = agents[0].id;
+      writePersistedUiState({ activeAgentId: nextAgentId });
+      set({ agents, activeAgentId: nextAgentId });
+      return;
+    }
     set({ agents });
   },
 
@@ -319,13 +334,39 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     set({ activeAgentId: agentId, interactionMode: "private_chat", sessionId });
   },
 
-  startRoundtable: (scenarioId, userInput) => {
+  openExistingPrivateChat: async (agentId, sessionId) => {
+    writePersistedUiState({
+      activeAgentId: agentId,
+      interactionMode: "private_chat",
+      activeRoundtableScenario: null,
+      activeRoundtableInput: "",
+      activeRoundtableSourceSessionId: null,
+      activeRoundtableSourceAgentId: null,
+      sessionId,
+    });
+    set({
+      activeAgentId: agentId,
+      interactionMode: "private_chat",
+      activeRoundtableScenario: null,
+      activeRoundtableInput: "",
+      activeRoundtableSourceSessionId: null,
+      activeRoundtableSourceAgentId: null,
+      sessionId,
+    });
+    await get().loadChatHistory(agentId, sessionId);
+  },
+
+  startRoundtable: (scenarioId, userInput, source) => {
+    const sourceSessionId = source?.sessionId ?? (get().interactionMode === "private_chat" ? get().sessionId : undefined);
+    const sourceAgentId = source?.agentId ?? (get().interactionMode === "private_chat" ? get().activeAgentId : undefined);
     const sessionId = `jarvis-${Date.now()}`;
     const isBrainstorm = scenarioId === "work_brainstorm";
     writePersistedUiState({
       interactionMode: "roundtable",
       activeRoundtableScenario: scenarioId,
       activeRoundtableInput: userInput,
+      activeRoundtableSourceSessionId: sourceSessionId ?? null,
+      activeRoundtableSourceAgentId: sourceAgentId ?? null,
       sessionId,
     });
     jarvisApi.saveConversationHistory({
@@ -334,12 +375,14 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
       title: `${isBrainstorm ? "工作难题头脑风暴" : "圆桌讨论"}${userInput ? `：${userInput.slice(0, 18)}` : ""}`,
       scenario_id: scenarioId,
       session_id: sessionId,
-      route_payload: { mode: "roundtable", scenario_id: scenarioId, user_input: userInput, mode_id: "general" },
+      route_payload: { mode: "roundtable", scenario_id: scenarioId, user_input: userInput, mode_id: "general", source_session_id: sourceSessionId, source_agent_id: sourceAgentId },
     }).catch(() => {});
     set({
       interactionMode: "roundtable",
       activeRoundtableScenario: scenarioId,
       activeRoundtableInput: userInput,
+      activeRoundtableSourceSessionId: sourceSessionId ?? null,
+      activeRoundtableSourceAgentId: sourceAgentId ?? null,
       sessionId,
     });
   },
@@ -364,12 +407,16 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
         interactionMode: "roundtable",
         activeRoundtableScenario: scenarioId,
         activeRoundtableInput: userInput,
+        activeRoundtableSourceSessionId: typeof payload.source_session_id === "string" ? payload.source_session_id : null,
+        activeRoundtableSourceAgentId: typeof payload.source_agent_id === "string" ? payload.source_agent_id : null,
         sessionId: conversation.session_id,
       });
       set({
         interactionMode: "roundtable",
         activeRoundtableScenario: scenarioId,
         activeRoundtableInput: userInput,
+        activeRoundtableSourceSessionId: typeof payload.source_session_id === "string" ? payload.source_session_id : null,
+        activeRoundtableSourceAgentId: typeof payload.source_agent_id === "string" ? payload.source_agent_id : null,
         sessionId: conversation.session_id,
       });
     }
@@ -386,21 +433,25 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
 
   closeRoundtable: () =>
   {
-    writePersistedUiState({ interactionMode: "scenario_grid", activeRoundtableScenario: null, activeRoundtableInput: "" });
+    writePersistedUiState({ interactionMode: "scenario_grid", activeRoundtableScenario: null, activeRoundtableInput: "", activeRoundtableSourceSessionId: null, activeRoundtableSourceAgentId: null });
     set({
       interactionMode: "scenario_grid",
       activeRoundtableScenario: null,
       activeRoundtableInput: "",
+      activeRoundtableSourceSessionId: null,
+      activeRoundtableSourceAgentId: null,
     });
   },
 
   resetToScenarioGrid: () =>
   {
-    writePersistedUiState({ interactionMode: "scenario_grid", activeRoundtableScenario: null, activeRoundtableInput: "" });
+    writePersistedUiState({ interactionMode: "scenario_grid", activeRoundtableScenario: null, activeRoundtableInput: "", activeRoundtableSourceSessionId: null, activeRoundtableSourceAgentId: null });
     set({
       interactionMode: "scenario_grid",
       activeRoundtableScenario: null,
       activeRoundtableInput: "",
+      activeRoundtableSourceSessionId: null,
+      activeRoundtableSourceAgentId: null,
     });
   },
 }));

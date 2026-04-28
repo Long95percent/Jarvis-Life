@@ -1,4 +1,4 @@
-﻿# 2026-04-25 产品与架构执行计划
+# 2026-04-25 产品与架构执行计划
 
 > 创建时间：2026-04-25（Asia/Shanghai）  
 > 文档目的：在已完成的第 4.5 层日程模块基础上，重新明确后续管家团队、日程委托、单 Agent 基础能力、外部 skill / API / 文件与网页能力的产品与架构方向。  
@@ -347,9 +347,9 @@ Agent 是角色，skill 是能力。
 | Step | 状态 | 已实现 | 还差 |
 | --- | --- | --- | --- |
 | Step 1：Maxwell 日程 500 | 已实现 | 错误透传、工具调用解析、日程确认卡、确认写入、404 兜底 | 继续真实场景回归 |
-| Step 2：schedule_intent → Maxwell | 已实现 MVP | 非 Maxwell 遇到日程/任务规划需求时生成正式 `schedule_intent/task_intent`，路由 Maxwell，前端展示秘书接管提示，actions 可追溯 | 更精细的 intent 分类模型、用户可手动改派秘书/取消接管 |
-| Step 3：Maxwell 冲突检查 | 部分实现 | 日历读取、当前时间、用户手动日程、确认写入基础；新增确认卡前 schedule_guard，能检查时间冲突/过去时间/日程密度，并在前端待确认卡展示秘书判断和替代空档 | 用户直接选择替代时间后再写入、冲突重要性自动取消/改期策略 |
-| Step 3.5：长短期任务拆解 | 部分实现 | `jarvis_task_plan_decompose`、`background_tasks`、`task.plan` 卡片、确认保存、查询接口、历史 actions 持久化，刷新/返回后待确认卡可恢复 | 计划编辑、滚动排程、任务管理页、与日历候选联动 |
+| Step 2：schedule_intent → Maxwell | 部分实现 | 非 Maxwell 遇到明显日程/任务关键词时可基础路由 Maxwell | 正式 intent schema、跨 Agent 转交记录、秘书弹窗确认链 |
+| Step 3：Maxwell 冲突检查 | 部分实现 | 日历读取、当前时间、用户手动日程、确认写入基础 | 冲突检测算法、替代时间推荐、用户选择后再写入 |
+| Step 3.5：长短期任务拆解 | 部分实现 | `jarvis_task_plan_decompose`、`background_tasks`、`task.plan` 卡片、确认保存、查询接口、路演脚本 | 计划编辑、滚动排程、任务管理页、与日历候选联动 |
 | Step 3.6：记忆提取层 | 部分实现 | 现有 Shadow 偏好学习器、协作记忆、长期/语义/情节记忆模块；新增 Demo Run、Demo Trace、Demo Memory、测试画像重置 API；主私聊链路已接入 LLM JSON + 规则兜底的记忆提取、保存、召回注入和删除 API | 混合存储分流、心理/节律趋势分析、前端管理页 |
 | Step 4：Skill Registry | 部分实现 | 工具 schema、白名单、待确认卡机制、部分工具注册 | 统一 Registry、权限治理、成本策略、外部 API / 文件 / 网页 skill 标准化 |
 | Step 5：Team Collaboration Layer | 部分实现 | `/team/collaborate` 最小真实闭环、专家选择、Alfred 汇总、协作记忆 | 通用协作协议、Agent 间 handoff 执行、协作云图和点击查看链路 |
@@ -365,7 +365,7 @@ Agent 是角色，skill 是能力。
 - 有明确时间时，生成待确认日程。
 - 确认后写入日历。
 
-### 【已实现 MVP：正式 schedule_intent/task_intent 协议、Maxwell 接管提示和 actions 追溯已打通；还差更精细分类和用户手动改派】Step 2：实现 schedule_intent → Maxwell
+### 【部分实现：已实现基础关键词路由到 Maxwell；还差正式 schedule_intent 协议和跨 Agent 确认链】Step 2：实现 schedule_intent → Maxwell
 
 目标：其它 Agent 不直接写日程，只提交日程意图。
 
@@ -375,15 +375,7 @@ Agent 是角色，skill 是能力。
 - 系统转给 Maxwell。
 - Maxwell 弹出待确认安排。
 
-2026-04-26 增量：
-
-- 已新增 `_build_schedule_intent`，将非 Maxwell Agent 收到的日程/提醒/长期任务规划需求结构化为 `schedule_intent` 或 `task_intent`。
-- 私聊 pipeline 会把该 intent 路由给 Maxwell，并把结构化意图写入 Maxwell prompt，让秘书决定生成日程卡、长期任务卡或先追问。
-- 后端响应新增 `routing` 字段，并在 `actions` 中插入 intent action，便于前端展示和后续追溯。
-- 前端私聊会显示“已把日程安排/长期任务规划交给 maxwell”的接管提示，避免用户误以为 Mira/Nora/Leo 直接写日程。
-- 待确认动作归属修正为实际执行的 `routed_agent_id`，避免 pending action 记录仍挂在原 Agent 下。
-
-### 【部分实现：已有日历读取、当前时间、确认写入基础、确认卡前冲突判断和替代空档展示；还差用户选择替代时间闭环】Step 3：Maxwell 冲突检查
+### 【部分实现：已有日历读取、当前时间和确认写入基础；还差完整冲突检测、替代时间候选和用户选择闭环】Step 3：Maxwell 冲突检查
 
 目标：秘书安排前读取已有日程。
 
@@ -392,13 +384,6 @@ Agent 是角色，skill 是能力。
 - 如果用户要求的时间冲突，Maxwell 告知冲突。
 - Maxwell 给替代时间。
 - 用户选择后写入。
-
-2026-04-26 增量：
-
-- 已在 `jarvis_calendar_add` 的待确认卡生成前加入 `schedule_guard` 判断层。
-- 前端待确认日程卡展示秘书判断、冲突日程和可选空档。
-- 聊天历史已持久化 agent actions，刷新/返回后仍能恢复待确认卡。
-- 私聊点击“返回”会登记到历史对话模块，便于从右下角继续打开。
 
 ### 【部分实现：已落地 task planner、后台任务表、task.plan 确认卡和查询接口；还差计划编辑、滚动排程、任务管理页】Step 3.5：Maxwell 长短期任务拆解与后台任务清单
 
@@ -496,6 +481,7 @@ Maxwell 判断任务类型、拆解、安排、追问或生成确认卡
 ```
 
 #### 3.5.4 Maxwell 专属 Task Planning Skill
+还有，不止Maxwell能接入skill，其它也应该能接入，我需要在设置里增加一个查看、增加、删除各智能体skill的页面
 
 需要给 Maxwell 接一个特定 skill，暂定名：`maxwell_task_planner` 或 `jarvis_task_plan_decompose`。
 
@@ -944,6 +930,3 @@ MVP 可先做成设置页里的危险操作区：
 - 改动内容：将 `task.plan` 卡片里的“秘书还需要确认”从纯文本问题改为用户可直接填写的表单字段；备考/长期任务支持填写目标、目标日期、每周天数、每次分钟数、补充说明；旅行任务支持填写目的地、目标日期、预算、同行人、补充说明。确认时前端将这些字段合并进 `plan.user_filled_fields`、`time_horizon` 和 `user_constraints`，后端落盘到 `background_tasks.notes`，避免再次消耗 token 让 AI 追问且可能听不懂。
 - 影响范围：长期/后台任务确认卡、后台任务落盘内容。
 - 验证方式：`npm.cmd run type-check` 通过；`python -m py_compile app\api\v1\jarvis_router.py` 通过。
-
-2026-04-26 Bugfix：修复跨 Agent 转 Maxwell 时确认日程卡不展示的问题；当前前端会切到 Maxwell 并保留待确认 actions。历史对话面板增加事件刷新，私聊返回后立即展示记录；带 pending 确认卡的回复不再弹出 Brainstorm/团队协作提示。
-

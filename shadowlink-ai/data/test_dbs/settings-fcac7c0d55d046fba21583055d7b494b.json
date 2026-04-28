@@ -1,0 +1,42 @@
+{
+  "profile": {
+    "name": "",
+    "pronouns": "",
+    "occupation": "",
+    "location": {
+      "lat": 35.6762,
+      "lng": 139.6503,
+      "label": "Tokyo"
+    },
+    "sleep_schedule": {
+      "bedtime": "23:00",
+      "wake": "07:00"
+    },
+    "diet_restrictions": [],
+    "interests": []
+  },
+  "agents": {
+    "alfred": {
+      "enabled": true,
+      "interrupt_budget": 3
+    },
+    "maxwell": {
+      "enabled": true,
+      "interrupt_budget": 5
+    },
+    "nora": {
+      "enabled": true,
+      "interrupt_budget": 2
+    },
+    "mira": {
+      "enabled": true,
+      "interrupt_budget": 1
+    },
+    "leo": {
+      "enabled": true,
+      "interrupt_budget": 2
+    }
+  },
+  "shadow_learner_enabled": true,
+  "psychological_tracking_enabled": false
+}
