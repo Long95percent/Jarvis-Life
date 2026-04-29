@@ -723,8 +723,8 @@ async def chat_with_agent(
         timing_spans.append(span)
 
     route_started = time.perf_counter()
-    schedule_intent = _build_schedule_intent(req.message, req.agent_id)
-    routed_agent_id = "maxwell" if schedule_intent else req.agent_id
+    schedule_intent = None
+    routed_agent_id = req.agent_id
     try:
         agent = get_agent(routed_agent_id)
     except KeyError:
@@ -850,14 +850,6 @@ async def chat_with_agent(
         "如果不需要工具，直接回答。\n\n"
     )
     intent_context = ""
-    if schedule_intent:
-        intent_label = "长期/后台任务规划" if schedule_intent.get("type") == "task_intent" else "短期日程安排"
-        intent_context = (
-            "## 路由接管说明\n"
-            f"用户原本正在和 {req.agent_id} 对话，但系统识别到这是{intent_label}需求。\n"
-            "你是秘书 Maxwell，请正式接管：判断是生成待确认日程卡、长期任务计划卡，还是先追问必要信息。\n"
-            f"结构化意图: {json.dumps(schedule_intent, ensure_ascii=False)}\n\n"
-        )
     full_message = (
         f"{profile_prefix}{context_summary}\n\n"
         f"{time_context}"
@@ -911,29 +903,7 @@ async def chat_with_agent(
             )
         except Exception as exc:
             logger.warning("jarvis.chat.mood_care_failed", agent_id=req.agent_id, error=str(exc))
-    if schedule_intent and not tool_results:
-        fallback_tool_name = "jarvis_task_plan_decompose" if schedule_intent.get("type") == "task_intent" else "jarvis_calendar_add"
-        fallback_arguments: dict[str, Any] = {"user_request": req.message, "source_agent": req.agent_id}
-        if fallback_tool_name == "jarvis_calendar_add":
-            fallback_arguments = {
-                "title": req.message[:30] or "待安排日程",
-                "start": (local_now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0).isoformat(),
-                "end": (local_now + timedelta(hours=2)).replace(minute=0, second=0, microsecond=0).isoformat(),
-                "stress_weight": 1.0,
-                "created_reason": "跨 Agent 日程意图由 Maxwell 兜底生成，用户确认后才写入。",
-            }
-            if not clean_reply:
-                clean_reply = "我先接管这条日程需求，给你生成一个待确认卡；时间不合适可以先取消再补充具体时间。"
-        tool_results = await execute_tool_calls(routed_agent_id, [{"tool_name": fallback_tool_name, "arguments": fallback_arguments}])
     action_results = [*care_actions, *consult_result.actions, *to_action_results(tool_results)]
-    if schedule_intent:
-        action_results.insert(0, {
-            "type": schedule_intent["type"],
-            "ok": True,
-            "pending_confirmation": False,
-            "description": schedule_intent["reason"],
-            "arguments": schedule_intent,
-        })
     for action in action_results:
         if not action.get("pending_confirmation"):
             continue
@@ -3104,4 +3074,3 @@ async def get_past_session_turns(session_id: str) -> list[dict[str, Any]]:
     """Return the full transcript for a past session (oldest turn first)."""
     from app.jarvis.persistence import get_session_turns
     return await get_session_turns(session_id)
-
