@@ -6,7 +6,7 @@ import pytest
 from app.api.v1 import jarvis_router
 from app.api.v1.jarvis_router import AgentChatRequest
 from app.jarvis import persistence
-from app.jarvis.agent_consultation import parse_consult_edges, run_agent_consultations
+from app.jarvis.agent_consultation import parse_consult_edges, plan_consult_edges, run_agent_consultations
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +52,91 @@ def test_parse_consult_edges_supports_two_hop_chain():
         ("nora", "mira"),
         ("mira", "maxwell"),
     ]
+
+
+def test_plan_consult_edges_routes_emotional_message_to_mira():
+    edges = plan_consult_edges(
+        source_agent="nora",
+        message="我最近压力很大，睡不好，也有点焦虑。",
+    )
+
+    assert [(edge.from_agent, edge.to_agent, edge.intent_type) for edge in edges] == [
+        ("nora", "mira", "care_intent")
+    ]
+    assert edges[0].metadata["matched_keywords"]
+
+
+def test_plan_consult_edges_routes_food_energy_message_to_nora():
+    edges = plan_consult_edges(
+        source_agent="mira",
+        message="我今晚很累，吃什么能补充能量又不刺激？",
+    )
+
+    assert [(edge.from_agent, edge.to_agent, edge.intent_type) for edge in edges] == [
+        ("mira", "nora", "nutrition_intent")
+    ]
+
+
+def test_plan_consult_edges_routes_schedule_message_to_maxwell_without_handoff():
+    edges = plan_consult_edges(
+        source_agent="leo",
+        message="明天下午帮我安排一次散步，别和会议冲突。",
+    )
+
+    assert [(edge.from_agent, edge.to_agent, edge.intent_type) for edge in edges] == [
+        ("leo", "maxwell", "schedule_intent")
+    ]
+
+
+def test_plan_consult_edges_routes_maxwell_emotional_message_to_mira():
+    edges = plan_consult_edges(
+        source_agent="maxwell",
+        message="我焦虑到有点撑不住，今晚还要继续学吗？",
+    )
+
+    assert [(edge.from_agent, edge.to_agent, edge.intent_type) for edge in edges] == [
+        ("maxwell", "mira", "care_intent")
+    ]
+
+
+def test_plan_consult_edges_limits_mixed_message_to_two_specialists():
+    edges = plan_consult_edges(
+        source_agent="alfred",
+        message="我今晚很累还要复习，吃什么比较好，明天也要安排会议，周末还想出去放松。",
+    )
+
+    assert len(edges) == 2
+    assert {edge.to_agent for edge in edges} <= {"maxwell", "mira", "nora", "leo"}
+    assert all(edge.to_agent != "alfred" for edge in edges)
+
+
+def test_plan_consult_edges_explicit_request_takes_priority():
+    edges = plan_consult_edges(
+        source_agent="nora",
+        message="你先去问问心理师我最近心理状态，再决定今天吃什么。",
+    )
+
+    assert [(edge.from_agent, edge.to_agent, edge.intent_type) for edge in edges] == [
+        ("nora", "mira", "explicit_consult")
+    ]
+
+
+def test_plan_consult_edges_never_consults_self_or_shadow():
+    edges = plan_consult_edges(
+        source_agent="mira",
+        message="我压力很大，也有点焦虑。",
+    )
+
+    assert edges == []
+
+
+def test_plan_consult_edges_ignores_vague_small_talk():
+    edges = plan_consult_edges(
+        source_agent="alfred",
+        message="你好呀，今天感觉还行。",
+    )
+
+    assert edges == []
 
 
 @pytest.mark.asyncio
