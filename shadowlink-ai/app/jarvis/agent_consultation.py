@@ -22,11 +22,75 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "leo": ("leo", "Leo", "生活顾问", "生活"),
 }
 
+_TASK_KEYWORDS = (
+    "备考", "雅思", "ielts", "考研", "考试", "长期", "一个月后", "下个月",
+    "暑假", "寒假", "旅游", "旅行", "搬家", "作品集", "健身习惯", "长期计划",
+    "每周", "每天", "周期", "以后", "未来", "准备", "目标",
+)
+_SCHEDULE_ACTION_KEYWORDS = (
+    "日程", "安排", "提醒", "预约", "开会", "会议", "deadline", "schedule", "待办",
+    "帮我", "记得", "加入", "写进", "放到", "规划", "定个", "约",
+)
+_SCHEDULE_TIME_KEYWORDS = (
+    "明天", "后天", "今天", "今晚", "下午", "上午", "晚上", "几点", "周一", "周二",
+    "周三", "周四", "周五", "周六", "周日", "星期", "下周", "本周",
+)
+_SCHEDULE_VERBS = ("做", "办", "见", "练", "学", "整理", "散步", "健身", "复习", "开会", "会议")
+_CARE_KEYWORDS = (
+    "压力", "焦虑", "累", "疲惫", "睡不好", "失眠", "崩溃", "撑不住",
+    "扛不住", "难受", "烦", "自责", "不想学", "不想动", "stressed",
+    "anxious", "overwhelmed", "tired", "burnout",
+)
+_NUTRITION_KEYWORDS = (
+    "吃什么", "吃啥", "晚饭", "午饭", "早饭", "饭", "营养", "咖啡", "水",
+    "补充能量", "能量", "胃", "低糖", "蛋白", "碳水", "喝什么", "meal",
+    "nutrition", "coffee", "hydration",
+)
+_LIFESTYLE_KEYWORDS = (
+    "周末", "出门", "散步", "活动", "放松", "去哪", "去哪玩", "推荐",
+    "运动", "恢复", "休息", "社交", "weekend", "relax", "activity",
+)
+
+_AUTO_INTENTS: tuple[dict[str, Any], ...] = (
+    {
+        "intent_type": "task_intent",
+        "target_agent": "maxwell",
+        "keywords": _TASK_KEYWORDS,
+        "reason": "用户表达了长期任务或背景计划需求，应咨询 Maxwell。",
+    },
+    {
+        "intent_type": "schedule_intent",
+        "target_agent": "maxwell",
+        "keywords": _SCHEDULE_ACTION_KEYWORDS + _SCHEDULE_TIME_KEYWORDS,
+        "reason": "用户表达了日程、提醒或短期安排需求，应咨询 Maxwell。",
+    },
+    {
+        "intent_type": "care_intent",
+        "target_agent": "mira",
+        "keywords": _CARE_KEYWORDS,
+        "reason": "用户表达了情绪、压力、睡眠或恢复边界需求，应咨询 Mira。",
+    },
+    {
+        "intent_type": "nutrition_intent",
+        "target_agent": "nora",
+        "keywords": _NUTRITION_KEYWORDS,
+        "reason": "用户表达了饮食、补水、咖啡或能量恢复需求，应咨询 Nora。",
+    },
+    {
+        "intent_type": "lifestyle_intent",
+        "target_agent": "leo",
+        "keywords": _LIFESTYLE_KEYWORDS,
+        "reason": "用户表达了活动、生活方式或低负担恢复需求，应咨询 Leo。",
+    },
+)
+
 
 @dataclass(frozen=True)
 class ConsultEdge:
     from_agent: str
     to_agent: str
+    intent_type: str = "explicit_consult"
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -125,6 +189,82 @@ def parse_consult_edges(source_agent: str, message: str) -> list[ConsultEdge]:
     return edges
 
 
+def _match_keywords(text: str, keywords: tuple[str, ...]) -> list[str]:
+    lowered = text.lower()
+    return [keyword for keyword in keywords if keyword.lower() in lowered]
+
+
+def _explicit_edges_with_metadata(source_agent: str, message: str) -> list[ConsultEdge]:
+    return [
+        ConsultEdge(
+            from_agent=edge.from_agent,
+            to_agent=edge.to_agent,
+            intent_type="explicit_consult",
+            metadata={
+                "mode": "private_consult",
+                "reason": "用户显式要求当前角色咨询该专家。",
+                "matched_keywords": [],
+                "confidence": 0.95,
+            },
+        )
+        for edge in parse_consult_edges(source_agent=source_agent, message=message)
+    ]
+
+
+def _schedule_matches(text: str) -> list[str]:
+    action_matches = _match_keywords(text, _SCHEDULE_ACTION_KEYWORDS)
+    time_matches = _match_keywords(text, _SCHEDULE_TIME_KEYWORDS)
+    if action_matches:
+        return [*action_matches, *[keyword for keyword in time_matches if keyword not in action_matches]]
+    if time_matches and any(verb in text for verb in _SCHEDULE_VERBS):
+        return [*time_matches, *[verb for verb in _SCHEDULE_VERBS if verb in text]]
+    return []
+
+
+def _auto_matches_for_intent(intent_type: str, text: str, keywords: tuple[str, ...]) -> list[str]:
+    if intent_type == "schedule_intent":
+        return _schedule_matches(text)
+    return _match_keywords(text, keywords)
+
+
+def plan_consult_edges(source_agent: str, message: str) -> list[ConsultEdge]:
+    explicit_edges = _explicit_edges_with_metadata(source_agent, message)
+    if explicit_edges:
+        return explicit_edges[:_MAX_CONSULT_EDGES]
+
+    text = message.strip()
+    if not text:
+        return []
+
+    edges: list[ConsultEdge] = []
+    seen_targets: set[str] = set()
+    for definition in _AUTO_INTENTS:
+        intent_type = str(definition["intent_type"])
+        target_agent = str(definition["target_agent"])
+        if not _can_consult(source_agent, target_agent) or target_agent in seen_targets:
+            continue
+        matched = _auto_matches_for_intent(intent_type, text, definition["keywords"])
+        if not matched:
+            continue
+        seen_targets.add(target_agent)
+        edges.append(
+            ConsultEdge(
+                from_agent=source_agent,
+                to_agent=target_agent,
+                intent_type=intent_type,
+                metadata={
+                    "mode": "private_consult",
+                    "reason": str(definition["reason"]),
+                    "matched_keywords": matched[:4],
+                    "confidence": 0.82 if len(matched) >= 2 else 0.68,
+                },
+            )
+        )
+        if len(edges) >= _MAX_CONSULT_EDGES:
+            break
+    return edges
+
+
 def _parse_consult_json(raw: str) -> dict[str, Any]:
     text = (raw or "").strip()
     start = text.find("{")
@@ -209,7 +349,7 @@ async def run_agent_consultations(
     llm_client: Any,
     context_summary: str,
 ) -> AgentConsultationResult:
-    edges = parse_consult_edges(source_agent=source_agent, message=user_message)
+    edges = plan_consult_edges(source_agent=source_agent, message=user_message)
     if not edges:
         return AgentConsultationResult()
 
@@ -237,6 +377,8 @@ async def run_agent_consultations(
             "from_agent_name": _agent_name(edge.from_agent),
             "to_agent": edge.to_agent,
             "to_agent_name": _agent_name(edge.to_agent),
+            "intent_type": edge.intent_type,
+            "metadata": edge.metadata,
             "summary": summary,
             "confidence": parsed.get("confidence", 0.5),
             "needs_followup": bool(parsed.get("needs_followup") or False),
