@@ -26,11 +26,21 @@ class FakeConsultLLM:
         self.calls.append({"message": message, "system_prompt": system_prompt})
         if "严格只输出 JSON" in message:
             return '{"memories":[]}'
+        if "## Jarvis private agent consultation" in message and "Mira" in system_prompt:
+            return '{"summary":"心理状态偏紧绷，建议先降低强度并保留恢复边界。","confidence":0.82,"needs_followup":false}'
+        if "## Jarvis private agent consultation" in message and "Maxwell" in system_prompt:
+            return '{"summary":"今晚时间紧，只适合一个 45 分钟学习块，不建议强塞 2 小时。","confidence":0.78,"needs_followup":false}'
+        if "## Jarvis private agent consultation" in message and "Nora" in system_prompt:
+            return '{"summary":"建议温热、低油，搭配一点碳水和蛋白，避免空腹咖啡。","confidence":0.8,"needs_followup":false}'
+        if "## Jarvis private agent consultation" in message and "Leo" in system_prompt:
+            return '{"summary":"建议低负担散步或短时户外，不要安排高消耗活动。","confidence":0.76,"needs_followup":false}'
         if "Mira" in system_prompt:
-            return '{"summary":"心理状态偏紧绷，建议低刺激、温热、稳定血糖。","confidence":0.82,"needs_followup":false}'
-        if "Maxwell" in system_prompt:
-            return '{"summary":"今晚时间紧，只适合 20 分钟内完成的轻量安排。","confidence":0.78,"needs_followup":false}'
-        return "结合内部咨询，我建议今晚吃温热、简单、低刺激的食物。"
+            return "我问了 Maxwell 和 Nora。今晚先别硬顶，保留一个 45 分钟学习块，再吃一点温热、低油、有碳水和蛋白的晚饭。"
+        if "Nora" in system_prompt:
+            return "我问了 Mira。你现在更需要先降强度，再吃温热、简单、低刺激的食物。"
+        if "Leo" in system_prompt:
+            return "我问了 Maxwell。明天下午可以安排散步，但要避开会议并留出缓冲。"
+        return "结合内部咨询，我建议先做一个轻量版本。"
 
 
 def test_parse_consult_edges_supports_role_aliases():
@@ -191,3 +201,30 @@ async def test_chat_pipeline_injects_consult_context_into_final_agent(monkeypatc
     assert "## 私下咨询结果" in final_call["message"]
     assert "心理状态偏紧绷" in final_call["message"]
     assert "温热、简单、低刺激" in response.content
+
+
+@pytest.mark.asyncio
+async def test_chat_pipeline_schedule_intent_consults_maxwell_without_switching_agent(monkeypatch):
+    llm = FakeConsultLLM()
+
+    async def no_memory_extract(**kwargs):
+        return []
+
+    monkeypatch.setattr(jarvis_router, "extract_and_save_chat_memories", no_memory_extract)
+
+    response = await jarvis_router.chat_with_agent(
+        AgentChatRequest(
+            agent_id="mira",
+            session_id="session-mira-schedule",
+            message="今晚很累但还要学 2 小时，帮我重新安排一下。",
+        ),
+        llm_client=llm,
+    )
+
+    final_call = llm.calls[-1]
+    assert response.agent_id == "mira"
+    assert response.routing is None
+    assert response.actions is None or all(action["type"] != "schedule_intent" for action in response.actions)
+    assert "## 私下咨询结果" in final_call["message"]
+    assert "Maxwell" in final_call["message"]
+    assert "我问了 Maxwell" in response.content
