@@ -178,6 +178,22 @@ export interface ChatResponse {
   timing?: Record<string, unknown> | null;
 }
 
+function parseSSEFrames(buffer: string): { frames: Array<{ event: string; data: string }>; remainder: string } {
+  const frames: Array<{ event: string; data: string }> = [];
+  const parts = buffer.split(/\n\n/);
+  const remainder = parts.pop() ?? "";
+  for (const part of parts) {
+    let event = "message";
+    const dataLines: string[] = [];
+    for (const line of part.split(/\n/)) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+    }
+    if (dataLines.length > 0) frames.push({ event, data: dataLines.join("\n") });
+  }
+  return { frames, remainder };
+}
+
 export interface JarvisPlan {
   id: string;
   title: string;
@@ -528,6 +544,38 @@ export const jarvisApi = {
       throw new Error(detail);
     }
     return res.json();
+  },
+
+  async chatStream(agentId: string, message: string, sessionId: string): Promise<ChatResponse> {
+    const res = await fetch(`${BASE}/chat/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+      body: JSON.stringify({ agent_id: agentId, message, session_id: sessionId }),
+    });
+    if (!res.ok || !res.body) return this.chat(agentId, message, sessionId);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let result: ChatResponse | null = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parsed = parseSSEFrames(buffer);
+      buffer = parsed.remainder;
+      for (const frame of parsed.frames) {
+        if (frame.event === "chat_result") {
+          result = JSON.parse(frame.data) as ChatResponse;
+        }
+        if (frame.event === "chat_error") {
+          const payload = JSON.parse(frame.data) as { error?: string };
+          throw new Error(payload.error || "Jarvis stream failed");
+        }
+      }
+    }
+    if (!result) return this.chat(agentId, message, sessionId);
+    return result;
   },
 
   async getChatHistory(agentId: string, limit = 50, sessionId?: string): Promise<ChatHistoryTurn[]> {

@@ -37,12 +37,13 @@ def _load_providers() -> dict:
             with open(_PROVIDERS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if data.get("providers"):
+                data.setdefault("background_id", None)
                 return data
         except (json.JSONDecodeError, KeyError):
             pass
 
     # First run — seed from .env settings if an API key is configured
-    data: dict[str, Any] = {"providers": [], "active_id": None}
+    data: dict[str, Any] = {"providers": [], "active_id": None, "background_id": None}
     if settings.llm.api_key:
         provider = {
             "id": "default",
@@ -55,7 +56,9 @@ def _load_providers() -> dict:
         }
         data["providers"].append(provider)
         data["active_id"] = "default"
+        data["background_id"] = None
         _save_providers(data)
+    data.setdefault("background_id", None)
     return data
 
 
@@ -190,7 +193,11 @@ async def list_providers() -> Result[dict]:
         )
         # Don't send raw key in list — send it only in single-get or when editing
         safe.append(entry)
-    return Result.ok(data={"providers": safe, "active_id": data.get("active_id")})
+    return Result.ok(data={
+        "providers": safe,
+        "active_id": data.get("active_id"),
+        "background_id": data.get("background_id"),
+    })
 
 
 @router.get("/providers/presets")
@@ -278,6 +285,19 @@ async def activate_provider(provider_id: str) -> Result[dict]:
     return Result.fail(code=404, message=f"Provider '{provider_id}' not found")
 
 
+@router.post("/providers/{provider_id}/activate-background")
+async def activate_background_provider(provider_id: str) -> Result[dict]:
+    """Set a provider as the low-priority background/sidecar model."""
+    data = _load_providers()
+    for p in data["providers"]:
+        if p["id"] == provider_id:
+            data["background_id"] = provider_id
+            _save_providers(data)
+            _apply_background_provider(p)
+            return Result.ok(data=p, message=f"Activated background model: {p['name']}")
+    return Result.fail(code=404, message=f"Provider '{provider_id}' not found")
+
+
 @router.post("/providers/test")
 async def test_provider(provider: ProviderCreate) -> Result[dict]:
     """Test connectivity to an LLM provider by sending a minimal completion request."""
@@ -331,6 +351,27 @@ def _apply_provider(provider: dict) -> None:
         logger.info("llm_client_reinitialized", provider=provider["name"], model=provider["model"])
     except Exception as exc:
         logger.error("llm_client_reinit_failed", error=str(exc))
+
+
+def _apply_background_provider(provider: dict | None) -> None:
+    """Push sidecar provider settings into the running background LLM client."""
+    try:
+        from app.llm.background_client import build_background_llm_client
+
+        client = build_background_llm_client(provider)
+        set_resource("background_llm_client", client)
+        try:
+            from app.core.lifespan import get_preference_learner
+
+            learner = get_preference_learner()
+            if learner is not None and hasattr(learner, "set_llm_client"):
+                learner.set_llm_client(client or get_resource("llm_client"))
+        except Exception as exc:
+            logger.warning("preference_learner_sidecar_update_failed", error=str(exc))
+        if provider:
+            logger.info("background_llm_client_reinitialized", provider=provider.get("name"), model=provider.get("model"))
+    except Exception as exc:
+        logger.error("background_llm_client_reinit_failed", error=str(exc))
 
 
 # ── Legacy endpoints (backward-compatible) ───────────────────────
@@ -397,4 +438,3 @@ async def get_service_info() -> Result[dict[str, Any]]:
             list(agent_engine._strategy_executors.keys()) if agent_engine else []
         ),
     })
-

@@ -28,9 +28,82 @@ from app.jarvis.memory_recall import build_bounded_memory_recall_prefix
 from app.jarvis.preference_learner import build_preference_profile_prefix
 from app.jarvis.intent_router import plan_agent_intent
 from app.jarvis.tool_runtime import execute_tool_calls, format_tool_results, run_agent_turn, to_action_results
+from app.llm.background_client import get_background_llm_client
 
 logger = structlog.get_logger("jarvis.api")
 router = APIRouter(prefix="/jarvis", tags=["jarvis"])
+
+
+async def _save_background_completion_notice(*, kind: str, count: int, source_agent: str) -> None:
+    if count <= 0:
+        return
+    try:
+        from app.jarvis.models import ProactiveMessage
+        from app.jarvis.persistence import save_proactive_message
+
+        label = "长期记忆提取" if kind == "memory" else "偏好学习"
+        await save_proactive_message(
+            ProactiveMessage(
+                agent_id="shadow",
+                agent_name="Shadow",
+                content=f"{label}已完成：本轮更新 {count} 条后台资料。",
+                trigger=f"{kind}_background_complete",
+                priority="low",
+            )
+        )
+    except Exception as exc:
+        logger.warning("jarvis.chat.background_notice_failed", kind=kind, source_agent=source_agent, error=str(exc))
+
+
+async def _run_chat_background_tasks(
+    *,
+    user_message: str,
+    agent_reply: str,
+    source_agent: str,
+    session_id: str,
+    tool_results: list[dict[str, Any]],
+) -> None:
+    async def memory_job() -> None:
+        saved_count = 0
+        try:
+            if is_user_constraint(user_message):
+                await remember_user_constraint(user_message, source_agent=source_agent)
+            await remember_tool_actions(source_agent, tool_results)
+            saved = await extract_and_save_chat_memories(
+                user_message=user_message,
+                agent_reply=agent_reply,
+                source_agent=source_agent,
+                session_id=session_id,
+                llm_client=get_background_llm_client(),
+            )
+            saved_count = len(saved or [])
+            await maybe_compact_old_raw_memories(cutoff_days=7, min_interval_seconds=3600)
+        except Exception as exc:
+            logger.warning("jarvis.chat.memory_save_failed", agent_id=source_agent, error=str(exc))
+        await _save_background_completion_notice(kind="memory", count=saved_count, source_agent=source_agent)
+
+    async def preference_job() -> None:
+        changed = False
+        try:
+            from app.jarvis.user_settings import get_settings as _get_jarvis_settings
+            from app.core.lifespan import get_preference_learner
+
+            if not _get_jarvis_settings().shadow_learner_enabled:
+                return
+            learner = get_preference_learner()
+            if learner is not None:
+                if hasattr(learner, "set_llm_client"):
+                    learner.set_llm_client(get_background_llm_client())
+                changed = bool(await learner.observe(
+                    agent_id=source_agent,
+                    user_message=user_message,
+                    agent_response=agent_reply,
+                ))
+        except Exception as exc:
+            logger.warning("jarvis.shadow.observe_failed", error=str(exc))
+        await _save_background_completion_notice(kind="preference", count=1 if changed else 0, source_agent=source_agent)
+
+    await asyncio.gather(memory_job(), preference_job())
 
 
 def _chat_error_detail(stage: str, exc: Exception, *, agent_id: str | None = None) -> dict[str, Any]:
@@ -800,9 +873,11 @@ async def chat_with_agent(
         mark_span("base_context", context_started, history_turns=len(history or []))
 
         memory_started = time.perf_counter()
-        collaboration_text = await build_collaboration_memory_prefix(routed_agent_id, limit=6)
-        memory_text = await build_bounded_memory_recall_prefix(routed_agent_id, req.message, limit=6)
-        preference_text = await build_preference_profile_prefix(routed_agent_id, limit=6)
+        collaboration_text, memory_text, preference_text = await asyncio.gather(
+            build_collaboration_memory_prefix(routed_agent_id, limit=6),
+            build_bounded_memory_recall_prefix(routed_agent_id, req.message, limit=6),
+            build_preference_profile_prefix(routed_agent_id, limit=6),
+        )
         mark_span(
             "memory_context",
             memory_started,
@@ -980,22 +1055,15 @@ async def chat_with_agent(
             action["error"] = f"待确认动作保存失败：{exc}"
     mark_span("actions_built", actions_started, actions=len(action_results), pending=sum(1 for action in action_results if action.get("pending_confirmation")))
 
-    memory_save_started = time.perf_counter()
-    try:
-        if is_user_constraint(req.message):
-            await remember_user_constraint(req.message, source_agent=routed_agent_id)
-        await remember_tool_actions(routed_agent_id, all_tool_results)
-        await extract_and_save_chat_memories(
-            user_message=req.message,
-            agent_reply=clean_reply,
-            source_agent=routed_agent_id,
-            session_id=req.session_id,
-            llm_client=llm_client,
-        )
-        await maybe_compact_old_raw_memories(cutoff_days=7, min_interval_seconds=3600)
-    except Exception as exc:
-        logger.warning("jarvis.chat.memory_save_failed", agent_id=req.agent_id, error=str(exc))
-    mark_span("memory_save", memory_save_started)
+    background_started = time.perf_counter()
+    asyncio.create_task(_run_chat_background_tasks(
+        user_message=req.message,
+        agent_reply=clean_reply,
+        source_agent=routed_agent_id,
+        session_id=req.session_id,
+        tool_results=all_tool_results,
+    ))
+    mark_span("background_scheduled", background_started)
 
     # Persist both sides of the exchange so the next request has history
     persist_started = time.perf_counter()
@@ -1043,23 +1111,6 @@ async def chat_with_agent(
             "countdown_seconds": hint.countdown_seconds,
         }
 
-    # Feed observation to Shadow (if enabled)
-    from app.jarvis.user_settings import get_settings as _get_jarvis_settings
-    if _get_jarvis_settings().shadow_learner_enabled:
-        shadow_started = time.perf_counter()
-        from app.core.lifespan import get_preference_learner
-        learner = get_preference_learner()
-        if learner is not None:
-            try:
-                await learner.observe(
-                    agent_id=req.agent_id,
-                    user_message=req.message,
-                    agent_response=clean_reply,
-                )
-            except Exception as exc:
-                logger.warning("jarvis.shadow.observe_failed", error=str(exc))
-        mark_span("shadow_observe", shadow_started)
-
     total_ms = round((time.perf_counter() - timing_started) * 1000, 1)
     timing_payload = {
         "total_ms": total_ms,
@@ -1083,6 +1134,43 @@ async def chat_with_agent(
         routing=schedule_intent,
         timing=timing_payload,
     )
+
+
+async def _chat_stream_events(req: AgentChatRequest, llm_client: Any):
+    started = time.perf_counter()
+    yield {
+        "event": "chat_status",
+        "data": json.dumps({"stage": "accepted", "agent_id": req.agent_id, "session_id": req.session_id}, ensure_ascii=False),
+    }
+    try:
+        response = await chat_with_agent(req, llm_client=llm_client)
+        yield {
+            "event": "chat_result",
+            "data": json.dumps(jsonable_encoder(response), ensure_ascii=False),
+        }
+        yield {
+            "event": "chat_done",
+            "data": json.dumps({
+                "ok": True,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                "response_ready_ms": response.timing.get("total_ms") if response.timing else None,
+            }, ensure_ascii=False),
+        }
+    except Exception as exc:
+        yield {
+            "event": "chat_error",
+            "data": json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False),
+        }
+
+
+@router.post("/chat/stream")
+async def stream_chat_with_agent(
+    req: AgentChatRequest,
+    llm_client=Depends(get_llm_client),
+) -> EventSourceResponse:
+    """SSE chat endpoint for lower perceived latency in private-chat mode."""
+
+    return EventSourceResponse(_chat_stream_events(req, llm_client))
 
 
 @router.get("/chat/{agent_id}/history")

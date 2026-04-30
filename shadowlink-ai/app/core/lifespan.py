@@ -60,12 +60,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # ── 1. Initialize LLM Client ──
     try:
-        from app.api.v1.settings_router import _load_providers
+        from app.api.v1.settings_router import _apply_background_provider, _load_providers
 
         provider_data = _load_providers()
         active_id = provider_data.get("active_id")
+        background_id = provider_data.get("background_id")
         active_provider = next(
             (provider for provider in provider_data.get("providers", []) if provider.get("id") == active_id),
+            None,
+        )
+        background_provider = next(
+            (provider for provider in provider_data.get("providers", []) if provider.get("id") == background_id),
             None,
         )
         if active_provider is not None:
@@ -81,6 +86,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 model=settings.llm.model,
                 base_url=settings.llm.base_url,
             )
+        _apply_background_provider(background_provider)
     except Exception as exc:
         await logger.awarning("llm_active_provider_load_failed", error=str(exc))
 
@@ -270,7 +276,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _preference_learner
     from app.jarvis.preference_learner import PreferenceLearner
 
-    _preference_learner = PreferenceLearner(llm_client=llm_client)
+    from app.llm.background_client import get_background_llm_client
+
+    _preference_learner = PreferenceLearner(llm_client=get_background_llm_client() or llm_client)
     await logger.ainfo("jarvis_preference_learner_ready")
 
     # ── 9. Rehydrate Jarvis state from SQLite ──

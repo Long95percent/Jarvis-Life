@@ -28,6 +28,7 @@ interface ServerProvider {
 interface ServerProvidersResponse {
   providers: ServerProvider[]
   active_id: string | null
+  background_id?: string | null
 }
 
 function toClient(p: ServerProvider): LLMConfig {
@@ -56,6 +57,7 @@ function toServer(c: LLMConfig): Partial<ServerProvider> {
 
 interface SettingsState {
   activeLlmId: string
+  backgroundLlmId: string
   llmConfigs: LLMConfig[]
   loadingLLM: boolean
   lastError: string | null
@@ -69,6 +71,7 @@ interface SettingsState {
   updateLLMConfig: (id: string, patch: Partial<LLMConfig>) => Promise<void>
   removeLLMConfig: (id: string) => Promise<void>
   setActiveLlmId: (id: string) => Promise<void>
+  setBackgroundLlmId: (id: string) => Promise<void>
 
   // Local-only preferences
   setLanguage: (lang: string) => void
@@ -112,6 +115,7 @@ export const useSettingsStore = create<SettingsState>()(
   persist(
     (set, get) => ({
       activeLlmId: '',
+      backgroundLlmId: '',
       llmConfigs: [],
       loadingLLM: false,
       lastError: null,
@@ -128,6 +132,7 @@ export const useSettingsStore = create<SettingsState>()(
           set({
             llmConfigs: data.providers.map(toClient),
             activeLlmId: data.active_id ?? '',
+            backgroundLlmId: data.background_id ?? '',
             loadingLLM: false,
           })
         } catch (err) {
@@ -210,6 +215,18 @@ export const useSettingsStore = create<SettingsState>()(
       setActiveLlmId: async (id) => {
         try {
           await fetchResult(`/v1/settings/providers/${id}/activate`, {
+            method: 'POST',
+          })
+          await get().loadLLMConfigs()
+        } catch (err) {
+          set({ lastError: String(err) })
+          throw err
+        }
+      },
+
+      setBackgroundLlmId: async (id) => {
+        try {
+          await fetchResult(`/v1/settings/providers/${id}/activate-background`, {
             method: 'POST',
           })
           await get().loadLLMConfigs()

@@ -39,7 +39,10 @@ class PreferenceLearner:
     def get_profile(self) -> UserProfile:
         return self._profile.model_copy()
 
-    async def observe(self, agent_id: str, user_message: str, agent_response: str) -> None:
+    def set_llm_client(self, llm_client: Any) -> None:
+        self.llm_client = llm_client
+
+    async def observe(self, agent_id: str, user_message: str, agent_response: str) -> bool:
         self._buffer.append({
             "agent": agent_id,
             "user": user_message,
@@ -48,9 +51,10 @@ class PreferenceLearner:
         self._profile.interaction_count += 1
 
         if self._profile.interaction_count % _OBSERVE_EVERY_N == 0:
-            await self._extract_preference()
+            return await self._extract_preference()
+        return False
 
-    async def _extract_preference(self) -> None:
+    async def _extract_preference(self) -> bool:
         recent = self._buffer[-_OBSERVE_EVERY_N:]
         exchanges = "\n".join(
             f"[{e['agent']}] User: {e['user']!r} | Agent: {e['agent_response']!r}"
@@ -78,19 +82,20 @@ class PreferenceLearner:
             start = raw.find("{")
             end = raw.rfind("}") + 1
             if start == -1:
-                return
+                return False
             data = json.loads(raw[start:end])
-            await self._persist_extracted_preferences(data, recent)
+            return await self._persist_extracted_preferences(data, recent)
         except Exception as exc:
             logger.warning("jarvis.learner.extract_failed", error=str(exc))
+            return False
 
-    async def _persist_extracted_preferences(self, data: dict[str, Any], recent: list[dict]) -> None:
+    async def _persist_extracted_preferences(self, data: dict[str, Any], recent: list[dict]) -> bool:
         items = data.get("preferences")
         if not isinstance(items, list):
             key = data.get("key")
             value = data.get("value")
             if not key:
-                return
+                return False
             items = [{
                 "key": key,
                 "value": value,
@@ -102,6 +107,7 @@ class PreferenceLearner:
 
         latest_agent = str(recent[-1].get("agent") or "shadow") if recent else "shadow"
         latest_user = str(recent[-1].get("user") or "") if recent else ""
+        saved_any = False
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -133,7 +139,9 @@ class PreferenceLearner:
                     source_agent=latest_agent if latest_agent in JARVIS_AGENTS else "shadow",
                     source_excerpt=evidence,
                 )
+                saved_any = True
             logger.info("jarvis.learner.preference_extracted", key=key, value=value_text)
+        return saved_any
 
 
 def _clamp_float(value: Any, *, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:

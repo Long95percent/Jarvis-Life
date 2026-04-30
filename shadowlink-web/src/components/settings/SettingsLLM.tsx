@@ -23,6 +23,7 @@ export function SettingsLLM() {
   const setLanguage = useSettingsStore((s) => s.setLanguage)
 
   const activeLlmId = useSettingsStore((s) => s.activeLlmId)
+  const backgroundLlmId = useSettingsStore((s) => s.backgroundLlmId)
   const llmConfigs = useSettingsStore((s) => s.llmConfigs)
   const loadingLLM = useSettingsStore((s) => s.loadingLLM)
   const lastError = useSettingsStore((s) => s.lastError)
@@ -31,6 +32,7 @@ export function SettingsLLM() {
   const updateLLMConfig = useSettingsStore((s) => s.updateLLMConfig)
   const removeLLMConfig = useSettingsStore((s) => s.removeLLMConfig)
   const setActiveLlmId = useSettingsStore((s) => s.setActiveLlmId)
+  const setBackgroundLlmId = useSettingsStore((s) => s.setBackgroundLlmId)
 
   // Load providers from backend on mount
   useEffect(() => {
@@ -295,6 +297,35 @@ export function SettingsLLM() {
               </div>
             )
           })}
+        </div>
+      </section>
+
+      <section className="surface-card p-5 space-y-4">
+        <div>
+          <h2 className="text-sm font-medium text-foreground">后台旁路模型</h2>
+          <p className="text-xs text-muted mt-0.5">
+            长期记忆提取和偏好学习使用这里选择的小模型，私聊、圆桌和多 Agent 回复仍使用 ACTIVE 主模型。
+          </p>
+        </div>
+        <label className="block">
+          <span className="text-xs text-muted">Sidecar Provider</span>
+          <select
+            value={backgroundLlmId || activeLlmId}
+            onChange={(e) => setBackgroundLlmId(e.target.value)}
+            className="mt-1.5 w-full px-3 py-2 rounded-lg bg-surface-secondary text-sm text-foreground border border-white/5 focus:border-primary-500/50 outline-none"
+          >
+            {llmConfigs.map((config) => (
+              <option key={config.id} value={config.id}>
+                {config.name} · {config.model}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="text-xs text-muted">
+          当前后台模型：
+          <span className="ml-1 text-foreground">
+            {(llmConfigs.find((item) => item.id === (backgroundLlmId || activeLlmId))?.model) || '未配置'}
+          </span>
         </div>
       </section>
 

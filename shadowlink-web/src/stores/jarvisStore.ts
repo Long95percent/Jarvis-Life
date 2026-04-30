@@ -198,7 +198,7 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     }));
     let response;
     try {
-      response = await jarvisApi.chat(agentId, message, sessionId);
+      response = await jarvisApi.chatStream(agentId, message, sessionId);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Jarvis 对话失败：未知错误";
       set((s) => ({
