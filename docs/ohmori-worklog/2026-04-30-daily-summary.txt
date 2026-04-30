@@ -1,0 +1,867 @@
+====================================================================
+    Jarvis · Be IronMan 项目 —— 2026-04-30 工作日志
+====================================================================
+
+日期：2026-04-30（周四）
+工作目录：/Users/ohmorimotoki/Downloads/Jarvis Life v3
+远端仓库：https://github.com/Long95percent/Jarvis-Life.git
+当前本地分支：main
+当前本地状态：main ahead origin/main 12 commits；本日志写入前，最新提交为：
+              d801042 perf: optimize jarvis private chat latency
+说明：今天没有 push。所有记录基于本地 Git、测试输出和实际代码检查。
+
+--------------------------------------------------------------------
+一、今日一句话总结
+--------------------------------------------------------------------
+
+今天的主线是把 Jarvis 私聊从“单角色被动回复 + 偶尔工具调用”推进到
+“当前私聊角色稳定持有对话主权、可私下咨询其它角色、可做角色本地
+意图识别和槽位抽取、并通过旁路小模型与后台任务降低非 LLM 主链路
+延迟”的版本。
+
+核心结果：
+
+1. 私聊不再因为跨角色咨询而切走当前角色。
+2. 新增私聊内的多角色“传话/咨询”机制，但咨询卡片不再污染聊天 UI。
+3. 新增轻量本地意图识别 + 槽位抽取层，覆盖 Maxwell / Nora / Mira / Leo。
+4. 私聊 Agent 执行工具时，部分高置信任务可少走一次 LLM。
+5. 新增主模型 / 后台旁路模型双模型配置能力。
+6. 长期记忆提取和偏好学习从用户响应主链路剥离，改为后台执行。
+7. 上下文准备由串行读取改为并行读取。
+8. 新增私聊 SSE 入口，前端私聊优先走 /chat/stream。
+9. 补齐相关测试，并记录了非 LLM 环节延迟优化的受控测试数据。
+
+--------------------------------------------------------------------
+二、Git 变更规模与提交清单
+--------------------------------------------------------------------
+
+本日相关本地提交（origin/main..HEAD）：
+
+1. d543be3 docs: design private chat collaboration router
+2. 692a569 docs: plan private chat collaboration router
+3. 569a075 test: specify private chat collaboration routing
+4. 1ac9600 feat: add private chat collaboration router
+5. 151f0fe test: require private chat to keep primary agent
+6. cae210d feat: keep private chat agent during specialist consultation
+7. 549ad6c fix: hide private consultation actions in chat
+8. f84af3e docs: design agent local intent router
+9. 76b31f1 docs: plan agent local intent router
+10. 4719e08 test: specify agent local intent router
+11. c2d259b feat: add agent local intent router
+12. d801042 perf: optimize jarvis private chat latency
+
+整体 diff 规模（origin/main..HEAD）：
+
+1. 21 files changed
+2. 2882 insertions
+3. 113 deletions
+
+主要新增文件：
+
+1. docs/superpowers/specs/2026-04-29-private-chat-collaboration-router-design.md
+2. docs/superpowers/plans/2026-04-29-private-chat-collaboration-router.md
+3. docs/superpowers/specs/2026-04-30-agent-local-intent-router-design.md
+4. docs/superpowers/plans/2026-04-30-agent-local-intent-router.md
+5. shadowlink-ai/app/jarvis/intent_router.py
+6. shadowlink-ai/app/llm/background_client.py
+7. shadowlink-ai/tests/unit/jarvis/test_intent_router.py
+8. shadowlink-ai/tests/unit/jarvis/test_agent_intent_pipeline.py
+9. shadowlink-ai/tests/unit/jarvis/test_background_llm_settings.py
+10. shadowlink-ai/tests/unit/jarvis/test_chat_latency_optimization.py
+
+关键修改文件：
+
+1. shadowlink-ai/app/api/v1/jarvis_router.py
+2. shadowlink-ai/app/api/v1/settings_router.py
+3. shadowlink-ai/app/core/lifespan.py
+4. shadowlink-ai/app/jarvis/agent_consultation.py
+5. shadowlink-ai/app/jarvis/preference_learner.py
+6. shadowlink-web/src/components/settings/SettingsLLM.tsx
+7. shadowlink-web/src/components/jarvis/AgentChatPanel.tsx
+8. shadowlink-web/src/services/jarvisApi.ts
+9. shadowlink-web/src/stores/jarvisStore.ts
+10. shadowlink-web/src/stores/settings-store.ts
+
+按最新几个核心提交的变更量：
+
+1. d801042 latency 优化：
+   - 11 files changed
+   - 550 insertions
+   - 49 deletions
+
+2. c2d259b 本地意图路由实现：
+   - 3 files changed
+   - 589 insertions
+   - 4 deletions
+
+3. 4719e08 本地意图路由测试：
+   - 1 file changed
+   - 113 insertions
+
+4. f84af3e + 76b31f1 spec/plan：
+   - 2 files changed
+   - 532 insertions
+
+5. 私聊协作路由相关提交：
+   - 设计、计划、测试、实现、保持当前角色、隐藏咨询卡片累计约
+     1123 insertions / 62 deletions。
+
+--------------------------------------------------------------------
+三、私聊协作路由：从“切给 Maxwell”改成“当前角色私下咨询”
+--------------------------------------------------------------------
+
+背景问题：
+
+早期私聊里，用户对某个角色提出跨领域问题时，系统容易把对话切向
+Maxwell 或产生“只有 Maxwell 能路由/协调”的体验。这和用户想要的
+真实感不一致：用户希望私聊 Nora、Mira、Leo、Alfred 时，也可以让
+当前角色去“问一下别的角色”，但最终仍由当前角色对用户说话。
+
+产品目标：
+
+1. 私聊当前角色不被动切走。
+2. 当前角色可以私下咨询别的角色。
+3. 支持显式传话：
+   - “你去问问心理师”
+   - “让营养师问心理师，再让心理师问秘书”
+4. 支持自动轻量判断：
+   - 饮食问题可咨询 Nora
+   - 情绪压力可咨询 Mira
+   - 日程安排可咨询 Maxwell
+   - 活动生活方式可咨询 Leo
+5. 不能让协作内部动作污染用户可见聊天卡片。
+
+实现要点：
+
+1. app/jarvis/agent_consultation.py
+   - 增加 ConsultEdge。
+   - 增加 AgentConsultationResult。
+   - 增加 parse_consult_edges。
+   - 增加 plan_consult_edges。
+   - 增加 run_agent_consultations。
+
+2. 协作边规则：
+   - 支持角色别名：
+     Alfred / 管家
+     Maxwell / 秘书 / 日程
+     Nora / 营养师
+     Mira / 心理师
+     Leo / 生活顾问
+   - 限制最多 2 条边，避免私聊里自动爆炸成小圆桌。
+   - 禁止咨询自己。
+   - 禁止咨询 Shadow。
+
+3. jarvis_router.py
+   - chat_with_agent 内调用 run_agent_consultations。
+   - 咨询结果以 “## 私下咨询结果” 注入当前角色 prompt。
+   - response.agent_id 保持 routed_agent_id，也就是当前私聊角色。
+   - routing 不再用于把私聊切换到 Maxwell。
+
+4. 前端 AgentChatPanel
+   - 隐藏 agent.consult action 卡片。
+   - 用户只看到自然回复，不看到内部咨询卡。
+
+行为结果：
+
+1. 私聊 Nora 问“你先去问问心理师我最近心理状态，再决定今天吃什么”
+   - 后端会让 Nora 咨询 Mira。
+   - 最终仍由 Nora 回复。
+   - response.agent_id = nora。
+
+2. 私聊 Mira 问“今晚很累但还要学 2 小时，帮我重新安排一下”
+   - Mira 可以私下咨询 Maxwell。
+   - 最终仍由 Mira 回复，不切到 Maxwell。
+
+3. 私聊 Leo 让他安排散步，Leo 可以咨询 Maxwell 的排程意见，
+   但用户仍留在 Leo 私聊体验里。
+
+测试覆盖：
+
+1. parse_consult_edges 支持角色别名。
+2. parse_consult_edges 支持二跳传话。
+3. plan_consult_edges 可按情绪、饮食、日程、活动关键词推断咨询对象。
+4. 明确请求优先于自动推断。
+5. 不咨询自己、不咨询 Shadow。
+6. 小聊不触发咨询。
+7. chat pipeline 确认咨询上下文注入最终 agent prompt。
+8. 私聊 schedule intent 咨询 Maxwell 时不切换 agent。
+
+--------------------------------------------------------------------
+四、私聊本地意图识别：轻量 Intent + Slot Router
+--------------------------------------------------------------------
+
+讨论背景：
+
+用户指出，意图识别和槽位抽取应该结合使用。主流做法有：
+
+1. Prompt + few-shot + CoT 一次性识别和抽槽。
+2. 意图识别与槽位抽取拆成两步，用小模型先判意图，再用大模型抽槽。
+
+本项目当前阶段选择了更轻量、可控、成本低的方案：
+
+1. 不先引入复杂 intent 模型。
+2. 在私聊主链路前加一层 deterministic local router。
+3. 高置信、常见、工具 schema 明确的任务直接由本地规则识别。
+4. 低置信或未覆盖任务仍交给角色 LLM 正常回答。
+
+新增核心 API：
+
+文件：
+shadowlink-ai/app/jarvis/intent_router.py
+
+核心结构：
+
+AgentIntentDecision:
+
+1. agent_id
+2. intent
+3. tool_name
+4. confidence
+5. slots
+6. missing_slots
+7. next_action
+   - chat_only
+   - ask_missing_slots
+   - call_tool
+   - pending_confirmation
+8. reason
+
+核心函数：
+
+plan_agent_intent(agent_id, message, local_now=None)
+
+覆盖角色与意图：
+
+1. Maxwell
+   - calendar_create -> jarvis_calendar_add
+   - task_decompose -> jarvis_task_plan_decompose
+
+2. Nora
+   - meal_plan -> jarvis_meal_plan
+   - caffeine_guard -> jarvis_caffeine_cutoff_guard
+   - nutrition_lookup -> jarvis_nutrition_lookup
+
+3. Mira
+   - breathing_protocol -> jarvis_breathing_protocol
+   - checkin_schedule -> jarvis_checkin_schedule
+
+4. Leo
+   - local_activities -> jarvis_local_activities
+   - plan_activity_slot -> jarvis_plan_activity_slot
+
+重要保护：
+
+1. 只在当前角色工具白名单内计划工具。
+2. Mira 收到“今晚吃什么比较好？”不会调用 Nora 的 meal_plan。
+3. Nora 的小聊不会误触发工具。
+4. 槽位不足时只让当前角色追问，不假装执行。
+
+例子：
+
+1. Maxwell：
+   “明天下午 3 点提醒我复习英语 1 小时”
+   - intent = calendar_create
+   - tool = jarvis_calendar_add
+   - slots.title = 复习英语
+   - slots.start = 2026-05-01T15:00:00
+   - slots.end = 2026-05-01T16:00:00
+   - next_action = pending_confirmation
+
+2. Nora：
+   “今晚很累，吃什么比较撑得住？”
+   - intent = meal_plan
+   - tool = jarvis_meal_plan
+   - slots.meals = ["dinner"]
+   - slots.goal = stress_recovery
+   - next_action = call_tool
+
+3. Mira：
+   “我焦虑得有点喘不过气”
+   - intent = breathing_protocol
+   - tool = jarvis_breathing_protocol
+   - slots.goal = calm_down
+
+4. Leo：
+   “把散步安排进日程”
+   - intent = plan_activity_slot
+   - missing_slots includes start
+   - next_action = ask_missing_slots
+
+接入方式：
+
+1. chat_with_agent 在 local_now 建好之后调用 plan_agent_intent。
+2. 如果 next_action 是 call_tool / pending_confirmation：
+   - 先 execute_tool_calls。
+   - 把工具结果和抽取槽位注入 final LLM prompt。
+   - 最终 LLM 只负责自然语言表达。
+3. 如果 next_action 是 ask_missing_slots：
+   - 不执行工具。
+   - prompt 要求当前角色自然追问缺失字段。
+4. 如果 chat_only：
+   - 原流程继续。
+
+价值：
+
+1. 高置信工具任务少走一次 LLM。
+2. 工具调度更稳定，不完全依赖模型输出 <jarvis-tool> 标签。
+3. 角色工具边界更明确。
+4. 为后续真正的小模型 intent router 留出接口。
+
+测试覆盖：
+
+1. test_intent_router.py
+   - 12 passed
+   - 覆盖 Maxwell / Nora / Mira / Leo / 白名单 guard / small talk。
+
+2. test_agent_intent_pipeline.py
+   - 覆盖 Nora 工具预执行。
+   - 覆盖 Maxwell 待确认日程 action 保存。
+   - 覆盖小聊不误调工具。
+
+验证结果：
+
+1. intent router + pipeline focused：
+   - 15 passed
+2. nearby backend regression：
+   - 51 passed
+3. frontend build：
+   - passed
+
+--------------------------------------------------------------------
+五、私聊 Agent Loop 状态判断
+--------------------------------------------------------------------
+
+今天检查了私聊执行链路，确认当前项目私聊不是完整 agent loop。
+
+当前结构：
+
+1. chat_with_agent 准备上下文。
+2. 本地意图 router 可预执行高置信工具。
+3. run_agent_turn 执行一次 LLM。
+4. 如果 LLM 输出 <jarvis-tool>：
+   - 执行工具。
+   - 再做一次 LLM 汇总工具结果。
+5. 不会循环到“模型继续决定下一步”。
+
+因此准确描述是：
+
+1. 不是完整 agent loop。
+2. 是“单轮工具规划 + 最多一次工具执行 + 最多一次 follow-up LLM”。
+3. 新增本地意图 router 后，部分任务变成：
+   - 本地识别/抽槽
+   - 工具执行
+   - 一次 LLM 总结
+
+延迟影响：
+
+1. 未命中本地意图时：
+   - 可能需要 2 次 LLM。
+2. 命中本地意图时：
+   - 通常只需要 1 次 LLM。
+3. 如果还有私下咨询：
+   - 每条咨询边额外一次 LLM。
+   - 最多 2 条边。
+
+工程判断：
+
+现阶段不急于上完整 agent loop。完整 loop 会提升灵活性，但也会带来：
+
+1. 延迟更高。
+2. token 成本更高。
+3. 工具重复调用风险更高。
+4. 私聊体验更难控。
+
+当前更合适的路径是：
+
+1. 用轻量本地 router 覆盖高频稳定意图。
+2. 保留单轮工具执行的可控性。
+3. 后续再按工具链复杂度决定是否引入 bounded loop。
+
+--------------------------------------------------------------------
+六、非圆桌私聊延迟优化：主模型 / 旁路模型 / 后台任务
+--------------------------------------------------------------------
+
+问题：
+
+私聊端到端延迟不只来自主 LLM。原链路中还有一些非用户可见但阻塞
+响应的工作：
+
+1. 长期记忆提取。
+2. 偏好学习。
+3. 旧记忆压缩。
+4. Shadow observe。
+5. 上下文准备阶段的多份记忆/画像读取。
+
+其中长期记忆提取本身会调用 LLM：
+
+extract_and_save_chat_memories
+-> extract_memory_candidates_with_llm
+-> llm_client.chat(...)
+
+这意味着用户明明已经拿到了可回复内容，接口仍可能因为后台记忆提取
+继续等待主模型。
+
+目标：
+
+1. 主模型只服务用户可见对话、多 Agent、工具总结。
+2. 长期记忆提取、偏好学习等后台维护任务使用旁路小模型。
+3. 这些后台维护任务不阻塞用户回复。
+4. 完成后如果有实际更新，通过现有 proactive message 机制通知用户。
+
+实现：
+
+1. 新增 app/llm/background_client.py
+   - SidecarLLMClient
+   - build_background_llm_client
+   - get_background_llm_client
+
+2. settings_router.py
+   - llm_providers.json 增加 background_id。
+   - /v1/settings/providers 返回 background_id。
+   - 新增：
+     POST /v1/settings/providers/{provider_id}/activate-background
+   - _apply_background_provider 会刷新 background_llm_client。
+
+3. lifespan.py
+   - 启动时读取 background_id。
+   - 初始化 background_llm_client。
+   - PreferenceLearner 优先使用 background LLM client。
+
+4. preference_learner.py
+   - 增加 set_llm_client。
+   - observe 返回 bool，表示本次是否提取并保存了新偏好。
+   - 方便后台任务决定是否发完成通知。
+
+5. jarvis_router.py
+   - 新增 _run_chat_background_tasks。
+   - memory_job：
+     * remember_user_constraint
+     * remember_tool_actions
+     * extract_and_save_chat_memories(llm_client=get_background_llm_client())
+     * maybe_compact_old_raw_memories
+   - preference_job：
+     * PreferenceLearner.observe
+     * 确保 learner 使用 background LLM client。
+   - 两个 job 用 asyncio.gather 并发执行。
+   - chat_with_agent 中只 create_task，不 await。
+
+6. 完成通知：
+   - 如果记忆提取保存了新记忆，发 proactive message：
+     “长期记忆提取已完成：本轮更新 N 条后台资料。”
+   - 如果偏好学习有实际更新，发 proactive message：
+     “偏好学习已完成：本轮更新 1 条后台资料。”
+   - trigger 分别为：
+     memory_background_complete
+     preference_background_complete
+
+前端设置入口：
+
+1. SettingsLLM 新增“后台旁路模型”区块。
+2. 用户可以从已有 Provider 中选择 Sidecar Provider。
+3. ACTIVE 主模型仍用于私聊、圆桌、多 Agent 回复。
+4. Sidecar Provider 用于长期记忆提取和偏好学习。
+5. settings-store 增加：
+   - backgroundLlmId
+   - setBackgroundLlmId
+6. 调用后端：
+   /v1/settings/providers/{id}/activate-background
+
+--------------------------------------------------------------------
+七、上下文准备并行化
+--------------------------------------------------------------------
+
+原流程：
+
+在 chat_with_agent 内，以下三个上下文源串行 await：
+
+1. build_collaboration_memory_prefix
+2. build_bounded_memory_recall_prefix
+3. build_preference_profile_prefix
+
+问题：
+
+这三个函数大多是数据库读取和文本拼接，互相没有依赖。串行执行会把
+耗时直接相加。
+
+改造：
+
+使用 asyncio.gather 并行执行：
+
+1. collaboration_text
+2. memory_text
+3. preference_text
+
+保留原 prompt 拼接顺序，不改变最终语义。
+
+受控测试数据：
+
+测试文件：
+shadowlink-ai/tests/unit/jarvis/test_chat_latency_optimization.py
+
+测试方式：
+
+1. monkeypatch 三个上下文函数。
+2. 每个函数固定 await asyncio.sleep(0.05)。
+3. 串行理论耗时约 150ms。
+4. 并行理论耗时约 50ms。
+
+实测输出：
+
+1. memory_context = 51.2ms
+2. total_ms = 62.1ms
+
+解释：
+
+这个测试不是线上真实延迟，而是受控结构测试。它证明：
+
+1. 代码结构已从串行等待变成并行等待。
+2. 三个独立上下文源的等待时间不再累加。
+3. 实际线上收益取决于数据库大小、磁盘状态、连接池、系统负载。
+
+--------------------------------------------------------------------
+八、后台任务不阻塞响应：受控延迟测试
+--------------------------------------------------------------------
+
+测试目标：
+
+证明长期记忆提取 / 偏好学习不再阻塞 chat_with_agent 返回。
+
+测试方式：
+
+1. monkeypatch extract_and_save_chat_memories。
+2. 让它固定 await asyncio.sleep(0.08)，模拟 80ms 后台任务。
+3. 在 chat_with_agent 返回时检查后台任务尚未完成。
+4. 再等待后台任务完成，确认它确实在后台继续跑。
+
+实测输出：
+
+1. total_ms = 9.4ms
+2. background_scheduled = 0.0ms
+3. persist_final_turns = 2.7ms
+4. memory_context = 2.8ms
+
+意义：
+
+旧结构中，这 80ms 会出现在用户响应主链路里。
+新结构中，主链路只负责调度 create_task，不等待后台记忆提取完成。
+
+边界说明：
+
+1. 这是受控测试，不代表线上只有 9.4ms。
+2. 真实线上仍会受主 LLM、工具 API、咨询 LLM、数据库和网络影响。
+3. 但它可靠证明：后台任务不再结构性阻塞返回。
+
+--------------------------------------------------------------------
+九、私聊流式接口
+--------------------------------------------------------------------
+
+新增：
+
+POST /api/v1/jarvis/chat/stream
+
+事件：
+
+1. chat_status
+   - 请求已接收。
+   - 包含 agent_id / session_id。
+
+2. chat_result
+   - 完整 AgentChatResponse。
+
+3. chat_done
+   - ok。
+   - elapsed_ms。
+   - response_ready_ms。
+
+4. chat_error
+   - 失败时返回错误信息。
+
+前端：
+
+1. jarvisApi 新增 chatStream。
+2. jarvisStore.sendMessage 优先调用 jarvisApi.chatStream。
+3. 如果 SSE 不可用或没有 body，回退旧 chat。
+
+当前边界：
+
+1. 现在不是 token-by-token 流式。
+2. 当前版本先把私聊接口从普通阻塞响应迁移到 SSE 生命周期响应。
+3. 动态工具链路仍复用原可靠 chat_with_agent。
+4. 后续如要 token 级流式，需要进一步拆分 run_agent_turn：
+   - 本地意图已命中且工具已预执行时，可直接 chat_stream 输出最终回复。
+   - LLM 自己决定工具的场景，仍需要先拿到完整 first_reply 才能解析工具块。
+
+工程判断：
+
+今天先做低风险版本是合理的：
+
+1. 不破坏现有工具执行可靠性。
+2. 前端私聊已经可以统一走 SSE。
+3. 为后续 token streaming 留出接口。
+
+--------------------------------------------------------------------
+十、验证记录
+--------------------------------------------------------------------
+
+1. 本地意图路由单测：
+
+命令：
+.venv311/bin/python -m pytest tests/unit/jarvis/test_intent_router.py -q
+
+结果：
+12 passed
+
+2. 本地意图路由 + pipeline：
+
+命令：
+.venv311/bin/python -m pytest tests/unit/jarvis/test_intent_router.py tests/unit/jarvis/test_agent_intent_pipeline.py -q
+
+结果：
+15 passed
+
+3. 私聊意图 / pipeline / 协作 / 持久化 / 升级 focused regression：
+
+命令：
+.venv311/bin/python -m pytest \
+  tests/unit/jarvis/test_intent_router.py \
+  tests/unit/jarvis/test_agent_intent_pipeline.py \
+  tests/unit/jarvis/test_agent_consultation.py \
+  tests/unit/jarvis/test_persistence.py \
+  tests/unit/jarvis/test_escalation.py -q
+
+结果：
+51 passed
+
+4. latency optimization focused tests：
+
+命令：
+.venv311/bin/python -m pytest \
+  tests/unit/jarvis/test_background_llm_settings.py \
+  tests/unit/jarvis/test_chat_latency_optimization.py -q
+
+结果：
+4 passed
+
+5. 最终后端 focused regression：
+
+命令：
+.venv311/bin/python -m pytest \
+  tests/unit/jarvis/test_background_llm_settings.py \
+  tests/unit/jarvis/test_chat_latency_optimization.py \
+  tests/unit/jarvis/test_preference_learner.py \
+  tests/unit/jarvis/test_intent_router.py \
+  tests/unit/jarvis/test_agent_intent_pipeline.py \
+  tests/unit/jarvis/test_agent_consultation.py \
+  tests/unit/jarvis/test_persistence.py \
+  tests/unit/jarvis/test_escalation.py -q
+
+结果：
+61 passed in 0.93s
+
+备注：
+测试结束时仍出现项目既有 async cleanup warning：
+
+Task was destroyed but it is pending!
+task: <Task pending ... snapshot_context() ...>
+
+该 warning 在此前测试中已出现，不是本次新增失败。
+
+6. 前端构建：
+
+命令：
+npm run build
+
+目录：
+/Users/ohmorimotoki/Downloads/Jarvis Life v3/shadowlink-web
+
+结果：
+passed
+
+构建摘要：
+
+1. 1976 modules transformed
+2. dist/index.html 0.81 kB
+3. dist/assets/index-6DY3KNs5.css 39.32 kB
+4. dist/assets/index-_eKwk6JS.js 198.12 kB
+5. built in 1.16s
+
+--------------------------------------------------------------------
+十一、重要工程判断与设计取舍
+--------------------------------------------------------------------
+
+1. 这次没有把私聊做成完整 agent loop。
+
+原因：
+
+完整 loop 会使延迟、成本、工具重复调用和调试复杂度都上升。
+当前生活管家场景更需要稳定、可预测、低延迟的常用能力。
+
+采用方案：
+
+1. 本地 intent router 覆盖高频确定性任务。
+2. LLM 保留自然语言表达和低置信场景处理。
+3. 工具执行保持最多一轮。
+
+2. 旁路模型不是替代主模型。
+
+主模型用途：
+
+1. 用户可见私聊回复。
+2. 圆桌发言。
+3. 多 Agent 讨论。
+4. 工具结果自然语言总结。
+
+旁路模型用途：
+
+1. 长期记忆提取。
+2. 偏好学习。
+3. 后续可扩展到摘要、标签、轻量分类。
+
+3. 延迟测试是真实执行代码，但不是线上性能 benchmark。
+
+本次测试可靠证明结构变化：
+
+1. 串行 -> 并行。
+2. 主链路 await -> create_task 后台执行。
+3. 主模型调用 -> background_llm_client 调用。
+
+但不宣称线上绝对延迟，因为真实环境还受：
+
+1. 模型服务网络。
+2. Provider 响应时间。
+3. SQLite 数据量。
+4. 工具 API。
+5. 系统负载。
+6. 是否触发私下咨询。
+
+4. 通知策略保持克制。
+
+只有实际保存记忆或偏好时才通知。
+
+原因：
+
+如果每轮都通知“后台分析完成”，会变成噪音。
+本轮只在 count > 0 时发 proactive message。
+
+--------------------------------------------------------------------
+十二、当前风险与后续建议
+--------------------------------------------------------------------
+
+1. /chat/stream 还不是 token 级流式。
+
+建议下一步：
+
+1. 将 run_agent_turn 拆成可复用阶段。
+2. 在本地意图命中且工具已预执行时，用 llm_client.chat_stream 输出最终回复。
+3. 前端 chat history 支持临时流式 agent turn。
+4. 动态工具块场景保留非 token 流，或做两阶段流：
+   - status: thinking
+   - tool_call
+   - tool_result
+   - final token stream
+
+2. Alfred 尚未纳入本地 intent router。
+
+今天的本地 router 覆盖 Maxwell / Nora / Mira / Leo。
+用户常说“私聊管家执行一个任务”，如果这里的“管家”指 Alfred，
+则 Alfred 仍更多依赖 LLM 工具块，可能仍多走一次 LLM。
+
+建议下一步：
+
+1. 为 Alfred 增加 local intent coverage。
+2. 可覆盖：
+   - daily_briefing
+   - specialist_orchestrate
+   - calendar_create
+   - context_update
+3. 注意 Alfred 是总管家，不能把所有意图都抢过来，应以统筹型任务为主。
+
+3. 后台 create_task 缺少统一生命周期管理。
+
+当前实现足够用于私聊后台任务，但后续如果后台任务变多，建议加：
+
+1. background task runner。
+2. 统一错误捕捉。
+3. 并发上限。
+4. 任务可观测指标。
+5. graceful shutdown 等待策略。
+
+4. 旁路模型配置还没有单独 probe。
+
+当前 Provider test 是通用 test_provider。
+建议后续增加：
+
+1. “测试后台模型”按钮。
+2. 返回 sidecar model / base_url / max_tokens / latency。
+3. 设置页显示最近一次后台任务状态。
+
+5. 真实延迟 benchmark 仍需要补。
+
+建议新增开发脚本：
+
+scripts/bench_jarvis_private_chat.py
+
+测量：
+
+1. cold / warm chat。
+2. no-tool small talk。
+3. local intent tool。
+4. LLM tool block。
+5. consult one edge。
+6. consult two edges。
+
+输出：
+
+1. p50 / p95 / max。
+2. timing.spans breakdown。
+3. LLM call count。
+4. tool count。
+5. background task count。
+
+这个 benchmark 才能回答真实项目环境中的端到端延迟。
+
+--------------------------------------------------------------------
+十三、当前系统状态
+--------------------------------------------------------------------
+
+当前私聊主链路能力：
+
+1. 支持当前角色稳定持有对话。
+2. 支持私下咨询其它角色。
+3. 支持角色本地 intent + slot。
+4. 支持角色工具白名单保护。
+5. 支持待确认 action 保存。
+6. 支持后台记忆提取。
+7. 支持后台偏好学习。
+8. 支持主模型 / 旁路模型分离。
+9. 支持私聊 SSE 事件入口。
+10. 支持 timing.spans 返回和日志记录。
+
+当前未完成但方向明确：
+
+1. token 级私聊流式输出。
+2. Alfred 本地 intent router。
+3. 真实 benchmark 脚本。
+4. sidecar provider probe。
+5. 后台任务 runner 化。
+
+--------------------------------------------------------------------
+十四、今日总体评价
+--------------------------------------------------------------------
+
+今天的工作不是单个功能点，而是一次私聊系统的架构收敛：
+
+1. 角色体验上，从“找 Maxwell 解决所有事”变成“当前角色可以传话、
+   咨询和吸收其它角色意见”。
+2. 工具调度上，从“完全依赖 LLM 自己输出工具标签”增加了可测试、
+   可控的本地 intent + slot 层。
+3. 延迟结构上，从“所有维护工作塞在用户响应前”改成“用户可见路径
+   和后台维护路径分离”。
+4. 模型资源上，从“一个主模型包办全部”变成“主模型负责体验，旁路
+   小模型负责维护任务”。
+
+这为后续继续做真实低延迟 Jarvis 私聊打了基础。下一步真正有价值的
+不是继续凭感觉优化，而是补真实 benchmark，把不同私聊场景的
+timing.spans、LLM call count、tool count 和 p50/p95 固化下来。
+
+                                          — 2026-04-30 汇总
