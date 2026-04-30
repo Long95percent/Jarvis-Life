@@ -332,6 +332,35 @@ CREATE TABLE IF NOT EXISTS proactive_routine_runs (
 
 CREATE INDEX IF NOT EXISTS idx_proactive_routine_runs_date ON proactive_routine_runs(run_date, routine_id);
 
+CREATE TABLE IF NOT EXISTS local_life_items (
+    id              TEXT PRIMARY KEY,
+    source_url      TEXT NOT NULL UNIQUE,
+    title           TEXT NOT NULL,
+    item_type       TEXT NOT NULL DEFAULT 'event',
+    category        TEXT NOT NULL DEFAULT 'general',
+    venue           TEXT,
+    address         TEXT,
+    lat             REAL,
+    lng             REAL,
+    distance_m      INTEGER,
+    starts_at       TEXT,
+    ends_at         TEXT,
+    expires_at      TEXT,
+    summary         TEXT NOT NULL DEFAULT '',
+    fit_tags_json   TEXT NOT NULL DEFAULT '[]',
+    confidence      REAL NOT NULL DEFAULT 0.5,
+    date_confidence TEXT NOT NULL DEFAULT 'low',
+    location_label  TEXT NOT NULL DEFAULT '',
+    query           TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'active',
+    last_seen_at    REAL NOT NULL,
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_life_items_expires ON local_life_items(status, expires_at, confidence DESC);
+CREATE INDEX IF NOT EXISTS idx_local_life_items_category ON local_life_items(status, category, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS background_tasks (
     id                    TEXT PRIMARY KEY,
     title                 TEXT NOT NULL,
@@ -588,6 +617,37 @@ def _ensure_initialized() -> None:
                 con.execute(f"ALTER TABLE proactive_messages ADD COLUMN {column_name} {column_def}")
         con.execute("CREATE INDEX IF NOT EXISTS idx_proactive_messages_status ON proactive_messages(status, created_at DESC)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_proactive_messages_agent ON proactive_messages(agent_id, status, created_at DESC)")
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS local_life_items (
+                id              TEXT PRIMARY KEY,
+                source_url      TEXT NOT NULL UNIQUE,
+                title           TEXT NOT NULL,
+                item_type       TEXT NOT NULL DEFAULT 'event',
+                category        TEXT NOT NULL DEFAULT 'general',
+                venue           TEXT,
+                address         TEXT,
+                lat             REAL,
+                lng             REAL,
+                distance_m      INTEGER,
+                starts_at       TEXT,
+                ends_at         TEXT,
+                expires_at      TEXT,
+                summary         TEXT NOT NULL DEFAULT '',
+                fit_tags_json   TEXT NOT NULL DEFAULT '[]',
+                confidence      REAL NOT NULL DEFAULT 0.5,
+                date_confidence TEXT NOT NULL DEFAULT 'low',
+                location_label  TEXT NOT NULL DEFAULT '',
+                query           TEXT NOT NULL DEFAULT '',
+                status          TEXT NOT NULL DEFAULT 'active',
+                last_seen_at    REAL NOT NULL,
+                created_at      REAL NOT NULL,
+                updated_at      REAL NOT NULL
+            )
+            """
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_local_life_items_expires ON local_life_items(status, expires_at, confidence DESC)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_local_life_items_category ON local_life_items(status, category, updated_at DESC)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_care_triggers_type ON jarvis_care_triggers(trigger_type, created_at DESC)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_care_triggers_status ON jarvis_care_triggers(status, created_at DESC)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_care_interventions_status ON jarvis_care_interventions(status, created_at DESC)")
@@ -2772,6 +2832,157 @@ async def list_proactive_messages(
     )
 
 
+# -- Local life cache -----------------------------------------------
+
+
+def _row_to_local_life_item(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    try:
+        tags = json.loads(item.get("fit_tags_json") or "[]")
+        item["fit_tags"] = tags if isinstance(tags, list) else []
+    except Exception:
+        item["fit_tags"] = []
+    item.pop("fit_tags_json", None)
+    return item
+
+
+def _upsert_local_life_items_sync(items: list[dict[str, Any]], now_ts: float | None = None) -> list[dict[str, Any]]:
+    now = now_ts if now_ts is not None else time.time()
+    saved_urls: list[str] = []
+    with _conn() as con:
+        for raw in items:
+            source_url = str(raw.get("source_url") or "").strip()
+            title = str(raw.get("title") or "").strip()
+            if not source_url or not title:
+                continue
+            fit_tags = raw.get("fit_tags") or raw.get("fit_tags_json") or []
+            if not isinstance(fit_tags, list):
+                fit_tags = []
+            item_id = str(raw.get("id") or f"local_life_{uuid4().hex}")
+            con.execute(
+                """
+                INSERT INTO local_life_items
+                  (id, source_url, title, item_type, category, venue, address,
+                   lat, lng, distance_m, starts_at, ends_at, expires_at, summary,
+                   fit_tags_json, confidence, date_confidence, location_label,
+                   query, status, last_seen_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                ON CONFLICT(source_url) DO UPDATE SET
+                  title = excluded.title,
+                  item_type = excluded.item_type,
+                  category = excluded.category,
+                  venue = excluded.venue,
+                  address = excluded.address,
+                  lat = excluded.lat,
+                  lng = excluded.lng,
+                  distance_m = excluded.distance_m,
+                  starts_at = excluded.starts_at,
+                  ends_at = excluded.ends_at,
+                  expires_at = excluded.expires_at,
+                  summary = excluded.summary,
+                  fit_tags_json = excluded.fit_tags_json,
+                  confidence = excluded.confidence,
+                  date_confidence = excluded.date_confidence,
+                  location_label = excluded.location_label,
+                  query = excluded.query,
+                  status = 'active',
+                  last_seen_at = excluded.last_seen_at,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    item_id,
+                    source_url,
+                    title,
+                    str(raw.get("item_type") or "event"),
+                    str(raw.get("category") or "general"),
+                    raw.get("venue"),
+                    raw.get("address"),
+                    raw.get("lat"),
+                    raw.get("lng"),
+                    raw.get("distance_m"),
+                    raw.get("starts_at"),
+                    raw.get("ends_at"),
+                    raw.get("expires_at"),
+                    str(raw.get("summary") or ""),
+                    json.dumps(fit_tags, ensure_ascii=False, default=str),
+                    float(raw.get("confidence") or 0.5),
+                    str(raw.get("date_confidence") or "low"),
+                    str(raw.get("location_label") or ""),
+                    str(raw.get("query") or ""),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            saved_urls.append(source_url)
+        con.commit()
+        if not saved_urls:
+            return []
+        placeholders = ",".join("?" for _ in saved_urls)
+        rows = con.execute(
+            f"SELECT * FROM local_life_items WHERE source_url IN ({placeholders}) ORDER BY confidence DESC, updated_at DESC",
+            tuple(saved_urls),
+        ).fetchall()
+    return [_row_to_local_life_item(row) for row in rows]
+
+
+async def upsert_local_life_items(items: list[dict[str, Any]], now_ts: float | None = None) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_upsert_local_life_items_sync, items, now_ts)
+
+
+def _list_local_life_items_sync(
+    *,
+    min_expires_at: str | None = None,
+    category: str | None = None,
+    query: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    clauses = ["status = 'active'"]
+    params: list[Any] = []
+    if min_expires_at:
+        clauses.append("(expires_at IS NOT NULL AND expires_at >= ?)")
+        params.append(min_expires_at)
+    if category:
+        clauses.append("(category = ? OR fit_tags_json LIKE ?)")
+        params.extend([category, f"%{category}%"])
+    if query:
+        clauses.append("(query = ? OR title LIKE ? OR summary LIKE ?)")
+        like = f"%{query}%"
+        params.extend([query, like, like])
+    params.append(max(1, min(limit, 50)))
+    with _conn() as con:
+        rows = con.execute(
+            f"""
+            SELECT * FROM local_life_items
+            WHERE {' AND '.join(clauses)}
+            ORDER BY
+              CASE date_confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+              confidence DESC,
+              COALESCE(distance_m, 999999) ASC,
+              updated_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+    return [_row_to_local_life_item(row) for row in rows]
+
+
+async def list_local_life_items(
+    *,
+    min_expires_at: str | None = None,
+    category: str | None = None,
+    query: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(
+        _list_local_life_items_sync,
+        min_expires_at=min_expires_at,
+        category=category,
+        query=query,
+        limit=limit,
+    )
+
+
 def _mark_proactive_messages_delivered_sync(message_ids: list[str]) -> int:
     if not message_ids:
         return 0
@@ -4343,4 +4554,3 @@ def _list_agent_events_sync(*, plan_id: str | None = None, event_type: str | Non
 
 async def list_agent_events(*, plan_id: str | None = None, event_type: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     return await asyncio.to_thread(_list_agent_events_sync, plan_id=plan_id, event_type=event_type, limit=limit)
-

@@ -54,6 +54,23 @@ def _default_agent_configs() -> dict[str, AgentConfig]:
     return result
 
 
+def _reconcile_agent_configs(settings: "JarvisSettings") -> "JarvisSettings":
+    defaults = _default_agent_configs()
+    merged = {**defaults, **settings.agents}
+    for agent_id, default_config in defaults.items():
+        existing = merged.get(agent_id)
+        if existing is None:
+            merged[agent_id] = default_config
+            continue
+        merged[agent_id] = AgentConfig(
+            enabled=existing.enabled,
+            interrupt_budget=existing.interrupt_budget,
+        )
+    if merged == settings.agents:
+        return settings
+    return settings.model_copy(update={"agents": merged})
+
+
 class JarvisSettings(BaseModel):
     profile: UserProfile = Field(default_factory=UserProfile)
     agents: dict[str, AgentConfig] = Field(default_factory=_default_agent_configs)
@@ -71,10 +88,12 @@ def _load() -> JarvisSettings:
         try:
             with open(_SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return JarvisSettings.model_validate(data)
+            loaded = _reconcile_agent_configs(JarvisSettings.model_validate(data))
+            _save(loaded)
+            return loaded
         except (json.JSONDecodeError, Exception):
             pass
-    return JarvisSettings()
+    return _reconcile_agent_configs(JarvisSettings())
 
 
 def _save(settings: JarvisSettings) -> None:

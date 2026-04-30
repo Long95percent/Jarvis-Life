@@ -34,6 +34,8 @@ class FakeConsultLLM:
             return '{"summary":"建议温热、低油，搭配一点碳水和蛋白，避免空腹咖啡。","confidence":0.8,"needs_followup":false}'
         if "## Jarvis private agent consultation" in message and "Leo" in system_prompt:
             return '{"summary":"建议低负担散步或短时户外，不要安排高消耗活动。","confidence":0.76,"needs_followup":false}'
+        if "## Jarvis private agent consultation" in message and "Athena" in system_prompt:
+            return '{"summary":"建议先做诊断题定位薄弱项，再用短循环复习和错题复盘推进。","confidence":0.81,"needs_followup":false}'
         if "Mira" in system_prompt:
             return "我问了 Maxwell 和 Nora。今晚先别硬顶，保留一个 45 分钟学习块，再吃一点温热、低油、有碳水和蛋白的晚饭。"
         if "Nora" in system_prompt:
@@ -50,6 +52,15 @@ def test_parse_consult_edges_supports_role_aliases():
     )
 
     assert [(edge.from_agent, edge.to_agent) for edge in edges] == [("nora", "mira")]
+
+
+def test_parse_consult_edges_supports_athena_aliases():
+    edges = parse_consult_edges(
+        source_agent="maxwell",
+        message="你先问问学习策略师，我现在雅思应该怎么复习。",
+    )
+
+    assert [(edge.from_agent, edge.to_agent) for edge in edges] == [("maxwell", "athena")]
 
 
 def test_parse_consult_edges_supports_two_hop_chain():
@@ -98,6 +109,17 @@ def test_plan_consult_edges_routes_schedule_message_to_maxwell_without_handoff()
     ]
 
 
+def test_plan_consult_edges_routes_learning_strategy_message_to_athena():
+    edges = plan_consult_edges(
+        source_agent="mira",
+        message="我今晚很累但还想复习雅思，怎么学才不浪费时间？",
+    )
+
+    assert [(edge.from_agent, edge.to_agent, edge.intent_type) for edge in edges] == [
+        ("mira", "athena", "learning_intent")
+    ]
+
+
 def test_plan_consult_edges_routes_maxwell_emotional_message_to_mira():
     edges = plan_consult_edges(
         source_agent="maxwell",
@@ -116,7 +138,7 @@ def test_plan_consult_edges_limits_mixed_message_to_two_specialists():
     )
 
     assert len(edges) == 2
-    assert {edge.to_agent for edge in edges} <= {"maxwell", "mira", "nora", "leo"}
+    assert {edge.to_agent for edge in edges} <= {"maxwell", "mira", "nora", "leo", "athena"}
     assert all(edge.to_agent != "alfred" for edge in edges)
 
 

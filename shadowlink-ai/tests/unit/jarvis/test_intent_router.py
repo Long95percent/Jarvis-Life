@@ -37,6 +37,25 @@ def test_maxwell_long_term_study_plan_decomposes_task():
     assert decision.slots["user_request"] == "我想一个月内准备完雅思第一轮"
 
 
+def test_athena_learning_strategy_decomposes_study_goal():
+    decision = plan_agent_intent("athena", "我想一个月内准备完雅思第一轮，应该怎么复习？", local_now=NOW)
+
+    assert decision.intent == "learning_plan"
+    assert decision.tool_name == "jarvis_task_plan_decompose"
+    assert decision.next_action == "call_tool"
+    assert decision.slots["source_agent"] == "athena"
+    assert "雅思" in decision.slots["user_request"]
+
+
+def test_athena_deadline_pressure_checks_learning_goal():
+    decision = plan_agent_intent("athena", "下周考试，现在复习还来得及吗？", local_now=NOW)
+
+    assert decision.intent == "learning_deadline_check"
+    assert decision.tool_name == "jarvis_deadline_check"
+    assert decision.next_action == "call_tool"
+    assert decision.slots["source_agent"] == "athena"
+
+
 def test_nora_meal_plan_extracts_dinner_and_recovery_goal():
     decision = plan_agent_intent("nora", "今晚很累，吃什么比较撑得住？", local_now=NOW)
 

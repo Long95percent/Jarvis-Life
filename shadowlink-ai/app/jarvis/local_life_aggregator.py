@@ -23,6 +23,7 @@ logger = structlog.get_logger("jarvis.local_life")
 class LocalLifeSnapshot:
     weather: dict[str, Any] = field(default_factory=dict)
     activities: list[dict[str, Any]] = field(default_factory=list)
+    opportunities: list[dict[str, Any]] = field(default_factory=list)
     news: list[dict[str, Any]] = field(default_factory=list)
     upcoming_events: list[dict[str, Any]] = field(default_factory=list)
     schedule_density: float = 0.0
@@ -122,6 +123,19 @@ async def refresh_local_life(force: bool = False) -> LocalLifeSnapshot:
         snapshot.sources["news"] = "rss"
     except Exception as exc:
         logger.warning("local_life.news_failed", error=str(exc))
+
+    # ── Cached local-life opportunities ─────
+    try:
+        from datetime import datetime
+
+        from app.jarvis.persistence import list_local_life_items
+
+        today_start = datetime.combine(datetime.now().date(), datetime.min.time()).isoformat()
+        snapshot.opportunities = await list_local_life_items(min_expires_at=today_start, limit=10)
+        if snapshot.opportunities:
+            snapshot.sources["opportunities"] = "local_life_cache"
+    except Exception as exc:
+        logger.warning("local_life.opportunities_failed", error=str(exc))
 
     # ── Push back into LifeContextBus so agents can use it ─────
     # We don't (yet) change LifeContext shape; stash into active_events

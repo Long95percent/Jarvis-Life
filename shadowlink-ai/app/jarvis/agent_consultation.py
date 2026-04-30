@@ -20,6 +20,7 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "nora": ("nora", "Nora", "营养师", "营养"),
     "mira": ("mira", "Mira", "心理师", "心理医生", "心理咨询师", "心理"),
     "leo": ("leo", "Leo", "生活顾问", "生活"),
+    "athena": ("athena", "Athena", "学习策略师", "学习教练", "学习导师", "学习", "认知教练"),
 }
 
 _TASK_KEYWORDS = (
@@ -50,8 +51,19 @@ _LIFESTYLE_KEYWORDS = (
     "周末", "出门", "散步", "活动", "放松", "去哪", "去哪玩", "推荐",
     "运动", "恢复", "休息", "社交", "weekend", "relax", "activity",
 )
+_LEARNING_KEYWORDS = (
+    "学习", "复习", "备考", "考试", "雅思", "ielts", "考研", "作业", "论文",
+    "知识点", "课程", "技能", "怎么学", "怎么复习", "刷题", "错题", "记忆",
+    "不浪费时间", "学习效率", "学习策略",
+)
 
 _AUTO_INTENTS: tuple[dict[str, Any], ...] = (
+    {
+        "intent_type": "learning_intent",
+        "target_agent": "athena",
+        "keywords": _LEARNING_KEYWORDS,
+        "reason": "用户表达了学习、备考、复习方法或认知负荷需求，应咨询 Athena。",
+    },
     {
         "intent_type": "task_intent",
         "target_agent": "maxwell",
@@ -245,6 +257,10 @@ def plan_consult_edges(source_agent: str, message: str) -> list[ConsultEdge]:
             continue
         matched = _auto_matches_for_intent(intent_type, text, definition["keywords"])
         if not matched:
+            continue
+        if intent_type == "task_intent" and "athena" in seen_targets:
+            continue
+        if intent_type == "schedule_intent" and "athena" in seen_targets and not _match_keywords(text, _SCHEDULE_ACTION_KEYWORDS):
             continue
         seen_targets.add(target_agent)
         edges.append(

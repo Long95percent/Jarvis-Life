@@ -57,9 +57,16 @@ def plan_agent_intent(
         "nora": _plan_nora,
         "mira": _plan_mira,
         "leo": _plan_leo,
+        "athena": _plan_athena,
     }.get(agent_id)
     if planner is None:
         return _chat_only(agent_id, "no_local_router")
+
+    local_life_decision = _plan_local_life(agent_id, text, now)
+    if local_life_decision is not None:
+        if local_life_decision.tool_name not in set(get_allowed_tool_names(agent_id)):
+            return _chat_only(agent_id, f"tool_not_allowed:{local_life_decision.tool_name}")
+        return local_life_decision
 
     decision = planner(agent_id, text, now)
     if decision.tool_name is None:
@@ -68,6 +75,42 @@ def plan_agent_intent(
     if decision.tool_name not in set(get_allowed_tool_names(agent_id)):
         return _chat_only(agent_id, f"tool_not_allowed:{decision.tool_name}")
     return decision
+
+
+def _plan_local_life(agent_id: str, text: str, now: datetime) -> AgentIntentDecision | None:
+    nearby_markers = ["附近", "周边", "本地", "附近的", "这附近"]
+    discovery_markers = ["活动", "市集", "展览", "去哪", "哪里", "推荐", "找一个", "找个", "有什么", "可以去"]
+    if not (_has_any(text, nearby_markers) and _has_any(text, discovery_markers)):
+        return None
+
+    category = "activity"
+    if agent_id == "nora" or _has_any(text, ["吃", "轻食", "餐", "咖啡", "市集", "健康"]):
+        category = "food"
+    elif agent_id == "mira" or _has_any(text, ["安静", "低刺激", "恢复", "放松", "轻松", "不累"]):
+        category = "recovery"
+    elif agent_id == "maxwell" or _has_any(text, ["安排", "日程", "空档", "这几天"]):
+        category = "activity"
+
+    radius_m = 2000 if _has_any(text, ["走路", "很近", "附近"]) else 3000
+    window_days = 3 if _has_any(text, ["今天", "明天", "这几天"]) else 14
+    if _has_any(text, ["周末", "本周末"]):
+        window_days = 7
+
+    return _decision(
+        agent_id,
+        intent="local_life_search",
+        tool_name="jarvis_local_life_search",
+        confidence=0.82,
+        slots={
+            "query": text,
+            "category": category,
+            "radius_m": radius_m,
+            "window_days": window_days,
+            "limit": 5,
+            "min_date": now.date().isoformat(),
+        },
+        reason="nearby_recent_local_life_request",
+    )
 
 
 def _plan_maxwell(agent_id: str, text: str, now: datetime) -> AgentIntentDecision:
@@ -223,6 +266,49 @@ def _plan_leo(agent_id: str, text: str, now: datetime) -> AgentIntentDecision:
     return _chat_only(agent_id, "no_leo_intent")
 
 
+def _plan_athena(agent_id: str, text: str, now: datetime) -> AgentIntentDecision:
+    learning_markers = [
+        "学习", "复习", "备考", "考试", "雅思", "ielts", "考研", "作业", "论文",
+        "知识点", "课程", "技能", "怎么学", "怎么复习", "刷题", "错题", "记忆",
+    ]
+    strategy_markers = [
+        "计划", "安排", "准备", "第一轮", "方法", "策略", "拆", "路径", "节奏",
+        "来得及", "不浪费时间", "效率", "优先", "重点",
+    ]
+    deadline_markers = ["截止", "deadline", "下周", "明天", "后天", "考试", "来得及", "ddl"]
+
+    if _has_any(text, learning_markers) and _has_any(text, deadline_markers) and _has_any(text, ["来得及", "截止", "deadline", "ddl", "考试"]):
+        due_at = _extract_learning_deadline(text, now)
+        return _decision(
+            agent_id,
+            intent="learning_deadline_check",
+            tool_name="jarvis_deadline_check",
+            confidence=0.77,
+            slots={
+                "source_agent": agent_id,
+                "items": [{
+                    "title": _extract_learning_title(text),
+                    "due_at": due_at.isoformat(),
+                    "estimated_minutes": 180,
+                    "importance": 4,
+                }],
+            },
+            reason="learning_deadline_pressure",
+        )
+
+    if _has_any(text, learning_markers) and _has_any(text, strategy_markers):
+        return _decision(
+            agent_id,
+            intent="learning_plan",
+            tool_name="jarvis_task_plan_decompose",
+            confidence=0.82,
+            slots={"user_request": text, "source_agent": agent_id},
+            reason="learning_strategy_or_study_plan",
+        )
+
+    return _chat_only(agent_id, "no_athena_intent")
+
+
 def _decision(
     agent_id: str,
     *,
@@ -331,6 +417,26 @@ def _extract_duration_minutes(text: str) -> int | None:
     if minute_match:
         return max(1, int(minute_match.group(1)))
     return None
+
+
+def _extract_learning_deadline(text: str, now: datetime) -> datetime:
+    if "明天" in text:
+        return now + timedelta(days=1)
+    if "后天" in text:
+        return now + timedelta(days=2)
+    if "下周" in text:
+        return now + timedelta(days=7)
+    return now + timedelta(days=7)
+
+
+def _extract_learning_title(text: str) -> str:
+    if "雅思" in text or "ielts" in text.lower():
+        return "雅思复习"
+    if "考试" in text:
+        return "考试复习"
+    if "论文" in text:
+        return "论文推进"
+    return "学习任务"
 
 
 def _extract_delay_hours(text: str) -> int:

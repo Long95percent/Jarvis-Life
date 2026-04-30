@@ -77,6 +77,53 @@ def _weekly_content(ctx: LifeContext, active: bool) -> str:
     return "这周快收尾了。我可以帮你做一个很短的周复盘：哪些事推进了、哪些要挪到下周、哪些该直接放掉。"
 
 
+def _should_attach_local_life_hint(rule: RoutineRule, ctx: LifeContext, active: bool) -> bool:
+    if not active:
+        return False
+    if rule.routine_id == "midday_appetite":
+        return ctx.stress_level >= 6.5 or ctx.schedule_density >= 6.5
+    if rule.routine_id == "evening_checkin":
+        return ctx.stress_level >= 8.0 or ctx.sleep_quality <= 4.0 or ctx.mood_trend == "negative"
+    return False
+
+
+async def build_local_life_opportunity_hint(
+    agent_id: str,
+    *,
+    now: datetime | None = None,
+    radius_m: int = 3000,
+    window_days: int = 14,
+) -> str:
+    """Return one cached local-life opportunity for proactive copy.
+
+    This intentionally reads cache only. Proactive routines must stay quick and
+    should not perform live web search.
+    """
+    from app.jarvis.local_life_search import list_cached_local_life_opportunities
+
+    category_by_agent = {
+        "nora": "food",
+        "mira": "recovery",
+        "leo": "activity",
+        "maxwell": "activity",
+        "alfred": None,
+    }
+    items = await list_cached_local_life_opportunities(
+        now=now,
+        category=category_by_agent.get(agent_id),
+        radius_m=radius_m,
+        window_days=window_days,
+        limit=1,
+    )
+    if not items:
+        return ""
+    item = items[0].to_dict()
+    distance = item.get("distance_m")
+    distance_text = f"{distance}m" if distance is not None else "距离不明"
+    venue = item.get("venue") or item.get("address") or "附近"
+    return f" 我这边还看到一个可选的附近机会：{item.get('title')}，{venue}，约 {distance_text}。"
+
+
 class ProactiveRoutineScheduler:
     """Creates lightweight daily rhythm messages without a separate scheduler."""
 
@@ -169,10 +216,16 @@ class ProactiveRoutineScheduler:
 
             priority = self._priority_for(rule, ctx, active)
             agent_def = JARVIS_AGENTS.get(rule.agent_id, {})
+            content = rule.build_content(ctx, active)
+            if _should_attach_local_life_hint(rule, ctx, active):
+                try:
+                    content += await build_local_life_opportunity_hint(rule.agent_id, now=local_now)
+                except Exception as exc:
+                    logger.warning("jarvis.routine.local_life_hint_failed", routine_id=rule.routine_id, error=str(exc))
             msg = ProactiveMessage(
                 agent_id=rule.agent_id,
                 agent_name=agent_def.get("name", rule.agent_id),
-                content=rule.build_content(ctx, active),
+                content=content,
                 trigger=rule.trigger,
                 priority=priority,
             )

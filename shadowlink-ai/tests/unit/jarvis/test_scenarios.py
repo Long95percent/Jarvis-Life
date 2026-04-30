@@ -1,8 +1,8 @@
 from app.jarvis.scenarios import JARVIS_SCENARIOS, get_scenario, list_scenarios
 
 
-def test_five_scenarios_defined():
-    assert len(JARVIS_SCENARIOS) == 5
+def test_six_scenarios_defined():
+    assert len(JARVIS_SCENARIOS) == 6
 
 
 def test_scenario_ids_unique():
@@ -26,6 +26,6 @@ def test_get_scenario_raises_for_unknown():
 
 def test_list_scenarios_returns_dicts():
     items = list_scenarios()
-    assert len(items) == 5
+    assert len(items) == 6
     assert all(isinstance(i, dict) for i in items)
     assert all("id" in i and "name" in i and "agents" in i for i in items)

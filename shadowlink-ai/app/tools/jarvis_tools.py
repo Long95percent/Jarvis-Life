@@ -750,6 +750,60 @@ class JarvisActivitiesTool(ShadowLinkTool):
         ]
 
 
+class JarvisLocalLifeSearchInput(BaseModel):
+    query: str = Field(description="User-facing local-life search query")
+    category: str | None = Field(default=None, description="Optional category such as food, recovery, activity, market")
+    radius_m: int = Field(default=3000, ge=200, le=20000, description="Maximum distance from configured user location")
+    window_days: int = Field(default=14, ge=1, le=60, description="Future search window in days")
+    limit: int = Field(default=5, ge=1, le=10, description="Maximum local-life items to return")
+    min_date: str | None = Field(default=None, description="Earliest valid date in YYYY-MM-DD; defaults to today")
+
+
+class JarvisLocalLifeSearchTool(ShadowLinkTool):
+    name: str = "jarvis_local_life_search"
+    description: str = (
+        "Find nearby, recent local activities or local-life opportunities. "
+        "Results are filtered to items whose deadline/end date is today or later and are cached for roundtable/proactive use."
+    )
+    args_schema: type[BaseModel] = JarvisLocalLifeSearchInput
+    category: ToolCategory = ToolCategory.SEARCH
+
+    def _run(
+        self,
+        query: str,
+        category: str | None = None,
+        radius_m: int = 3000,
+        window_days: int = 14,
+        limit: int = 5,
+        min_date: str | None = None,
+    ) -> list[dict]:
+        raise NotImplementedError("Use async version")
+
+    async def _arun(
+        self,
+        query: str,
+        category: str | None = None,
+        radius_m: int = 3000,
+        window_days: int = 14,
+        limit: int = 5,
+        min_date: str | None = None,
+    ) -> list[dict]:
+        from app.jarvis.local_life_search import LocalLifeSearchQuery, LocalLifeSearchService
+
+        service = LocalLifeSearchService()
+        items = await service.search(
+            LocalLifeSearchQuery(
+                query=query,
+                category=category,
+                radius_m=radius_m,
+                window_days=window_days,
+                limit=limit,
+                min_date=min_date,
+            )
+        )
+        return [item.to_dict() if hasattr(item, "to_dict") else dict(item) for item in items]
+
+
 class JarvisNewsDigestInput(BaseModel):
     limit: int = Field(default=5, ge=1, le=10, description="Maximum headlines to return")
 
@@ -2368,4 +2422,3 @@ class JarvisSpecialistOrchestrateTool(ShadowLinkTool):
             "conflicts": synthesis.get("conflicts", []),
             "followups": synthesis.get("followups", []),
         }
-

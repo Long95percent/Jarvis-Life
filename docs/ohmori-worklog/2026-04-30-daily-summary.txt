@@ -821,7 +821,616 @@ scripts/bench_jarvis_private_chat.py
 这个 benchmark 才能回答真实项目环境中的端到端延迟。
 
 --------------------------------------------------------------------
-十三、当前系统状态
+十三、本地生活场景适配：Local Life Search
+--------------------------------------------------------------------
+
+背景：
+
+用户提出一个新的方向：不是在圆桌里单独做“本地生活场景”，而是为
+Jarvis 的任何场景提供一套可复用的附近活动 / 本地信息能力。
+
+核心要求：
+
+1. 不要只做普通 web_search。
+2. 能过滤周边、本地、时间最近的信息。
+3. 截止日期必须是今天及以后。
+4. 私聊、圆桌、主动提醒等场景都可以按需使用。
+5. 结构上要优雅，尽量融入现有 Jarvis 架构。
+6. 不能为了少改文件而偷懒；该新增服务、工具、缓存时就新增。
+
+最终采用方案：
+
+A + 轻量 C。
+
+也就是：
+
+1. 新增统一服务 LocalLifeSearchService。
+2. 新增统一工具 jarvis_local_life_search。
+3. 新增本地缓存表 local_life_items。
+4. 私聊、圆桌、主动提醒都读同一套能力。
+5. 角色使用方式保持差异化。
+
+架构取舍：
+
+没有把逻辑塞进 jarvis_tools.py。
+工具层只负责参数转发和结果返回。
+搜索、归一化、日期过滤、半径过滤、去重、排序、缓存协调都放进
+app/jarvis/local_life_search.py。
+
+这样做的原因：
+
+1. jarvis_tools.py 已经很大，继续塞业务逻辑会恶化边界。
+2. 本地生活不是 Leo 专属能力，而是多个场景共享能力。
+3. 圆桌和主动提醒不能每次实时搜索，否则会拖慢主链路。
+4. 服务层可单测，工具层只测集成边界。
+
+新增文件：
+
+1. shadowlink-ai/app/jarvis/local_life_search.py
+2. shadowlink-ai/tests/unit/jarvis/test_local_life_search.py
+3. docs/superpowers/specs/2026-04-30-local-life-search-design.md
+4. docs/superpowers/plans/2026-04-30-local-life-search.md
+
+修改文件：
+
+1. shadowlink-ai/app/jarvis/persistence.py
+   - 新增 local_life_items 表。
+   - 新增 upsert_local_life_items。
+   - 新增 list_local_life_items。
+   - source_url 唯一，重复抓取走 upsert。
+   - fit_tags 用 JSON 存储。
+
+2. shadowlink-ai/app/jarvis/local_life_search.py
+   - 新增 LocalLifeSearchQuery。
+   - 新增 LocalLifeSearchItem。
+   - 新增 LocalLifeSearchService。
+   - 支持缓存优先。
+   - 支持 DuckDuckGo fallback。
+   - 支持日期抽取、半径过滤、去重、排序。
+
+3. shadowlink-ai/app/tools/jarvis_tools.py
+   - 新增 JarvisLocalLifeSearchInput。
+   - 新增 JarvisLocalLifeSearchTool。
+   - 工具名：jarvis_local_life_search。
+   - 工具返回结构化 list[dict]，不暴露内部标签。
+
+4. shadowlink-ai/app/core/lifespan.py
+   - 将 JarvisLocalLifeSearchTool 注册到 ToolRegistry。
+
+5. shadowlink-ai/app/jarvis/agents.py
+   - 将 jarvis_local_life_search 加入 Alfred / Maxwell / Nora / Mira / Leo
+     的工具白名单。
+   - 这表示本地生活信息不是某个角色私有，而是全局生活信息能力。
+
+6. shadowlink-ai/app/jarvis/intent_router.py
+   - 新增本地生活 intent。
+   - 覆盖附近、周边、本地、活动、市集、展览、去哪、推荐等表达。
+   - Nora 默认偏 food。
+   - Mira 默认偏 recovery。
+   - Leo 默认偏 activity。
+   - Maxwell 偏可安排进日程的 activity。
+   - “这几天”会走 window_days=3。
+   - “周末”会走 window_days=7。
+
+7. shadowlink-ai/app/api/v1/jarvis_router.py
+   - 私聊上下文新增 cached local life prefix。
+   - 圆桌 start / continue 新增 cached local life prefix。
+   - decision context 新增 local_life_context。
+   - /jarvis/local-life 返回 opportunities。
+   - 注意：圆桌只读缓存，不触发实时 web search。
+
+8. shadowlink-ai/app/jarvis/local_life_aggregator.py
+   - LocalLifeSnapshot 新增 opportunities。
+   - refresh_local_life 读取 local_life_items 缓存。
+   - sources 增加 local_life_cache。
+
+9. shadowlink-ai/app/jarvis/proactive_routines.py
+   - 新增 build_local_life_opportunity_hint。
+   - 主动提醒只读缓存，不触发实时搜索。
+   - Nora 偏 food，Mira 偏 recovery，Leo / Maxwell 偏 activity。
+
+10. shadowlink-ai/tests/integration/test_jarvis_api.py
+    - 修正私聊 integration 测试 fixture。
+    - 默认 mock run_agent_consultations，避免内部咨询抢占主 agent LLM 调用。
+    - 默认 mock detect_mood_snapshot_enhanced，避免 Mira 情绪识别抢占主
+      agent LLM 调用。
+    - 将硬编码 2026-04-24 的测试日期改为未来相对日期。
+    - Mira mood journal 工具测试改写 tmp_path，避免污染真实 data 文件。
+
+数据模型：
+
+local_life_items 字段：
+
+1. id
+2. source_url
+3. title
+4. item_type
+5. category
+6. venue
+7. address
+8. lat / lng
+9. distance_m
+10. starts_at
+11. ends_at
+12. expires_at
+13. summary
+14. fit_tags_json
+15. confidence
+16. date_confidence
+17. location_label
+18. query
+19. status
+20. last_seen_at
+21. created_at / updated_at
+
+关键行为：
+
+1. 私聊：
+   - 用户问“附近有什么活动”、“这几天去哪”、“附近有没有安静展览”
+     等高信号请求时，本地 intent router 会先调用
+     jarvis_local_life_search。
+   - 当前角色保持主回复身份，不切到 Leo 或 Maxwell。
+
+2. 圆桌：
+   - start / continue 阶段只读取缓存中的近期机会。
+   - 不在圆桌准备上下文时实时 web search。
+   - 这是为了避免圆桌启动延迟不可控。
+
+3. 主动提醒：
+   - build_local_life_opportunity_hint 只读缓存。
+   - 如果有匹配机会，就把一个简短本地机会附加到 proactive 内容里。
+   - 搜索失败或无缓存不会阻塞 proactive message。
+
+4. /jarvis/local-life：
+   - 原有入口继续保留 weather / activities / news / upcoming_events。
+   - 新增 opportunities，来自 local_life_items 缓存。
+
+Review 验收发现的问题与二次修复：
+
+使用 review 模式验收后，先后确认了三个需要补强的逻辑问题。
+这些问题都集中在一个核心点：本地生活结果一旦进入缓存，后续所有
+读取路径仍然必须尊重当前请求的半径、时间窗口和使用场景，不能因为
+“缓存已经存在”就绕过业务约束。
+
+问题 1：搜索失败 fallback 路径可能返回未按当前请求过滤的缓存结果。
+
+原始风险：
+
+1. 用户先用较大半径搜索，缓存了较远的活动。
+2. 后续用户用较小半径搜索同类活动。
+3. 如果实时 web search 失败，旧 fallback 可能直接返回缓存路径中的结果。
+4. 结果可能把不符合 radius_m 的活动暴露给用户。
+
+修复方式：
+
+1. LocalLifeSearchService.search 内部不再把缓存行直接作为返回值。
+2. 缓存行先转换为 LocalLifeSearchItem。
+3. cached items 统一进入 _dedupe_and_rank。
+4. web search 失败时只返回已经过滤后的 cached_items[:limit]。
+
+新增回归测试：
+
+1. test_local_life_service_filters_cached_fallback_when_web_search_fails
+   - 先写入一个 8000m 外、仍在有效期内的缓存活动。
+   - 注入会抛错的 web_search。
+   - 使用 radius_m=2000 搜索。
+   - 期望返回空，证明 fallback 不会绕过半径过滤。
+
+问题 2：上下文和 proactive 缓存读取只过滤“今天以后”，没有统一应用
+radius_m 和 window_days。
+
+原始风险：
+
+1. 私聊或圆桌只想使用未来 14 天、3km 内的机会。
+2. 缓存里可能已有 20 天后或 9km 外的活动。
+3. 旧的上下文注入路径直接读 list_local_life_items。
+4. 结果可能把超窗口、超半径的活动放进 prompt，被角色误用。
+
+修复方式：
+
+1. 新增 list_cached_local_life_opportunities。
+2. 该 helper 内部复用 LocalLifeSearchQuery 与 _dedupe_and_rank。
+3. jarvis_router._build_local_life_context_prefix 改为调用该 helper。
+4. proactive_routines.build_local_life_opportunity_hint 也改为调用该 helper。
+5. cached context 和 proactive hint 现在都支持：
+   - radius_m
+   - window_days
+   - category
+   - limit
+
+新增回归测试：
+
+1. test_context_prefix_filters_cached_local_life_by_window_and_radius
+   - 缓存近期近距离活动、远距离活动、超窗口活动。
+   - 构建 roundtable/private context prefix。
+   - 期望只注入近期近距离活动。
+
+2. test_proactive_hint_filters_cached_local_life_by_window_and_radius
+   - 缓存 Nora 可用的 food 类机会。
+   - 同时写入远距离和超窗口干扰项。
+   - 期望 proactive hint 只选择符合窗口和半径的机会。
+
+问题 3：主动提醒曾经无条件拼接本地生活机会。
+
+原始风险：
+
+1. 早晨 brief、周复盘或低压力状态下也可能附带活动推荐。
+2. 这会让 proactive message 变得像广告插入，而不是上下文相关的关怀。
+3. 场景越多，用户越容易觉得 Jarvis 在“硬塞附近活动”。
+
+修复方式：
+
+1. 新增 _should_attach_local_life_hint(rule, ctx, active)。
+2. 只有用户近期活跃时才考虑附加本地机会。
+3. midday_appetite 仅在 stress_level 或 schedule_density >= 6.5 时附加。
+4. evening_checkin 仅在 stress_level >= 8、sleep_quality <= 4 或
+   mood_trend == negative 时附加。
+5. morning_brief 和 weekly_review 默认不附加本地生活机会。
+
+新增回归测试：
+
+1. test_proactive_routine_only_adds_local_life_hint_for_matching_context
+   - 先用低压力午间场景验证不附加 hint。
+   - 再用高压力午间场景验证会附加 hint。
+   - 证明本地生活机会只在上下文真正相关时进入主动提醒。
+
+关键实现点：
+
+1. _dedupe_and_rank 现在同时检查：
+   - source_url/title 是否有效。
+   - expires_at 是否存在。
+   - min_day <= expires_at.date() <= max_day。
+   - distance_m <= query.radius_m。
+
+2. _normalize_web_result 也提前应用 max_day：
+   - 实时抓取结果如果超出 window_days，直接丢弃。
+   - 这样缓存和实时结果的时间窗口语义一致。
+
+3. max_day 计算方式：
+   - max_day = min_day + timedelta(days=max(1, query.window_days))
+   - 防止 window_days=0 或异常小值导致窗口失效。
+
+4. 圆桌和私聊上下文只读缓存：
+   - 不触发实时 web search。
+   - 不增加端到端感知延迟。
+   - 但读取时仍使用同一套过滤逻辑。
+
+测试记录：
+
+1. 本地生活聚焦测试：
+   - 命令：
+     cd shadowlink-ai
+     .venv311/bin/python -m pytest tests/unit/jarvis/test_local_life_search.py -q
+   - 结果：
+     13 passed in 0.27s
+
+2. Jarvis 相关聚合回归：
+   - 命令：
+     cd shadowlink-ai
+     .venv311/bin/python -m pytest \
+       tests/unit/jarvis/test_background_llm_settings.py \
+       tests/unit/jarvis/test_chat_latency_optimization.py \
+       tests/unit/jarvis/test_preference_learner.py \
+       tests/unit/jarvis/test_intent_router.py \
+       tests/unit/jarvis/test_agent_intent_pipeline.py \
+       tests/unit/jarvis/test_agent_consultation.py \
+       tests/unit/jarvis/test_persistence.py \
+       tests/unit/jarvis/test_escalation.py \
+       tests/unit/jarvis/test_local_life_search.py \
+       tests/integration/test_jarvis_api.py -q
+   - 结果：
+     92 passed in 1.90s
+
+3. 编译检查：
+   - 命令：
+     .venv311/bin/python -m compileall -q \
+       app/jarvis/local_life_search.py \
+       app/jarvis/proactive_routines.py \
+       app/api/v1/jarvis_router.py \
+       tests/unit/jarvis/test_local_life_search.py
+   - 结果：
+     通过，无输出。
+
+4. diff 检查：
+   - 命令：
+     git diff --check
+   - 结果：
+     通过，无输出。
+
+已知测试噪声：
+
+仍可见既有警告：
+
+Task was destroyed but it is pending!
+coro=<snapshot_context() running at app/jarvis/persistence.py:939>
+
+这不是本地生活适配引入的失败。
+测试结果为 passed，但后续建议单独处理 LifeContextBus 异步 snapshot
+生命周期，避免测试和服务关闭时留下 pending task。
+
+本阶段结论：
+
+本地生活能力已经从“Leo 附近 POI 工具”提升为“Jarvis 全局生活信息
+雷达”：
+
+1. 有独立服务边界。
+2. 有统一工具入口。
+3. 有本地缓存。
+4. 有私聊 intent 支持。
+5. 有圆桌上下文支持。
+6. 有主动提醒支持。
+7. 有 API 聚合入口支持。
+8. 有 review 后补强的半径和时间窗口约束。
+
+这套实现没有把本地生活做成圆桌专属功能，也没有强行复用旧
+jarvis_local_activities 导致语义混乱。旧工具仍可作为 POI 查询能力存在；
+新工具负责“近期、本地、可安排、可被多角色复用”的生活机会。
+
+--------------------------------------------------------------------
+十四、Athena 角色补全：从前端头像到统一角色入口
+--------------------------------------------------------------------
+
+背景：
+
+在讨论圆桌会议继续升级前，先补齐 Athena 的角色设定和系统接入。
+目标不是只让前端显示一个新角色，而是让 Athena 和 Alfred / Maxwell /
+Mira / Nora / Leo 一样走统一角色入口：
+
+1. 有角色元数据。
+2. 有 persona 和职责边界。
+3. 有私聊路由能力。
+4. 有咨询别的角色的能力。
+5. 有工具白名单。
+6. 有用户设置 reconciliation。
+7. 前端圆桌和角色展示能识别该角色。
+
+关键修改：
+
+1. shadowlink-ai/app/jarvis/agents.py
+   - 新增 Athena 角色定义。
+   - Athena 定位为学习策略、认知负荷、复盘和知识工作节奏相关角色。
+   - 补齐 role prompt、description、capabilities、工具白名单。
+   - 让 Athena 进入 JARVIS_AGENTS 统一注册表，而不是做特殊分支。
+
+2. shadowlink-ai/app/jarvis/agent_consultation.py
+   - 增加 Athena 可被其它角色咨询的路由描述。
+   - 增加别名和触发语义，例如学习、复盘、认知负荷、考试、知识整理。
+   - 保持“当前角色私聊身份不切换，只私下咨询别的角色”的既有体验。
+
+3. shadowlink-ai/app/jarvis/intent_router.py
+   - 对 Athena 的学习 / 能量 / 本地生活等 intent 做统一接入。
+   - 不给 Athena 写独立的私聊调度入口，避免和其它角色分叉。
+
+4. shadowlink-ai/app/jarvis/user_settings.py
+   - reconciliation 时补齐 Athena 默认设置。
+   - 同时修正一个 review 风险：interrupt_budget=0 是用户显式选择，
+     不能用 falsy 判断重写成默认值。
+   - 这使“允许主动打扰”和“完全静默”都能被真实表达。
+
+5. shadowlink-web/src/components/jarvis/agentMeta.ts
+   - 增加 Athena 前端元数据。
+   - 圆桌角色展示、私聊头像和角色名称都通过统一 meta 读取。
+
+验收关注点：
+
+1. Athena 不是 hard-coded 到某个场景里的临时 participant。
+2. Athena 可以被现有角色咨询，也可以作为当前私聊角色发起咨询。
+3. 既有角色的 Maxwell 路由没有被保留成特殊孤岛；新增角色沿用同一套
+   consultation / intent / tools 接入方式。
+4. 用户如果显式把某角色 interrupt_budget 配为 0，系统不会在加载时
+   悄悄恢复默认主动打扰预算。
+
+--------------------------------------------------------------------
+十五、预设圆桌 LangGraph 深度编排迁移
+--------------------------------------------------------------------
+
+背景：
+
+用户希望圆桌会议不只是“几个 Agent 各说一段”，而是按预设场景做
+更有质量的多轮讨论。前端已有固定的圆桌入口，用户会选择某一种预设
+场景进入讨论，因此改造方向不是自由生成会议流程，而是在每个预设
+场景下建立清晰的会议协议。
+
+设计目标：
+
+1. 用户自己可以作为会议成员提出需求。
+2. 每一轮都先让角色依次发言。
+3. 前端在每个角色发言时流式显示气泡。
+4. 一轮结束后显示纪要、共识、分歧和待确认问题。
+5. 用户可以选择继续讨论，也可以直接收敛。
+6. 不同预设场景保留不同参与者、目标和产物类型。
+7. 后端事件协议统一，前端只按 event type 渲染，不为每个场景堆分支。
+
+新增共享模块：
+
+1. shadowlink-ai/app/jarvis/roundtable_graph.py
+   - 定义 RoundtableGraphState。
+   - 定义 RoundtableTurn。
+   - 定义 RoundtableSummary。
+   - 定义 RoleDirective。
+   - 统一 round_started / role_started / role_delta / role_completed /
+     round_summary / user_checkpoint / final_result 事件语义。
+
+新增场景图：
+
+1. shadowlink-ai/app/jarvis/schedule_coord_graph.py
+   - 场景：今日日程协调。
+   - 类型：decision。
+   - 角色：Maxwell / Nora / Mira / Alfred。
+   - 目标：把日程、精力、餐食、风险和取舍收敛成可执行安排。
+
+2. shadowlink-ai/app/jarvis/local_lifestyle_graph.py
+   - 场景：本地生活方式建议。
+   - 类型：brainstorm。
+   - 角色：Leo / Maxwell / Nora / Alfred。
+   - 目标：把本地活动、路线、餐饮和时间窗口组合成生活方案。
+
+3. shadowlink-ai/app/jarvis/emotional_care_graph.py
+   - 场景：情绪照护。
+   - 类型：brainstorm。
+   - 角色：Mira / Nora / Leo / Alfred。
+   - 目标：先稳定状态，再给出低刺激、可恢复、不过度打扰的建议。
+
+4. shadowlink-ai/app/jarvis/study_energy_decision_graph.py
+   - 场景：学习精力决策。
+   - 类型：decision。
+   - 角色：Mira / Maxwell / Athena / Alfred。
+   - 目标：在学习任务、认知负荷、休息窗口和日程约束之间做取舍。
+
+5. shadowlink-ai/app/jarvis/weekend_recharge_graph.py
+   - 场景：周末恢复。
+   - 类型：brainstorm。
+   - 角色：Leo / Nora / Mira / Alfred。
+   - 目标：生成恢复型周末方案，避免把周末排成另一个工作日。
+
+6. shadowlink-ai/app/jarvis/work_brainstorm_graph.py
+   - 场景：工作头脑风暴。
+   - 类型：brainstorm。
+   - 角色：Moderator / Explorer / Critic / Synthesizer。
+   - 目标：保留原有 brainstorm 专用角色语义，让发散、质疑、收敛
+     都有明确职责。
+
+后端接入：
+
+1. shadowlink-ai/app/api/v1/jarvis_router.py
+   - start_roundtable 对 graph-backed 场景走新图执行器。
+   - continue / finalize 走同一套 graph context builder。
+   - 保留 legacy path，避免一次性切掉所有旧逻辑。
+   - 图执行器输出 SSE 事件，前端可边收边显示角色发言。
+   - decision 场景落 decision_result。
+   - brainstorm 场景落 brainstorm_result。
+
+2. enabled agent 过滤：
+   - start_roundtable 先根据用户设置过滤可用角色。
+   - graph executor 不再硬编码完整角色列表。
+   - 这样用户禁用某个角色后，graph 圆桌不会再偷偷调用它。
+
+3. prior discussion 保留：
+   - continue / finalize 时通过 _build_graph_round_context 带上
+     session.format_for_prompt(max_chars=6000)。
+   - previous_discussion 包含上一轮 agent 发言、用户反馈和 round summary。
+   - 这避免“继续讨论”或“直接收敛”忘掉刚刚讨论过的内容。
+
+前端接入：
+
+1. shadowlink-web/src/components/jarvis/RoundtableStage.tsx
+   - 处理 round_started。
+   - 处理 role_started。
+   - 处理 role_delta，实时拼接当前角色气泡内容。
+   - 处理 role_completed，角色气泡完成后沉淀为 transcript。
+   - 处理 round_summary，显示本轮纪要、共识、分歧和问题。
+   - 处理 user_checkpoint，显示“继续讨论 / 直接收敛”控制。
+   - 处理 decision_result / brainstorm_result 后清理 checkpoint 状态。
+
+Review 验收发现的问题与修复：
+
+1. 问题：continue / finalize 丢失上一轮 agent 讨论。
+   - 风险：用户点继续或直接收敛后，图只能看到用户反馈，看不到刚刚
+     各角色说了什么。
+   - 修复：统一 _build_graph_round_context，加入 previous_discussion。
+   - 覆盖：decision graph 和 brainstorm graph 两条路径。
+
+2. 问题：graph executor 不尊重 disabled agents。
+   - 风险：用户禁用了 Nora / Mira 等角色，legacy path 已过滤，但 graph
+     场景仍使用硬编码 participant 列表。
+   - 修复：所有场景 execute_round / continue_round / finalize 都接受
+     participants 参数，并在 state 中传播。
+
+3. 问题：brainstorm_result 后前端 checkpoint 未清理。
+   - 风险：结果已经生成，底部仍显示“继续讨论 / 直接收敛”。
+   - 修复：brainstorm_result handler 和 decision_result 一样调用
+     setWaitingForCheckpoint(false)。
+
+新增测试：
+
+1. shadowlink-ai/tests/unit/jarvis/test_schedule_coord_graph.py
+2. shadowlink-ai/tests/unit/jarvis/test_local_lifestyle_graph.py
+3. shadowlink-ai/tests/unit/jarvis/test_emotional_care_graph.py
+4. shadowlink-ai/tests/unit/jarvis/test_study_energy_decision_graph.py
+5. shadowlink-ai/tests/unit/jarvis/test_weekend_recharge_graph.py
+6. shadowlink-ai/tests/unit/jarvis/test_work_brainstorm_graph.py
+
+这些测试覆盖：
+
+1. 场景能启动并产出 round_summary。
+2. decision 场景能 finalize 为 final_result。
+3. brainstorm 场景能 finalize 为 brainstorm_result。
+4. continue 时会带入用户反馈。
+5. participants 参数会被尊重。
+6. previous_discussion 会进入上下文。
+
+--------------------------------------------------------------------
+十六、最终验证记录与提交前状态
+--------------------------------------------------------------------
+
+本轮最终验证使用真实命令执行，不记录模拟数字。
+
+已执行验证：
+
+1. Graph 场景聚焦测试：
+   - 命令：
+     cd shadowlink-ai
+     .venv311/bin/python -m pytest \
+       tests/unit/jarvis/test_schedule_coord_graph.py \
+       tests/unit/jarvis/test_local_lifestyle_graph.py \
+       tests/unit/jarvis/test_emotional_care_graph.py \
+       tests/unit/jarvis/test_study_energy_decision_graph.py \
+       tests/unit/jarvis/test_weekend_recharge_graph.py \
+       tests/unit/jarvis/test_work_brainstorm_graph.py -q
+   - 结果：
+     23 passed
+
+2. Jarvis unit 聚合测试：
+   - 命令：
+     cd shadowlink-ai
+     .venv311/bin/python -m pytest tests/unit/jarvis -q
+   - 结果：
+     209 passed
+
+3. Jarvis API integration：
+   - 命令：
+     cd shadowlink-ai
+     .venv311/bin/python -m pytest tests/integration/test_jarvis_api.py -q
+   - 结果：
+     18 passed
+
+4. 前端 build：
+   - 命令：
+     cd shadowlink-web
+     npm run build
+   - 结果：
+     build passed
+
+5. Python 编译检查：
+   - 命令：
+     cd shadowlink-ai
+     .venv311/bin/python -m compileall -q app tests
+   - 结果：
+     通过，无输出。
+
+6. diff 空白检查：
+   - 命令：
+     git diff --check
+   - 结果：
+     通过，无输出。
+
+提交注意事项：
+
+1. shadowlink-ai/data/test_dbs/settings-*.json 是测试运行产生的临时设置文件。
+2. 这些文件不属于功能代码，不应进入提交。
+3. 本次提交应包含源代码、测试、计划文档和本工作日志。
+
+当前剩余风险：
+
+1. LifeContextBus snapshot_context 仍有既有 pending task 警告。
+   测试为 passed，但建议后续单独治理异步生命周期。
+2. 私聊 token 级流式输出仍未完成；目前完成的是圆桌角色发言流式事件
+   和私聊 SSE 结构基础。
+3. 本地生活实时 web search 依赖外部搜索质量，生产环境后续需要真实
+   地理编码和页面抓取质量评估。
+
+--------------------------------------------------------------------
+十七、当前系统状态
 --------------------------------------------------------------------
 
 当前私聊主链路能力：
@@ -836,6 +1445,10 @@ scripts/bench_jarvis_private_chat.py
 8. 支持主模型 / 旁路模型分离。
 9. 支持私聊 SSE 事件入口。
 10. 支持 timing.spans 返回和日志记录。
+11. 支持本地生活机会搜索、缓存和跨场景读取。
+12. 支持 Athena 作为统一角色参与私聊、咨询和圆桌。
+13. 支持六个前端预设圆桌场景走 LangGraph 多轮会议协议。
+14. 支持圆桌角色发言流式显示、轮次摘要和用户 checkpoint。
 
 当前未完成但方向明确：
 
@@ -844,9 +1457,11 @@ scripts/bench_jarvis_private_chat.py
 3. 真实 benchmark 脚本。
 4. sidecar provider probe。
 5. 后台任务 runner 化。
+6. LifeContextBus snapshot_context 异步任务生命周期治理。
+7. 圆桌 LangGraph 协议后续可以继续做更强的冲突仲裁和证据引用。
 
 --------------------------------------------------------------------
-十四、今日总体评价
+十八、今日总体评价
 --------------------------------------------------------------------
 
 今天的工作不是单个功能点，而是一次私聊系统的架构收敛：
@@ -859,6 +1474,12 @@ scripts/bench_jarvis_private_chat.py
    和后台维护路径分离”。
 4. 模型资源上，从“一个主模型包办全部”变成“主模型负责体验，旁路
    小模型负责维护任务”。
+5. 本地生活上，从“附近 POI 查询”扩展成“可缓存、可过滤、可跨角色
+   使用的本地生活机会雷达”。
+6. 圆桌上，从“角色轮流回复”升级为“按预设场景执行的图编排会议”，
+   每轮有流式发言、纪要、共识、分歧、问题和用户 checkpoint。
+7. 角色体系上，Athena 已经补齐为一等角色，不再只是某个场景里的
+   临时名字。
 
 这为后续继续做真实低延迟 Jarvis 私聊打了基础。下一步真正有价值的
 不是继续凭感觉优化，而是补真实 benchmark，把不同私聊场景的

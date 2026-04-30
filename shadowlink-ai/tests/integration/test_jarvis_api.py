@@ -1,11 +1,14 @@
 from unittest.mock import AsyncMock
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app.api.v1 import jarvis_router
 from app.jarvis import persistence
+from app.jarvis.agent_consultation import AgentConsultationResult
 from app.jarvis.models import ProactiveMessage
 from app.jarvis.persistence import (
     clear_collaboration_memories,
@@ -42,7 +45,7 @@ from app.tools.jarvis_tools import (
 
 
 @pytest.fixture
-async def client():
+async def client(monkeypatch):
     app = create_app()
 
     # Override LLM client so the /chat endpoint does not require network or API keys
@@ -54,13 +57,22 @@ async def client():
 
     app.dependency_overrides[get_llm_client] = override_get_llm_client
 
+    async def no_consultations(**kwargs):
+        return AgentConsultationResult([], "", [])
+
+    async def no_mood_snapshot(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(jarvis_router, "run_agent_consultations", no_consultations)
+    monkeypatch.setattr("app.jarvis.mood_care.detect_mood_snapshot_enhanced", no_mood_snapshot)
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
 
 
 @pytest.fixture
-async def client_with_mock_llm():
+async def client_with_mock_llm(monkeypatch):
     app = create_app()
 
     mock_llm = AsyncMock()
@@ -70,6 +82,15 @@ async def client_with_mock_llm():
         return mock_llm
 
     app.dependency_overrides[get_llm_client] = override_get_llm_client
+
+    async def no_consultations(**kwargs):
+        return AgentConsultationResult([], "", [])
+
+    async def no_mood_snapshot(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(jarvis_router, "run_agent_consultations", no_consultations)
+    monkeypatch.setattr("app.jarvis.mood_care.detect_mood_snapshot_enhanced", no_mood_snapshot)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
@@ -147,8 +168,10 @@ async def test_chat_with_agent_uses_registry_for_mutating_tools(client_with_mock
     registry.register(read_tool.to_tool_info(), read_tool)
     registry.register(write_tool.to_tool_info(), write_tool)
     set_resource("tool_registry", registry)
+    walk_start = (datetime.utcnow() + timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
+    walk_end = walk_start + timedelta(minutes=30)
     mock_llm.chat = AsyncMock(side_effect=[
-        '<jarvis-tool>{"tool_name":"jarvis_calendar_add","arguments":{"title":"晚间散步","start":"2026-04-24T19:00:00","end":"2026-04-24T19:30:00","stress_weight":0.5}}</jarvis-tool>',
+        f'<jarvis-tool>{{"tool_name":"jarvis_calendar_add","arguments":{{"title":"晚间散步","start":"{walk_start.isoformat()}","end":"{walk_end.isoformat()}","stress_weight":0.5}}}}</jarvis-tool>',
         "已经帮你把晚间散步加入日程，时间是今晚 19:00 到 19:30。",
     ])
 
@@ -235,6 +258,12 @@ async def test_maxwell_prompt_exposes_schedule_management_tools(client_with_mock
 
 @pytest.mark.asyncio
 async def test_maxwell_tools_support_user_visible_workflows():
+    base = (datetime.utcnow() + timedelta(days=1)).replace(hour=15, minute=0, second=0, microsecond=0)
+    meeting_start = base
+    meeting_end = base + timedelta(hours=1)
+    deadline_at = base.replace(hour=18)
+    window_start = base.replace(hour=14)
+    window_end = base.replace(hour=18)
     registry_tools = {
         "meeting": JarvisMeetingBriefTool(),
         "prioritize": JarvisTaskPrioritizeTool(),
@@ -245,8 +274,8 @@ async def test_maxwell_tools_support_user_visible_workflows():
 
     add_result = await registry_tools["calendar_add"]._arun(
         title="项目例会",
-        start="2026-04-24T15:00:00",
-        end="2026-04-24T16:00:00",
+        start=meeting_start.isoformat(),
+        end=meeting_end.isoformat(),
         stress_weight=1.0,
     )
     assert add_result["ok"] is True
@@ -264,7 +293,7 @@ async def test_maxwell_tools_support_user_visible_workflows():
     prioritized = await registry_tools["prioritize"]._arun(tasks=[
         {
             "title": "提交周报",
-            "deadline": "2026-04-24T18:00:00",
+            "deadline": deadline_at.isoformat(),
             "importance": 4,
             "estimated_minutes": 30,
             "energy_level": "low",
@@ -285,7 +314,7 @@ async def test_maxwell_tools_support_user_visible_workflows():
     deadline_check = await registry_tools["deadline"]._arun(items=[
         {
             "title": "提交周报",
-            "due_at": "2026-04-24T18:00:00",
+            "due_at": deadline_at.isoformat(),
             "estimated_minutes": 30,
             "importance": 4,
         },
@@ -295,8 +324,8 @@ async def test_maxwell_tools_support_user_visible_workflows():
 
     free_slot = await registry_tools["free_slot"]._arun(
         duration_minutes=30,
-        window_start="2026-04-24T14:00:00",
-        window_end="2026-04-24T18:00:00",
+        window_start=window_start.isoformat(),
+        window_end=window_end.isoformat(),
         preferred_period="afternoon",
         buffer_minutes=10,
     )
@@ -398,7 +427,8 @@ async def test_mira_prompt_exposes_support_tools_only_to_mira(client_with_mock_l
 
 
 @pytest.mark.asyncio
-async def test_mira_tools_support_user_visible_workflows():
+async def test_mira_tools_support_user_visible_workflows(monkeypatch, tmp_path):
+    monkeypatch.setattr("app.tools.jarvis_tools.app_settings.data_dir", str(tmp_path))
     breathing_tool = JarvisBreathingProtocolTool()
     burnout_tool = JarvisBurnoutRiskAssessTool()
     journal_tool = JarvisMoodJournalTool()

@@ -8,6 +8,7 @@ export const JARVIS_AGENTS: Record<
   nora:        { icon: "🥗", color: "#10B981", name: "Nora",    role: "营养师" },
   mira:        { icon: "🌸", color: "#F59E0B", name: "Mira",    role: "心理师" },
   leo:         { icon: "🌟", color: "#EF4444", name: "Leo",     role: "生活顾问" },
+  athena:      { icon: "🦉", color: "#8B5CF6", name: "Athena",  role: "学习策略师" },
 
   // Brainstorm scenario roster
   moderator:   { icon: "🎙️", color: "#8B5CF6", name: "Moderator",   role: "主持人" },

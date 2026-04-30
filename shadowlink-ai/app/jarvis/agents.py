@@ -40,6 +40,7 @@ JARVIS_AGENTS: dict[str, dict] = {
             "jarvis_context_snapshot",
             "jarvis_calendar_upcoming",
             "jarvis_weather_snapshot",
+            "jarvis_local_life_search",
             "jarvis_news_digest",
             "jarvis_calendar_add",
             "jarvis_calendar_delete",
@@ -88,6 +89,7 @@ JARVIS_AGENTS: dict[str, dict] = {
             "jarvis_task_prioritize",
             "jarvis_deadline_check",
             "jarvis_calendar_find_free_slot",
+            "jarvis_local_life_search",
         ],
         "proactive_triggers": ["upcoming_meeting_30min", "deadline_approaching", "schedule_overload"],
         "interrupt_budget": 5,
@@ -114,6 +116,7 @@ JARVIS_AGENTS: dict[str, dict] = {
             "current_time",
             "jarvis_context_snapshot",
             "jarvis_weather_snapshot",
+            "jarvis_local_life_search",
             "jarvis_context_update",
             "jarvis_meal_plan",
             "jarvis_nutrition_lookup",
@@ -145,6 +148,7 @@ JARVIS_AGENTS: dict[str, dict] = {
             "current_time",
             "jarvis_context_snapshot",
             "jarvis_calendar_upcoming",
+            "jarvis_local_life_search",
             "jarvis_context_update",
             "jarvis_checkin_schedule",
             "jarvis_breathing_protocol",
@@ -178,6 +182,7 @@ JARVIS_AGENTS: dict[str, dict] = {
             "jarvis_calendar_upcoming",
             "jarvis_weather_snapshot",
             "jarvis_local_activities",
+            "jarvis_local_life_search",
             "jarvis_news_digest",
             "jarvis_activity_rank_by_energy",
             "jarvis_route_estimate",
@@ -187,6 +192,40 @@ JARVIS_AGENTS: dict[str, dict] = {
             "jarvis_calendar_update",
         ],
         "proactive_triggers": ["free_window_detected", "weekend_approaching", "weather_good"],
+        "interrupt_budget": 2,
+    },
+    "athena": {
+        "name": "Athena",
+        "role": "学习策略师",
+        "color": "#8B5CF6",
+        "icon": "🦉",
+        "system_prompt": (
+            "You are Athena, the user's learning strategist and cognitive performance coach. "
+            "Your vibe is a calm tactical academy mentor: precise, clear, intellectually sharp, and quietly encouraging. "
+            "You help the user study, prepare for exams, learn skills, structure knowledge, choose study methods, manage cognitive load, "
+            "and turn vague learning goals into clear practice loops. "
+            "You are not a schoolteacher scolding the user, and you are not a secretary scheduling the day. "
+            "Your job is to decide what to learn first, what to ignore for now, how to practice, how to review, and how to measure progress. "
+            "When the user is tired, protect cognitive load: reduce scope, choose the highest-yield learning action, and avoid fake productivity. "
+            "When the user has a long-term learning goal, use the jarvis_task_plan_decompose tool to turn it into an editable study plan. "
+            "When a deadline, exam date, or delivery pressure is central, use jarvis_deadline_check to surface feasibility and risk before advising. "
+            "Coordinate with Maxwell for scheduling and calendar execution, Mira for emotional overload and burnout boundaries, "
+            "Nora for energy and recovery through food, and Alfred for final orchestration. "
+            "Speak in the user's language. Be concise, concrete, and humane. "
+            "A strong Athena reply feels like a composed anime strategist opening the map, circling the critical path, "
+            "and saying: learn this first, practice it this way, and stop before the effort turns wasteful. "
+            "Domain: learning strategy, exam preparation, study planning, knowledge decomposition, practice design, cognitive load, and progress review."
+        ),
+        "tool_whitelist": [
+            "current_time",
+            "jarvis_context_snapshot",
+            "jarvis_calendar_upcoming",
+            "jarvis_task_plan_decompose",
+            "jarvis_task_prioritize",
+            "jarvis_deadline_check",
+            "jarvis_local_life_search",
+        ],
+        "proactive_triggers": ["deadline_approaching", "schedule_overload"],
         "interrupt_budget": 2,
     },
     "shadow": {

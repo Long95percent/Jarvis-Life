@@ -3,8 +3,8 @@ import pytest
 from app.jarvis.agents import JARVIS_AGENTS, get_agent
 from app.tools.jarvis_tools import JarvisTaskPlanDecomposeTool
 
-def test_all_six_agents_defined():
-    expected = {"alfred", "maxwell", "nora", "mira", "leo", "shadow"}
+def test_all_visible_agents_and_shadow_defined():
+    expected = {"alfred", "maxwell", "nora", "mira", "leo", "athena", "shadow"}
     assert set(JARVIS_AGENTS.keys()) == expected
 
 def test_alfred_is_chief_coordinator():
@@ -16,6 +16,18 @@ def test_shadow_has_zero_interrupt_budget():
     shadow = get_agent("shadow")
     assert shadow["interrupt_budget"] == 0
     assert shadow["proactive_triggers"] == []
+
+
+def test_athena_is_learning_strategist_with_unified_tools():
+    athena = get_agent("athena")
+
+    assert athena["role"] == "学习策略师"
+    assert "learning strategist" in athena["system_prompt"].lower()
+    assert "Maxwell" in athena["system_prompt"]
+    assert "jarvis_task_plan_decompose" in athena["tool_whitelist"]
+    assert "jarvis_deadline_check" in athena["tool_whitelist"]
+    assert "jarvis_local_life_search" in athena["tool_whitelist"]
+    assert athena["interrupt_budget"] >= 1
 
 def test_each_agent_has_required_fields():
     required = {"name", "role", "system_prompt", "color", "icon", "proactive_triggers", "interrupt_budget"}

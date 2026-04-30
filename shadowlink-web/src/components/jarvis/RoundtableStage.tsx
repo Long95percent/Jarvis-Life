@@ -47,6 +47,31 @@ interface TokenPayload {
   progress?: RoundtableProgress;
 }
 
+interface RoundStartedPayload {
+  round_index: number;
+  participants?: string[];
+}
+
+interface RoleDeltaPayload {
+  agent_id: string;
+  delta: string;
+  round_index: number;
+}
+
+interface RoleCompletedPayload extends SpeakPayload {
+  content: string;
+  round_index: number;
+}
+
+interface RoundSummaryPayload {
+  round_index: number;
+  minutes: Array<{ agent_id?: string; agent_name?: string; summary?: string }>;
+  consensus: string[];
+  disagreements: string[];
+  questions_for_user: string[];
+  next_round_focus: string[];
+}
+
 interface RoundtableProgress {
   current?: number;
   total?: number;
@@ -91,6 +116,15 @@ const SCENARIO_META: Record<string, { icon: string; name: string; subtitle: stri
   work_brainstorm: { icon: "💡", name: "工作难题头脑风暴", subtitle: "Work Brainstorm" },
   study_energy_decision: { icon: "⚖️", name: "疲惫学习决策", subtitle: "Decision Roundtable" },
 };
+
+const GRAPH_ROUNDTABLE_SCENARIOS = new Set([
+  "schedule_coord",
+  "local_lifestyle",
+  "emotional_care",
+  "study_energy_decision",
+  "weekend_recharge",
+  "work_brainstorm",
+]);
 
 function parseSSEFrames(buffer: string): {
   frames: Array<{ event: string; data: string }>;
@@ -209,6 +243,8 @@ export const RoundtableStage: React.FC<Props> = ({
   const [degradedMessages, setDegradedMessages] = useState<Array<{ agentId: string; agentName: string; message: string }>>([]);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [showTranscript, setShowTranscript] = useState(false);
+  const [roundSummaries, setRoundSummaries] = useState<RoundSummaryPayload[]>([]);
+  const [waitingForCheckpoint, setWaitingForCheckpoint] = useState(false);
 
   const [userDraft, setUserDraft] = useState<string>("");
   const [userBubble, setUserBubble] = useState<string | null>(null);
@@ -369,6 +405,82 @@ export const RoundtableStage: React.FC<Props> = ({
       return;
     }
 
+    if (event === "round_started") {
+      const payload = data as RoundStartedPayload;
+      setRoundCount(payload.round_index);
+      setWaitingForCheckpoint(false);
+      setCurrentContent("");
+      setActiveAgentId(null);
+      setProgress({
+        current: 0,
+        total: payload.participants?.length ?? participants.length,
+        status: "speaking",
+      });
+      return;
+    }
+
+    if (event === "role_started") {
+      const payload = data as SpeakPayload;
+      setActiveAgentId(payload.agent_id);
+      setCurrentContent("");
+      setUserBubble(null);
+      setProgress((prev) => ({
+        current: prev?.current ?? 0,
+        total: prev?.total ?? participants.length,
+        status: "speaking",
+      }));
+      return;
+    }
+
+    if (event === "role_delta") {
+      const payload = data as RoleDeltaPayload;
+      setActiveAgentId(payload.agent_id);
+      setCurrentContent((prev) => prev + payload.delta);
+      return;
+    }
+
+    if (event === "role_completed") {
+      const payload = data as RoleCompletedPayload;
+      const meta = JARVIS_AGENTS[payload.agent_id];
+      const normalizedContent = normalizeAgentReply(payload.content, payload.agent_name);
+      setTranscript((prev) => [
+        ...prev,
+        {
+          key: `msg-${prev.length}`,
+          kind: "agent",
+          agentId: payload.agent_id,
+          agentName: payload.agent_name,
+          agentColor: payload.agent_color ?? meta?.color ?? "#6366F1",
+          agentIcon: payload.agent_icon ?? meta?.icon ?? "🤖",
+          content: normalizedContent,
+        },
+      ]);
+      setProgress((prev) => ({
+        current: Math.min((prev?.current ?? 0) + 1, prev?.total ?? participants.length),
+        total: prev?.total ?? participants.length,
+        status: "completed",
+      }));
+      window.setTimeout(() => {
+        setActiveAgentId((current) => current === payload.agent_id ? null : current);
+        setCurrentContent("");
+      }, 450);
+      return;
+    }
+
+    if (event === "round_summary") {
+      setRoundSummaries((prev) => [...prev, data as RoundSummaryPayload]);
+      setPhase("等待你的判断");
+      return;
+    }
+
+    if (event === "user_checkpoint") {
+      setWaitingForCheckpoint(true);
+      setStatus("idle");
+      setPhase("等待你的判断");
+      setProgress(null);
+      return;
+    }
+
     if (event === "agent_speak") {
       const payload = data as SpeakPayload;
       const normalizedContent = payload.content
@@ -443,11 +555,13 @@ export const RoundtableStage: React.FC<Props> = ({
 
     if (event === "decision_result") {
       setDecisionResult(data as DecisionResult);
+      setWaitingForCheckpoint(false);
       return;
     }
 
     if (event === "brainstorm_result") {
       setBrainstormResult(data as BrainstormResult);
+      setWaitingForCheckpoint(false);
       return;
     }
   };
@@ -556,6 +670,7 @@ export const RoundtableStage: React.FC<Props> = ({
       ? `主持总结：已沉淀 ${brainstormResult.ideas.length} 个想法，可保存灵感或转给 Maxwell。`
       : `${modeTone.label} 圆桌进行中：${modeTone.hint}`;
   const decisionContextItems = contextExplanationItems(decisionResult);
+  const latestRoundSummary = roundSummaries[roundSummaries.length - 1];
 
   return (
     <AnimatePresence>
@@ -654,6 +769,56 @@ export const RoundtableStage: React.FC<Props> = ({
         {returnNotice && (
           <div className="absolute left-1/2 top-24 z-30 max-w-md -translate-x-1/2 rounded-xl border border-white/15 bg-white/10 px-4 py-2 text-xs text-white/85 backdrop-blur-md">
             {returnNotice}
+          </div>
+        )}
+
+        {latestRoundSummary && !showTranscript && !decisionResult && !brainstormResult && (
+          <div className="absolute right-8 top-24 z-30 w-[390px] rounded-2xl border border-white/15 bg-slate-950/90 p-4 text-white shadow-2xl backdrop-blur-xl">
+            <div className="mb-3 flex items-center justify-between">
+              <div>
+                <p className="text-xs uppercase tracking-[0.2em] text-white/45">Round Summary</p>
+                <h3 className="text-base font-semibold">第 {latestRoundSummary.round_index} 轮纪要</h3>
+              </div>
+              {waitingForCheckpoint && (
+                <span className="rounded-full bg-amber-300/15 px-2 py-1 text-[11px] text-amber-100">等你判断</span>
+              )}
+            </div>
+            <div className="space-y-3 text-xs">
+              {latestRoundSummary.minutes.length > 0 && (
+                <section>
+                  <div className="mb-1 font-semibold text-white/80">角色纪要</div>
+                  <ul className="space-y-1 text-white/65">
+                    {latestRoundSummary.minutes.slice(0, 4).map((item, idx) => (
+                      <li key={`${item.agent_id ?? idx}-${idx}`}>• {item.agent_name ?? item.agent_id ?? "成员"}：{item.summary ?? "暂无摘要"}</li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+              {latestRoundSummary.consensus.length > 0 && (
+                <section>
+                  <div className="mb-1 font-semibold text-emerald-100">共识</div>
+                  <ul className="space-y-1 text-emerald-50/75">
+                    {latestRoundSummary.consensus.slice(0, 3).map((item, idx) => <li key={idx}>• {item}</li>)}
+                  </ul>
+                </section>
+              )}
+              {latestRoundSummary.disagreements.length > 0 && (
+                <section>
+                  <div className="mb-1 font-semibold text-amber-100">分歧</div>
+                  <ul className="space-y-1 text-amber-50/75">
+                    {latestRoundSummary.disagreements.slice(0, 3).map((item, idx) => <li key={idx}>• {item}</li>)}
+                  </ul>
+                </section>
+              )}
+              {latestRoundSummary.questions_for_user.length > 0 && (
+                <section>
+                  <div className="mb-1 font-semibold text-sky-100">需要你判断</div>
+                  <ul className="space-y-1 text-sky-50/75">
+                    {latestRoundSummary.questions_for_user.slice(0, 3).map((item, idx) => <li key={idx}>• {item}</li>)}
+                  </ul>
+                </section>
+              )}
+            </div>
           </div>
         )}
 
@@ -1051,6 +1216,23 @@ export const RoundtableStage: React.FC<Props> = ({
             paddingBottom: "20px",
           }}
         >
+          {waitingForCheckpoint && GRAPH_ROUNDTABLE_SCENARIOS.has(scenarioId) && (
+            <div className="mx-auto mb-3 flex max-w-3xl items-center gap-2 text-xs">
+              <button
+                onClick={() => setUserDraft("继续讨论：")}
+                className="rounded-lg border border-white/10 bg-white/10 px-3 py-2 text-white/75 hover:bg-white/15"
+              >
+                继续讨论
+              </button>
+              <button
+                onClick={() => setUserDraft("直接收敛")}
+                className="rounded-lg bg-emerald-300 px-3 py-2 font-medium text-slate-950"
+              >
+                直接收敛
+              </button>
+              <span className="text-white/40">也可以直接输入你的补充意见。</span>
+            </div>
+          )}
           <div className="max-w-3xl mx-auto flex items-center gap-3">
             <div className="w-10 h-10 rounded-full flex items-center justify-center text-xl flex-shrink-0" style={{ backgroundColor: USER_COLOR + "30", border: `2px solid ${USER_COLOR}` }}>
               {USER_ICON}

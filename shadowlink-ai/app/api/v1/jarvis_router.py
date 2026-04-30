@@ -912,6 +912,9 @@ async def chat_with_agent(
             f"用户位置标签: {profile_location}\n"
             "制定今天/明天/几点到几点的计划时，必须参考这个当前时间；不要安排已经过去的时间段。\n\n"
         )
+        local_life_started = time.perf_counter()
+        local_life_context = await _build_local_life_context_prefix(now=local_now, limit=5)
+        mark_span("local_life_context", local_life_started, chars=len(local_life_context))
     except Exception as exc:
         detail = _chat_error_detail("prepare_context", exc, agent_id=req.agent_id)
         logger.error("jarvis.api.chat_prepare_failed", **detail)
@@ -977,6 +980,7 @@ async def chat_with_agent(
         f"{intent_context}"
         f"{mood_context}"
         f"{consult_result.prompt_prefix}"
+        f"{local_life_context}"
         f"{preference_text}"
         f"{memory_text}"
         f"{collaboration_text}"
@@ -1200,6 +1204,7 @@ async def get_local_life(force: bool = False) -> dict[str, Any]:
     return {
         "weather": snapshot.weather,
         "activities": snapshot.activities,
+        "opportunities": snapshot.opportunities,
         "news": snapshot.news,
         "upcoming_events": snapshot.upcoming_events,
         "schedule_density": snapshot.schedule_density,
@@ -1407,7 +1412,7 @@ async def team_collaborate(
     from app.jarvis.collaboration_memory import remember_coordination_summary
     from app.tools.jarvis_tools import _parse_json_object
 
-    allowed = [agent_id for agent_id in (req.agents or ["maxwell", "nora", "mira", "leo"]) if agent_id in JARVIS_AGENTS and agent_id != "shadow"]
+    allowed = [agent_id for agent_id in (req.agents or ["maxwell", "nora", "mira", "leo", "athena"]) if agent_id in JARVIS_AGENTS and agent_id != "shadow"]
     selected = allowed[:5]
     if not selected:
         raise HTTPException(status_code=400, detail="No valid collaboration agents selected")
@@ -2332,6 +2337,7 @@ async def _prepare_decision_context() -> dict[str, Any]:
     task_days = await list_background_task_days(plan_date=today.isoformat(), limit=20)
     workbench_items = await list_maxwell_workbench_items(status="pending", plan_date=today.isoformat(), limit=20)
     events = [event.model_dump() for event in get_events_between(start, end)]
+    local_life_prefix = await _build_local_life_context_prefix(now=datetime.combine(today, datetime.min.time()), limit=5)
     return {
         "date": today.isoformat(),
         "psychological_snapshot": snapshots[0] if snapshots else None,
@@ -2339,6 +2345,7 @@ async def _prepare_decision_context() -> dict[str, Any]:
         "today_tasks": task_days,
         "calendar_events": events,
         "maxwell_workbench_items": workbench_items,
+        "local_life_context": local_life_prefix,
         "rag_summary": "MVP: 使用当前心理快照、压力信号、今日任务和日程事件作为决策上下文。",
     }
 
@@ -2354,7 +2361,46 @@ def _build_decision_context_prefix(context: dict[str, Any]) -> str:
         f"energy={snapshot.get('energy_score', 'n/a')}, flags={snapshot.get('risk_flags', [])}\n"
         f"- 日程压力信号: {len(stress)} 条；今日任务: {len(tasks)} 条；日程事件: {len(events)} 条\n"
         f"- RAG 摘要: {context.get('rag_summary')}\n\n"
+        f"{context.get('local_life_context') or ''}"
     )
+
+
+async def _build_local_life_context_prefix(
+    *,
+    now: datetime | None = None,
+    limit: int = 5,
+    category: str | None = None,
+    radius_m: int = 3000,
+    window_days: int = 14,
+) -> str:
+    from app.jarvis.local_life_search import list_cached_local_life_opportunities
+
+    items = await list_cached_local_life_opportunities(
+        now=now,
+        category=category,
+        radius_m=radius_m,
+        window_days=window_days,
+        limit=limit,
+    )
+    if not items:
+        return ""
+
+    lines = [
+        "## 近期本地生活机会",
+        "以下是缓存中的附近近期活动/本地信息，只在与用户目标相关时使用；不要声称已经实时搜索。",
+    ]
+    for item in items[:limit]:
+        data = item.to_dict()
+        distance = data.get("distance_m")
+        distance_text = f"{distance}m" if distance is not None else "距离未知"
+        when = data.get("starts_at") or data.get("expires_at") or "时间待确认"
+        tags = ", ".join(data.get("fit_tags") or [])
+        venue = data.get("venue") or data.get("address") or "地点待确认"
+        lines.append(
+            f"- {data.get('title')}｜{venue}｜{distance_text}｜{when}｜"
+            f"tags={tags or data.get('category', 'general')}｜source={data.get('source_url')}"
+        )
+    return "\n".join(lines) + "\n\n"
 
 
 def _build_decision_result(session_id: str, scenario_id: str, user_input: str, transcript: str, context: dict[str, Any]) -> dict[str, Any]:
@@ -2438,6 +2484,7 @@ async def start_roundtable(
         f"日程密度{ctx.schedule_density:.1f}/10, "
         f"心情{ctx.mood_trend}]\n\n"
     )
+    context_prefix += await _build_local_life_context_prefix(limit=5)
     if decision_context is not None:
         context_prefix += _build_decision_context_prefix(decision_context)
     user_ask = req.user_input or "(用户未具体说明,请根据当前状态主动展开)"
@@ -2445,7 +2492,7 @@ async def start_roundtable(
         f"{profile_prefix}{context_prefix}{scenario.opening_prompt}\n\n用户诉求: {user_ask}"
     )
 
-    # ── Work Brainstorm: delegate to BrainstormExecutor ─────────────
+    # ── Work Brainstorm: LangGraph workshop with human checkpoints ──
     if scenario.agent_roster == "brainstorm":
         try:
             from app.jarvis.persistence import save_conversation
@@ -2479,71 +2526,23 @@ async def start_roundtable(
             await add_turn_async(session, "user", "You", req.user_input)
         session.round_count = 1
 
-        from app.agent.brainstorm.executor import BrainstormExecutor
-        from app.models.agent import AgentRequest
-
-        executor = BrainstormExecutor(llm_client=llm_client)
-        agent_req = AgentRequest(
-            session_id=req.session_id,
-            message=composed_message,
-            mode_id=req.mode_id,
-        )
-
-        async def bs_event_gen():
-            from app.jarvis.roundtable_sessions import add_turn_async
-            from app.jarvis.persistence import save_roundtable_result
-
-            timing_started = time.perf_counter()
-            timing_spans: list[dict[str, Any]] = [{"name": "context_prepare", "ms": 0.0, "mode": "brainstorm", "participants": len(scenario.agents)}]
-            synthesis = ""
-            ideas: list[dict[str, Any]] = []
-            async for ev in executor.execute_stream(agent_req):
-                event_name = ev.event.value if hasattr(ev.event, "value") else str(ev.event)
-                if event_name == "agent_speak":
-                    agent_span_started = time.perf_counter()
-                    agent_id = str(ev.data.get("agent_id") or "brainstorm")
-                    agent_name = str(ev.data.get("agent_name") or agent_id)
-                    content = str(ev.data.get("content") or "")
-                    await add_turn_async(session, agent_id, agent_name, content)
-                    timing_spans.append({"name": "agent_turn", "agent_id": agent_id, "ms": round((time.perf_counter() - agent_span_started) * 1000, 1), "chars": len(content)})
-                elif event_name == "idea_created":
-                    ideas.append(dict(ev.data))
-                elif event_name == "brainstorm_done":
-                    synthesis = str(ev.data.get("synthesis") or "")
-                yield {"event": event_name, "data": ev.model_dump_json()}
-            result_persist_started = time.perf_counter()
-            result_payload = _build_brainstorm_result(
+        return EventSourceResponse(
+            _run_work_brainstorm_graph_round(
+                llm_client=llm_client,
                 session_id=req.session_id,
                 scenario_id=scenario.id,
-                topic=req.user_input or composed_message,
-                synthesis=synthesis,
-                ideas=ideas,
-            )
-            saved_result = await save_roundtable_result(
-                result_id=result_payload["id"],
-                session_id=req.session_id,
+                scenario_name=scenario.name,
+                scenario_icon=scenario.icon,
+                participants=list(scenario.agents),
+                opening_prompt=scenario.opening_prompt,
+                profile_prefix=profile_prefix,
+                context_prefix=context_prefix,
+                phase_label="open",
                 mode="brainstorm",
-                status="draft",
-                summary=result_payload["summary"],
-                options=result_payload["themes"],
-                recommended_option="",
-                tradeoffs=result_payload["tensions"],
-                actions=[{"type": "save_as_memory", "enabled": False}, {"type": "handoff_to_maxwell", "enabled": False}],
-                handoff_target="maxwell",
-                context={
-                    **result_payload["context"],
-                    "themes": result_payload["themes"],
-                    "ideas": result_payload["ideas"],
-                    "tensions": result_payload["tensions"],
-                    "followup_questions": result_payload["followup_questions"],
-                    "save_as_memory": False,
-                },
+                initial_user_input=req.user_input,
+                decision_context=None,
             )
-            yield {"event": "brainstorm_result", "data": json.dumps(jsonable_encoder({**result_payload, **saved_result}), ensure_ascii=False)}
-            timing_spans.append({"name": "result_persist", "ms": round((time.perf_counter() - result_persist_started) * 1000, 1), "result_type": "brainstorm"})
-            yield {"event": "roundtable_timing", "data": json.dumps({"total_ms": round((time.perf_counter() - timing_started) * 1000, 1), "spans": timing_spans, "mode": "brainstorm", "strategy": "sequential_agent_turns"}, ensure_ascii=False)}
-
-        return EventSourceResponse(bs_event_gen())
+        )
 
     # ── Jarvis-roster scenarios: inline sequential loop ─────────────
     # Determine participating agents (filter to those that actually exist in the roster
@@ -2588,7 +2587,7 @@ async def start_roundtable(
     session.round_count = 1
 
     return EventSourceResponse(
-        _run_roundtable_round(
+        _run_graph_or_legacy_round(
             llm_client=llm_client,
             session_id=req.session_id,
             scenario_id=scenario.id,
@@ -2682,9 +2681,10 @@ async def continue_roundtable(
         f"日程密度{ctx.schedule_density:.1f}/10, "
         f"心情{ctx.mood_trend}]\n\n"
     )
+    context_prefix += await _build_local_life_context_prefix(limit=5)
 
     return EventSourceResponse(
-        _run_roundtable_round(
+        _run_graph_or_legacy_round(
             llm_client=llm_client,
             session_id=req.session_id,
             scenario_id=session.scenario_id,
@@ -2990,6 +2990,575 @@ async def return_roundtable_to_private_chat(session_id: str, req: RoundtableRetu
         "summary": return_note,
         "result": updated_result,
     }
+
+
+def _is_schedule_coord_finalize_request(message: str) -> bool:
+    normalized = message.strip().lower()
+    return normalized in {"/finalize", "finalize", "收敛", "直接收敛", "直接结论", "给我结论", "生成结论"}
+
+
+def _graph_roundtable_scenario_id(scenario_id: str) -> str | None:
+    return scenario_id if scenario_id in {"schedule_coord", "local_lifestyle", "emotional_care", "study_energy_decision", "weekend_recharge", "work_brainstorm"} else None
+
+
+def _build_graph_round_context(
+    *,
+    session,
+    decision_context: dict[str, Any] | None,
+    context_prefix: str,
+    opening_prompt: str,
+    profile_prefix: str,
+    scenario_name: str,
+    scenario_icon: str,
+) -> dict[str, Any]:
+    previous_discussion = session.format_for_prompt(max_chars=6000) if session else ""
+    return {
+        **(decision_context or {}),
+        "context_prefix": context_prefix,
+        "opening_prompt": opening_prompt,
+        "profile_prefix_present": bool(profile_prefix),
+        "scenario_name": scenario_name,
+        "scenario_icon": scenario_icon,
+        "previous_discussion": previous_discussion,
+    }
+
+
+async def _run_graph_or_legacy_round(**kwargs):
+    graph_scenario_id = _graph_roundtable_scenario_id(str(kwargs.get("scenario_id") or ""))
+    if graph_scenario_id == "schedule_coord":
+        async for event in _run_schedule_coord_graph_round(**kwargs):
+            yield event
+        return
+    if graph_scenario_id == "study_energy_decision":
+        async for event in _run_study_energy_decision_graph_round(**kwargs):
+            yield event
+        return
+    if graph_scenario_id == "local_lifestyle":
+        async for event in _run_local_lifestyle_graph_round(**kwargs):
+            yield event
+        return
+    if graph_scenario_id == "emotional_care":
+        async for event in _run_emotional_care_graph_round(**kwargs):
+            yield event
+        return
+    if graph_scenario_id == "weekend_recharge":
+        async for event in _run_weekend_recharge_graph_round(**kwargs):
+            yield event
+        return
+    if graph_scenario_id == "work_brainstorm":
+        async for event in _run_work_brainstorm_graph_round(**kwargs):
+            yield event
+        return
+    async for event in _run_roundtable_round(**kwargs):
+        yield event
+
+
+async def _run_decision_graph_round(
+    *,
+    executor,
+    graph_scenario_id: str,
+    graph_strategy: str,
+    llm_client,
+    session_id: str,
+    scenario_id: str,
+    scenario_name: str,
+    scenario_icon: str,
+    participants: list[str],
+    opening_prompt: str,
+    profile_prefix: str,
+    context_prefix: str,
+    phase_label: str,
+    mode: str = "decision",
+    initial_user_input: str = "",
+    decision_context: dict[str, Any] | None = None,
+):
+    from app.jarvis.persistence import save_roundtable_result
+    from app.jarvis.roundtable_sessions import add_turn_async, get_session
+
+    timing_started = time.perf_counter()
+    session = get_session(session_id)
+    feedback_history = [
+        turn.content
+        for turn in (session.transcript if session else [])
+        if turn.role == "user" and turn.content.strip()
+    ]
+    original_goal = feedback_history[0] if feedback_history else (initial_user_input or "")
+    context = _build_graph_round_context(
+        session=session,
+        decision_context=decision_context,
+        context_prefix=context_prefix,
+        opening_prompt=opening_prompt,
+        profile_prefix=profile_prefix,
+        scenario_name=scenario_name,
+        scenario_icon=scenario_icon,
+    )
+
+    yield {
+        "event": "phase_change",
+        "data": json.dumps(
+            {
+                "phase": phase_label,
+                "scenario_id": scenario_id,
+                "scenario_name": scenario_name,
+                "participants": participants,
+                "session_id": session_id,
+                "round_count": session.round_count if session else 1,
+                "mode": mode,
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+    if phase_label == "user_turn" and _is_schedule_coord_finalize_request(initial_user_input):
+        event_iter = executor.finalize(
+            session_id=session_id,
+            user_goal=original_goal,
+            context=context,
+            feedback_history=feedback_history,
+            participants=participants,
+        )
+    elif phase_label == "user_turn":
+        event_iter = executor.continue_round(
+            session_id=session_id,
+            user_goal=original_goal,
+            context=context,
+            feedback_history=feedback_history,
+            round_index=session.round_count if session else 1,
+            participants=participants,
+        )
+    else:
+        event_iter = executor.start_round(
+            session_id=session_id,
+            user_goal=original_goal,
+            context=context,
+            round_index=session.round_count if session else 1,
+            feedback_history=feedback_history[1:],
+            participants=participants,
+        )
+
+    done_event: dict[str, str] | None = None
+    async for event in event_iter:
+        if event.get("event") == "done":
+            done_event = event
+            continue
+        if event.get("event") == "role_completed" and session is not None:
+            payload = json.loads(event.get("data") or "{}")
+            agent_id = str(payload.get("agent_id") or "")
+            agent = JARVIS_AGENTS.get(agent_id)
+            content = str(payload.get("content") or "").strip()
+            if agent_id and content:
+                await add_turn_async(
+                    session,
+                    agent_id,
+                    f"{payload.get('agent_name') or agent_id}（{payload.get('agent_role') or (agent or {}).get('role') or '专家'}）",
+                    content,
+                )
+        elif event.get("event") == "decision_result":
+            payload = json.loads(event.get("data") or "{}")
+            saved_result = await save_roundtable_result(
+                result_id=str(payload["id"]),
+                session_id=session_id,
+                mode="decision",
+                status=str(payload.get("status") or "draft"),
+                summary=str(payload.get("summary") or ""),
+                options=payload.get("options") if isinstance(payload.get("options"), list) else [],
+                recommended_option=str(payload.get("recommended_option") or ""),
+                tradeoffs=payload.get("tradeoffs") if isinstance(payload.get("tradeoffs"), list) else [],
+                actions=payload.get("actions") if isinstance(payload.get("actions"), list) else [],
+                handoff_target=str(payload.get("handoff_target") or "maxwell"),
+                context=payload.get("context") if isinstance(payload.get("context"), dict) else {},
+                result_json=payload,
+            )
+            event = {"event": "decision_result", "data": json.dumps(jsonable_encoder(saved_result), ensure_ascii=False)}
+        yield event
+
+    yield {
+        "event": "roundtable_timing",
+        "data": json.dumps(
+            {
+                "total_ms": round((time.perf_counter() - timing_started) * 1000, 1),
+                "spans": [{"name": f"{graph_scenario_id}_graph_round", "ms": round((time.perf_counter() - timing_started) * 1000, 1)}],
+                "mode": "decision",
+                "strategy": graph_strategy,
+            },
+            ensure_ascii=False,
+        ),
+    }
+    if done_event is not None:
+        yield done_event
+
+
+async def _run_schedule_coord_graph_round(
+    *,
+    llm_client,
+    session_id: str,
+    scenario_id: str,
+    scenario_name: str,
+    scenario_icon: str,
+    participants: list[str],
+    opening_prompt: str,
+    profile_prefix: str,
+    context_prefix: str,
+    phase_label: str,
+    mode: str = "decision",
+    initial_user_input: str = "",
+    decision_context: dict[str, Any] | None = None,
+):
+    from app.jarvis.schedule_coord_graph import ScheduleCoordGraphExecutor
+
+    async for event in _run_decision_graph_round(
+        executor=ScheduleCoordGraphExecutor(llm_client=llm_client),
+        graph_scenario_id="schedule_coord",
+        graph_strategy="langgraph_schedule_coord_v1",
+        llm_client=llm_client,
+        session_id=session_id,
+        scenario_id=scenario_id,
+        scenario_name=scenario_name,
+        scenario_icon=scenario_icon,
+        participants=participants,
+        opening_prompt=opening_prompt,
+        profile_prefix=profile_prefix,
+        context_prefix=context_prefix,
+        phase_label=phase_label,
+        mode=mode,
+        initial_user_input=initial_user_input,
+        decision_context=decision_context,
+    ):
+        yield event
+
+
+async def _run_study_energy_decision_graph_round(
+    *,
+    llm_client,
+    session_id: str,
+    scenario_id: str,
+    scenario_name: str,
+    scenario_icon: str,
+    participants: list[str],
+    opening_prompt: str,
+    profile_prefix: str,
+    context_prefix: str,
+    phase_label: str,
+    mode: str = "decision",
+    initial_user_input: str = "",
+    decision_context: dict[str, Any] | None = None,
+):
+    from app.jarvis.study_energy_decision_graph import StudyEnergyDecisionGraphExecutor
+
+    async for event in _run_decision_graph_round(
+        executor=StudyEnergyDecisionGraphExecutor(llm_client=llm_client),
+        graph_scenario_id="study_energy_decision",
+        graph_strategy="langgraph_study_energy_decision_v1",
+        llm_client=llm_client,
+        session_id=session_id,
+        scenario_id=scenario_id,
+        scenario_name=scenario_name,
+        scenario_icon=scenario_icon,
+        participants=participants,
+        opening_prompt=opening_prompt,
+        profile_prefix=profile_prefix,
+        context_prefix=context_prefix,
+        phase_label=phase_label,
+        mode=mode,
+        initial_user_input=initial_user_input,
+        decision_context=decision_context,
+    ):
+        yield event
+
+
+async def _run_brainstorm_graph_round(
+    *,
+    executor,
+    graph_scenario_id: str,
+    graph_strategy: str,
+    llm_client,
+    session_id: str,
+    scenario_id: str,
+    scenario_name: str,
+    scenario_icon: str,
+    participants: list[str],
+    opening_prompt: str,
+    profile_prefix: str,
+    context_prefix: str,
+    phase_label: str,
+    mode: str = "brainstorm",
+    initial_user_input: str = "",
+    decision_context: dict[str, Any] | None = None,
+):
+    from app.jarvis.persistence import save_roundtable_result
+    from app.jarvis.roundtable_sessions import add_turn_async, get_session
+
+    timing_started = time.perf_counter()
+    session = get_session(session_id)
+    feedback_history = [
+        turn.content
+        for turn in (session.transcript if session else [])
+        if turn.role == "user" and turn.content.strip()
+    ]
+    original_goal = feedback_history[0] if feedback_history else (initial_user_input or "")
+    context = _build_graph_round_context(
+        session=session,
+        decision_context=decision_context,
+        context_prefix=context_prefix,
+        opening_prompt=opening_prompt,
+        profile_prefix=profile_prefix,
+        scenario_name=scenario_name,
+        scenario_icon=scenario_icon,
+    )
+
+    yield {
+        "event": "phase_change",
+        "data": json.dumps(
+            {
+                "phase": phase_label,
+                "scenario_id": scenario_id,
+                "scenario_name": scenario_name,
+                "participants": participants,
+                "session_id": session_id,
+                "round_count": session.round_count if session else 1,
+                "mode": "brainstorm",
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+    if phase_label == "user_turn" and _is_schedule_coord_finalize_request(initial_user_input):
+        event_iter = executor.finalize(
+            session_id=session_id,
+            user_goal=original_goal,
+            context=context,
+            feedback_history=feedback_history,
+            participants=participants,
+        )
+    elif phase_label == "user_turn":
+        event_iter = executor.continue_round(
+            session_id=session_id,
+            user_goal=original_goal,
+            context=context,
+            feedback_history=feedback_history,
+            round_index=session.round_count if session else 1,
+            participants=participants,
+        )
+    else:
+        event_iter = executor.start_round(
+            session_id=session_id,
+            user_goal=original_goal,
+            context=context,
+            round_index=session.round_count if session else 1,
+            feedback_history=feedback_history[1:],
+            participants=participants,
+        )
+
+    done_event: dict[str, str] | None = None
+    async for event in event_iter:
+        if event.get("event") == "done":
+            done_event = event
+            continue
+        if event.get("event") == "role_completed" and session is not None:
+            payload = json.loads(event.get("data") or "{}")
+            agent_id = str(payload.get("agent_id") or "")
+            agent = JARVIS_AGENTS.get(agent_id)
+            content = str(payload.get("content") or "").strip()
+            if agent_id and content:
+                await add_turn_async(
+                    session,
+                    agent_id,
+                    f"{payload.get('agent_name') or agent_id}（{payload.get('agent_role') or (agent or {}).get('role') or '专家'}）",
+                    content,
+                )
+        elif event.get("event") == "brainstorm_result":
+            payload = json.loads(event.get("data") or "{}")
+            context_payload = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+            saved_result = await save_roundtable_result(
+                result_id=str(payload["id"]),
+                session_id=session_id,
+                mode="brainstorm",
+                status=str(payload.get("status") or "draft"),
+                summary=str(payload.get("summary") or ""),
+                options=payload.get("themes") if isinstance(payload.get("themes"), list) else [],
+                recommended_option="",
+                tradeoffs=payload.get("tensions") if isinstance(payload.get("tensions"), list) else [],
+                actions=[
+                    {"type": "save_as_memory", "enabled": False},
+                    {"type": "handoff_to_maxwell", "enabled": False},
+                ],
+                handoff_target=str(payload.get("handoff_target") or "maxwell"),
+                context=context_payload,
+                result_json=payload,
+            )
+            event = {"event": "brainstorm_result", "data": json.dumps(jsonable_encoder(_public_brainstorm_result(saved_result)), ensure_ascii=False)}
+        yield event
+
+    yield {
+        "event": "roundtable_timing",
+        "data": json.dumps(
+            {
+                "total_ms": round((time.perf_counter() - timing_started) * 1000, 1),
+                "spans": [{"name": f"{graph_scenario_id}_graph_round", "ms": round((time.perf_counter() - timing_started) * 1000, 1)}],
+                "mode": "brainstorm",
+                "strategy": graph_strategy,
+            },
+            ensure_ascii=False,
+        ),
+    }
+    if done_event is not None:
+        yield done_event
+
+
+async def _run_local_lifestyle_graph_round(
+    *,
+    llm_client,
+    session_id: str,
+    scenario_id: str,
+    scenario_name: str,
+    scenario_icon: str,
+    participants: list[str],
+    opening_prompt: str,
+    profile_prefix: str,
+    context_prefix: str,
+    phase_label: str,
+    mode: str = "brainstorm",
+    initial_user_input: str = "",
+    decision_context: dict[str, Any] | None = None,
+):
+    from app.jarvis.local_lifestyle_graph import LocalLifestyleGraphExecutor
+
+    async for event in _run_brainstorm_graph_round(
+        executor=LocalLifestyleGraphExecutor(llm_client=llm_client),
+        graph_scenario_id="local_lifestyle",
+        graph_strategy="langgraph_local_lifestyle_v1",
+        llm_client=llm_client,
+        session_id=session_id,
+        scenario_id=scenario_id,
+        scenario_name=scenario_name,
+        scenario_icon=scenario_icon,
+        participants=participants,
+        opening_prompt=opening_prompt,
+        profile_prefix=profile_prefix,
+        context_prefix=context_prefix,
+        phase_label=phase_label,
+        mode=mode,
+        initial_user_input=initial_user_input,
+        decision_context=decision_context,
+    ):
+        yield event
+
+
+async def _run_emotional_care_graph_round(
+    *,
+    llm_client,
+    session_id: str,
+    scenario_id: str,
+    scenario_name: str,
+    scenario_icon: str,
+    participants: list[str],
+    opening_prompt: str,
+    profile_prefix: str,
+    context_prefix: str,
+    phase_label: str,
+    mode: str = "brainstorm",
+    initial_user_input: str = "",
+    decision_context: dict[str, Any] | None = None,
+):
+    from app.jarvis.emotional_care_graph import EmotionalCareGraphExecutor
+
+    async for event in _run_brainstorm_graph_round(
+        executor=EmotionalCareGraphExecutor(llm_client=llm_client),
+        graph_scenario_id="emotional_care",
+        graph_strategy="langgraph_emotional_care_v1",
+        llm_client=llm_client,
+        session_id=session_id,
+        scenario_id=scenario_id,
+        scenario_name=scenario_name,
+        scenario_icon=scenario_icon,
+        participants=participants,
+        opening_prompt=opening_prompt,
+        profile_prefix=profile_prefix,
+        context_prefix=context_prefix,
+        phase_label=phase_label,
+        mode=mode,
+        initial_user_input=initial_user_input,
+        decision_context=decision_context,
+    ):
+        yield event
+
+
+async def _run_weekend_recharge_graph_round(
+    *,
+    llm_client,
+    session_id: str,
+    scenario_id: str,
+    scenario_name: str,
+    scenario_icon: str,
+    participants: list[str],
+    opening_prompt: str,
+    profile_prefix: str,
+    context_prefix: str,
+    phase_label: str,
+    mode: str = "brainstorm",
+    initial_user_input: str = "",
+    decision_context: dict[str, Any] | None = None,
+):
+    from app.jarvis.weekend_recharge_graph import WeekendRechargeGraphExecutor
+
+    async for event in _run_brainstorm_graph_round(
+        executor=WeekendRechargeGraphExecutor(llm_client=llm_client),
+        graph_scenario_id="weekend_recharge",
+        graph_strategy="langgraph_weekend_recharge_v1",
+        llm_client=llm_client,
+        session_id=session_id,
+        scenario_id=scenario_id,
+        scenario_name=scenario_name,
+        scenario_icon=scenario_icon,
+        participants=participants,
+        opening_prompt=opening_prompt,
+        profile_prefix=profile_prefix,
+        context_prefix=context_prefix,
+        phase_label=phase_label,
+        mode=mode,
+        initial_user_input=initial_user_input,
+        decision_context=decision_context,
+    ):
+        yield event
+
+
+async def _run_work_brainstorm_graph_round(
+    *,
+    llm_client,
+    session_id: str,
+    scenario_id: str,
+    scenario_name: str,
+    scenario_icon: str,
+    participants: list[str],
+    opening_prompt: str,
+    profile_prefix: str,
+    context_prefix: str,
+    phase_label: str,
+    mode: str = "brainstorm",
+    initial_user_input: str = "",
+    decision_context: dict[str, Any] | None = None,
+):
+    from app.jarvis.work_brainstorm_graph import WorkBrainstormGraphExecutor
+
+    async for event in _run_brainstorm_graph_round(
+        executor=WorkBrainstormGraphExecutor(llm_client=llm_client),
+        graph_scenario_id="work_brainstorm",
+        graph_strategy="langgraph_work_brainstorm_v1",
+        llm_client=llm_client,
+        session_id=session_id,
+        scenario_id=scenario_id,
+        scenario_name=scenario_name,
+        scenario_icon=scenario_icon,
+        participants=participants,
+        opening_prompt=opening_prompt,
+        profile_prefix=profile_prefix,
+        context_prefix=context_prefix,
+        phase_label=phase_label,
+        mode=mode,
+        initial_user_input=initial_user_input,
+        decision_context=decision_context,
+    ):
+        yield event
 
 
 async def _run_roundtable_round(
