@@ -26,7 +26,8 @@ from app.jarvis.memory_extractor import extract_and_save_chat_memories
 from app.jarvis.memory_compactor import maybe_compact_old_raw_memories
 from app.jarvis.memory_recall import build_bounded_memory_recall_prefix
 from app.jarvis.preference_learner import build_preference_profile_prefix
-from app.jarvis.tool_runtime import execute_tool_calls, run_agent_turn, to_action_results
+from app.jarvis.intent_router import plan_agent_intent
+from app.jarvis.tool_runtime import execute_tool_calls, format_tool_results, run_agent_turn, to_action_results
 
 logger = structlog.get_logger("jarvis.api")
 router = APIRouter(prefix="/jarvis", tags=["jarvis"])
@@ -850,6 +851,50 @@ async def chat_with_agent(
         "如果不需要工具，直接回答。\n\n"
     )
     intent_context = ""
+    planned_tool_results: list[dict[str, Any]] = []
+    intent_started = time.perf_counter()
+    try:
+        intent_decision = plan_agent_intent(routed_agent_id, req.message, local_now=local_now)
+        if intent_decision.next_action in {"call_tool", "pending_confirmation"} and intent_decision.tool_name:
+            planned_tool_results = await execute_tool_calls(
+                routed_agent_id,
+                [{"tool_name": intent_decision.tool_name, "arguments": intent_decision.slots}],
+            )
+            intent_context = (
+                "## 私聊意图识别\n"
+                f"当前角色: {routed_agent_id}\n"
+                f"识别意图: {intent_decision.intent}\n"
+                f"计划工具: {intent_decision.tool_name}\n"
+                f"下一步: {intent_decision.next_action}\n"
+                f"原因: {intent_decision.reason}\n\n"
+                f"提取槽位: {json.dumps(intent_decision.slots, ensure_ascii=False, default=str)}\n\n"
+                f"{format_tool_results(planned_tool_results)}\n\n"
+                "你已经拿到了上面的工具结果。请直接基于结果自然回复用户；"
+                "如果工具结果需要确认，请说明已生成待确认卡片，用户确认后才会写入。\n\n"
+            )
+        elif intent_decision.next_action == "ask_missing_slots":
+            missing = "、".join(intent_decision.missing_slots)
+            intent_context = (
+                "## 私聊意图识别\n"
+                f"当前角色: {routed_agent_id}\n"
+                f"识别意图: {intent_decision.intent}\n"
+                f"计划工具: {intent_decision.tool_name}\n"
+                f"缺少槽位: {missing}\n"
+                f"已提取槽位: {json.dumps(intent_decision.slots, ensure_ascii=False, default=str)}\n"
+                "请保持当前角色身份，用一句自然的话向用户补齐这些信息；"
+                "不要切换到其他角色，也不要假装已经执行工具。\n\n"
+            )
+        mark_span(
+            "local_intent",
+            intent_started,
+            intent=intent_decision.intent,
+            next_action=intent_decision.next_action,
+            planned_tools=len(planned_tool_results),
+        )
+    except Exception as exc:
+        logger.warning("jarvis.chat.local_intent_failed", agent_id=routed_agent_id, error=str(exc))
+        mark_span("local_intent", intent_started, intent="error", planned_tools=0)
+
     full_message = (
         f"{profile_prefix}{context_summary}\n\n"
         f"{time_context}"
@@ -881,7 +926,8 @@ async def chat_with_agent(
         }
         logger.error("jarvis.api.chat_failed", **detail)
         raise HTTPException(status_code=502, detail=detail) from exc
-    mark_span("llm_turn", llm_started, tool_calls=len(tool_results or []))
+    all_tool_results = [*planned_tool_results, *(tool_results or [])]
+    mark_span("llm_turn", llm_started, tool_calls=len(tool_results or []), planned_tool_calls=len(planned_tool_results))
 
     actions_started = time.perf_counter()
     clean_reply = (response or "").strip()
@@ -903,7 +949,7 @@ async def chat_with_agent(
             )
         except Exception as exc:
             logger.warning("jarvis.chat.mood_care_failed", agent_id=req.agent_id, error=str(exc))
-    action_results = [*care_actions, *consult_result.actions, *to_action_results(tool_results)]
+    action_results = [*care_actions, *consult_result.actions, *to_action_results(all_tool_results)]
     for action in action_results:
         if not action.get("pending_confirmation"):
             continue
@@ -938,7 +984,7 @@ async def chat_with_agent(
     try:
         if is_user_constraint(req.message):
             await remember_user_constraint(req.message, source_agent=routed_agent_id)
-        await remember_tool_actions(routed_agent_id, tool_results)
+        await remember_tool_actions(routed_agent_id, all_tool_results)
         await extract_and_save_chat_memories(
             user_message=req.message,
             agent_reply=clean_reply,
