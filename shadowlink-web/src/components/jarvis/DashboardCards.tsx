@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
-import { jarvisApi, type JarvisTimeContext } from "@/services/jarvisApi";
+import { jarvisScheduleApi } from "@/services/jarvisScheduleApi";
+import { jarvisSettingsApi, type JarvisTimeContext } from "@/services/jarvisSettingsApi";
 import { useJarvisStore } from "@/stores/jarvisStore";
 
 interface DashboardCardsProps {
@@ -139,18 +140,13 @@ const WeatherCard: React.FC = () => {
       setLoading(true);
       setErrorMsg(null);
       try {
-        const [lifeRes, profileRes] = await Promise.all([
-          fetch("/api/v1/jarvis/local-life"),
-          fetch("/api/v1/jarvis/profile"),
+        const [lifeData, profile] = await Promise.all([
+          jarvisScheduleApi.getLocalLife(),
+          jarvisSettingsApi.getProfile().catch(() => null),
         ]);
-        if (!lifeRes.ok) throw new Error(`HTTP ${lifeRes.status}`);
-        const lifeData = await lifeRes.json();
         if (!cancelled) {
           setWeather(lifeData.weather ?? null);
-          if (profileRes.ok) {
-            const profile = await profileRes.json();
-            setLocationLabel(profile?.location?.label ?? "");
-          }
+          setLocationLabel(profile?.location?.label ?? "");
         }
       } catch (err) {
         if (!cancelled) setErrorMsg(String(err));
@@ -210,7 +206,7 @@ const TimeCard: React.FC = () => {
     const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     (async () => {
       try {
-        const data = await jarvisApi.getTimeContext(browserTimezone);
+        const data = await jarvisSettingsApi.getTimeContext(browserTimezone);
         if (!cancelled) {
           setTimeContext(data);
           setNow(new Date(data.local_iso));

@@ -1,5 +1,5 @@
 ﻿import React, { useEffect, useMemo, useState } from "react";
-import { jarvisApi, type JarvisMemory } from "@/services/jarvisApi";
+import { jarvisMemoryApi, type JarvisMemory } from "@/services/jarvisMemoryApi";
 
 const MEMORY_KIND_OPTIONS = [
   { value: "", label: "全部" },
@@ -46,7 +46,7 @@ export const MemoryPanel: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
-      const items = await jarvisApi.listMemories({ memoryKind: memoryKind || undefined, limit: 30 });
+      const items = await jarvisMemoryApi.listMemories({ memoryKind: memoryKind || undefined, limit: 30 });
       setMemories(items);
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载记忆失败");
@@ -65,7 +65,7 @@ export const MemoryPanel: React.FC = () => {
     setDeletingId(memory.id);
     setError(null);
     try {
-      await jarvisApi.deleteMemory(memory.id);
+      await jarvisMemoryApi.deleteMemory(memory.id);
       setMemories((items) => items.filter((item) => item.id !== memory.id));
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除记忆失败");

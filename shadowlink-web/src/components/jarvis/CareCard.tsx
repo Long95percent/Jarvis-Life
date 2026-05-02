@@ -1,5 +1,6 @@
 import React, { useState } from "react";
-import { jarvisApi, type ActionResult, type ProactiveMessage } from "@/services/jarvisApi";
+import { type ActionResult, type ProactiveMessage } from "@/services/jarvisApi";
+import { jarvisCareApi } from "@/services/jarvisCareApi";
 
 type CareFeedback = "helpful" | "too_frequent" | "not_needed" | "snooze" | "handled";
 
@@ -29,7 +30,7 @@ export const CareCard: React.FC<Props> = ({ action, message, state, error, onFee
     if (!proactiveId || !submitFeedback) return;
     setSubmitting(feedback);
     try {
-      await jarvisApi.sendCareFeedback(proactiveId, { feedback, snooze_minutes: feedback === "snooze" ? 120 : undefined });
+      await jarvisCareApi.sendCareFeedback(proactiveId, { feedback, snooze_minutes: feedback === "snooze" ? 120 : undefined });
     } finally {
       setSubmitting(null);
     }

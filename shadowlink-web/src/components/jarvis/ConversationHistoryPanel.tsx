@@ -1,5 +1,5 @@
 ﻿import React, { useEffect, useState } from "react";
-import { jarvisApi, type ConversationHistoryItem } from "@/services/jarvisApi";
+import { jarvisConversationApi, type ConversationHistoryItem } from "@/services/jarvisConversationApi";
 import { useJarvisStore } from "@/stores/jarvisStore";
 
 export const JARVIS_CONVERSATION_HISTORY_CHANGED = "jarvis:conversation-history-changed";
@@ -33,7 +33,7 @@ export const ConversationHistoryPanel: React.FC = () => {
     setLoading(true);
     setError(null);
     try {
-      setItems(await jarvisApi.listConversationHistory(30));
+      setItems(await jarvisConversationApi.listConversationHistory(30));
     } catch (err) {
       setError(err instanceof Error ? err.message : "加载历史对话失败");
     } finally {
@@ -75,7 +75,7 @@ export const ConversationHistoryPanel: React.FC = () => {
     setDeletingId(item.id);
     setError(null);
     try {
-      await jarvisApi.deleteConversationHistory(item.id);
+      await jarvisConversationApi.deleteConversationHistory(item.id);
       setItems((current) => current.filter((entry) => entry.id !== item.id));
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除历史对话失败");

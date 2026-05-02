@@ -1,17 +1,9 @@
 // shadowlink-web/src/components/jarvis/ScenarioGrid.tsx
 import React, { useEffect, useState } from "react";
+import { jarvisScenarioApi, type Scenario } from "@/services/jarvisScenarioApi";
 import { JARVIS_AGENTS } from "./agentMeta";
 
-export interface Scenario {
-  id: string;
-  name: string;
-  name_en: string;
-  icon: string;
-  description: string;
-  agents: string[];
-  agent_roster: "jarvis" | "brainstorm";
-}
-
+export type { Scenario } from "@/services/jarvisScenarioApi";
 interface Props {
   onStart: (scenarioId: string, userInput: string) => void;
 }
@@ -27,9 +19,7 @@ export const ScenarioGrid: React.FC<Props> = ({ onStart }) => {
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch("/api/v1/jarvis/scenarios");
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data: Scenario[] = await res.json();
+        const data = await jarvisScenarioApi.listScenarios();
         if (!cancelled) setScenarios(data);
       } catch (err) {
         if (!cancelled) setError((err as Error).message);

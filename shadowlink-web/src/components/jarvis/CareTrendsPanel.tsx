@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { jarvisApi, type CareTrendDetail, type CareTrendPoint, type CareTrendsResponse, type ProactiveMessage } from "@/services/jarvisApi";
+import { type ProactiveMessage } from "@/services/jarvisApi";
+import { jarvisCareApi, type CareTrendDetail, type CareTrendPoint, type CareTrendsResponse } from "@/services/jarvisCareApi";
 
 type TrendRange = "week" | "month" | "year";
 type MetricKey = "mood_score" | "stress_score" | "energy_score" | "sleep_risk_score" | "schedule_pressure_score";
@@ -67,8 +68,8 @@ export const CareTrendsPanel: React.FC<Props> = ({ recentCareMessages = [], onOp
     setError("");
     try {
       const [settings, trends] = await Promise.all([
-        jarvisApi.getCareSettings().catch(() => ({ psychological_tracking_enabled: true })),
-        jarvisApi.getCareTrends({ range: targetRange }),
+        jarvisCareApi.getCareSettings().catch(() => ({ psychological_tracking_enabled: true })),
+        jarvisCareApi.getCareTrends({ range: targetRange }),
       ]);
       setTrackingEnabled(Boolean(settings.psychological_tracking_enabled && trends.tracking_enabled !== false));
       setData(trends);
@@ -93,7 +94,7 @@ export const CareTrendsPanel: React.FC<Props> = ({ recentCareMessages = [], onOp
     setDayDetail(data?.details[date] ?? null);
     setDetailLoading(true);
     try {
-      setDayDetail(await jarvisApi.getCareDayDetail(date));
+      setDayDetail(await jarvisCareApi.getCareDayDetail(date));
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "当天解释加载失败");
     } finally {
@@ -105,7 +106,7 @@ export const CareTrendsPanel: React.FC<Props> = ({ recentCareMessages = [], onOp
     setSaving(true);
     try {
       const next = !trackingEnabled;
-      const result = await jarvisApi.setPsychologicalTracking(next);
+      const result = await jarvisCareApi.setPsychologicalTracking(next);
       setTrackingEnabled(result.psychological_tracking_enabled);
       await load(range);
     } catch (exc) {
@@ -119,7 +120,7 @@ export const CareTrendsPanel: React.FC<Props> = ({ recentCareMessages = [], onOp
     if (!window.confirm("确认清除心理中心数据？这会删除情绪、行为、压力信号和每日快照。")) return;
     setSaving(true);
     try {
-      await jarvisApi.clearCareData();
+      await jarvisCareApi.clearCareData();
       await load(range);
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "心理数据清除失败");

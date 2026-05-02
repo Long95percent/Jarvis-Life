@@ -1,6 +1,8 @@
 ﻿// shadowlink-web/src/stores/jarvisStore.ts
 import { create } from "zustand";
 import { jarvisApi, type ActionResult, type CalendarEvent, type ConversationHistoryItem, type EscalationHint, type JarvisAgent, type LifeContext, type ProactiveMessage, type TeamCollaborationResponse } from "@/services/jarvisApi";
+import { jarvisConversationApi } from "@/services/jarvisConversationApi";
+import { jarvisScheduleApi } from "@/services/jarvisScheduleApi";
 
 export type InteractionMode = "scenario_grid" | "private_chat" | "roundtable";
 
@@ -286,7 +288,7 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
 
   refreshLocalLife: async (force = false) => {
     try {
-      const data = await jarvisApi.getLocalLife(force);
+      const data = await jarvisScheduleApi.getLocalLife(force);
       set({
         localLife: {
           weather: data.weather ?? null,
@@ -310,17 +312,17 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
   },
 
   addCalendarEvent: async (payload) => {
-    await jarvisApi.addCalendarEvent(payload);
+    await jarvisScheduleApi.addCalendarEvent(payload);
     await get().refreshAll();
   },
 
   deleteCalendarEvent: async (eventId) => {
-    await jarvisApi.deleteCalendarEvent(eventId);
+    await jarvisScheduleApi.deleteCalendarEvent(eventId);
     await get().refreshAll();
   },
 
   updateCalendarEvent: async (eventId, patch) => {
-    await jarvisApi.updateCalendarEvent(eventId, patch);
+    await jarvisScheduleApi.updateCalendarEvent(eventId, patch);
     await get().refreshAll();
   },
 
@@ -370,7 +372,7 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
       activeRoundtableSourceAgentId: sourceAgentId ?? null,
       sessionId,
     });
-    jarvisApi.saveConversationHistory({
+    jarvisConversationApi.saveConversationHistory({
       conversation_id: `${isBrainstorm ? "brainstorm" : "roundtable"}:${sessionId}`,
       conversation_type: isBrainstorm ? "brainstorm" : "roundtable",
       title: `${isBrainstorm ? "工作难题头脑风暴" : "圆桌讨论"}${userInput ? `：${userInput.slice(0, 18)}` : ""}`,
@@ -389,7 +391,7 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
   },
 
   openConversation: async (conversation) => {
-    await jarvisApi.openConversationHistory(conversation.id).catch(() => {});
+    await jarvisConversationApi.openConversationHistory(conversation.id).catch(() => {});
     const payload = conversation.route_payload ?? {};
     if (conversation.conversation_type === "private_chat" && conversation.agent_id) {
       writePersistedUiState({

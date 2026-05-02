@@ -10,6 +10,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { Check, Loader2 } from 'lucide-react'
+import { jarvisSettingsApi } from '@/services/jarvisSettingsApi'
 import { JARVIS_AGENTS } from '@/components/jarvis/agentMeta'
 
 interface AgentCfg {
@@ -48,9 +49,7 @@ export function SettingsAgents() {
     let alive = true
     ;(async () => {
       try {
-        const res = await fetch('/api/v1/jarvis/agent-config')
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const data: AgentConfigResponse = await res.json()
+        const data = await jarvisSettingsApi.getAgentConfig()
         if (alive) setCfg(data)
       } catch (e) {
         if (alive) setError(String(e))

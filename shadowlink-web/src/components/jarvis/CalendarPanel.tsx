@@ -1,6 +1,6 @@
 ﻿import React, { useEffect, useMemo, useState } from "react";
 import { useJarvisStore } from "@/stores/jarvisStore";
-import { jarvisApi, type BackgroundTask, type BackgroundTaskDay, type CalendarEvent, type JarvisPlan, type JarvisPlanDay, type MaxwellWorkbenchItem, type PendingAction, type PlannerCalendarItem, type PlannerConflict, type PlannerFreeWindow, type PlannerDailyMaintenanceResult, type PlannerOverdueMissedResult, type PlannerTaskCleanupResult, type PlannerTaskItem, type AgentEvent } from "@/services/jarvisApi";
+import { jarvisScheduleApi, type BackgroundTask, type BackgroundTaskDay, type CalendarEvent, type JarvisPlan, type JarvisPlanDay, type MaxwellWorkbenchItem, type PendingAction, type PlannerCalendarItem, type PlannerConflict, type PlannerFreeWindow, type PlannerDailyMaintenanceResult, type PlannerOverdueMissedResult, type PlannerTaskCleanupResult, type PlannerTaskItem, type AgentEvent } from "@/services/jarvisScheduleApi";
 
 interface Props { open: boolean; onClose: () => void }
 type ViewMode = "day" | "week" | "month";
@@ -324,14 +324,14 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setLoadError(null);
     try {
       const [calendarItems, pending, plannerTaskItems, backgroundTasks, backgroundTaskDays, jarvisPlans, jarvisPlanDays, maxwellWorkbenchItems] = await Promise.all([
-        loadStep("日历项", () => jarvisApi.getPlannerCalendar({ start: range.start.toISOString(), end: range.end.toISOString() })),
-        loadStep("待确认安排", () => jarvisApi.listPendingActions("pending")),
-        loadStep("统一任务清单", () => jarvisApi.listPlannerTasks()),
-        loadStep("后台任务", () => jarvisApi.listBackgroundTasks()),
-        loadStep("后台任务日", () => jarvisApi.listBackgroundTaskDays({ limit: 1000 })),
-        loadStep("长期计划", () => jarvisApi.listPlans()),
-        loadStep("计划日", () => jarvisApi.listPlanDays({ limit: 2000 })),
-        loadStep("Maxwell 工作台", () => jarvisApi.listMaxwellWorkbenchItems({ limit: 200 })),
+        loadStep("日历项", () => jarvisScheduleApi.getPlannerCalendar({ start: range.start.toISOString(), end: range.end.toISOString() })),
+        loadStep("待确认安排", () => jarvisScheduleApi.listPendingActions()),
+        loadStep("统一任务清单", () => jarvisScheduleApi.listPlannerTasks()),
+        loadStep("后台任务", () => jarvisScheduleApi.listBackgroundTasks()),
+        loadStep("后台任务日", () => jarvisScheduleApi.listBackgroundTaskDays({ limit: 1000 })),
+        loadStep("长期计划", () => jarvisScheduleApi.listPlans()),
+        loadStep("计划日", () => jarvisScheduleApi.listPlanDays({ limit: 2000 })),
+        loadStep("Maxwell 工作台", () => jarvisScheduleApi.listMaxwellWorkbenchItems({ limit: 200 })),
       ]);
       const plannerItems = calendarItems.items;
       setEvents(plannerItems.map(eventFromPlannerItem).filter((item): item is CalendarEvent => Boolean(item)));
@@ -385,7 +385,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     const payload = payloadFromForm();
     if (!payload.title) return;
     if (editingPending) {
-      await jarvisApi.updatePendingAction(editingPending.id, { title: payload.title, arguments: { ...editingPending.arguments, ...payload } });
+      await jarvisScheduleApi.updatePendingAction(editingPending.id, { title: payload.title, arguments: { ...editingPending.arguments, ...payload } });
       setEditingPending(null);
     } else if (editing?.id) {
       await updateCalendarEvent(editing.id, { ...payload, source: "user_ui", source_agent: null, created_reason: "用户手动修改日程", status: editing.status ?? "confirmed" });
@@ -398,16 +398,16 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     await loadAll();
   };
 
-  const confirmPending = async (item: PendingAction) => { await jarvisApi.confirmPendingAction(item.id); await loadAll(); };
-  const cancelPending = async (item: PendingAction) => { await jarvisApi.cancelPendingAction(item.id); await loadAll(); };
+  const confirmPending = async (item: PendingAction) => { await jarvisScheduleApi.confirmPendingAction(item.id); await loadAll(); };
+  const cancelPending = async (item: PendingAction) => { await jarvisScheduleApi.cancelPendingAction(item.id); await loadAll(); };
   const editPending = (item: PendingAction) => { setEditingPending(item); setEditing(null); setSelected(null); setForm(formFromPending(item)); setTab("calendar"); };
   const startEdit = (event: CalendarEvent) => { setEditing(event); setEditingPending(null); setSelected(event); setForm(formFromEvent(event)); };
   const markCompleted = async (event: CalendarEvent) => { if (!event.id) return; await updateCalendarEvent(event.id, { status: event.status === "completed" ? "confirmed" : "completed" }); await loadAll(); setSelected(null); };
   const removeEvent = async (event: CalendarEvent) => { if (!event.id || !confirm(`删除日程「${event.title}」？`)) return; await deleteCalendarEvent(event.id); await loadAll(); setSelected(null); setEditing(null); };
-  const completeTaskDay = async (day: BackgroundTaskDay) => { await jarvisApi.completeBackgroundTaskDay(day.id); await loadAll(); setSelectedTaskDay(null); };
-  const completePlanDay = async (day: JarvisPlanDay) => { await jarvisApi.completePlanDay(day.id); await loadAll(); setSelectedPlanDay(null); };
-  const removeTaskDay = async (day: BackgroundTaskDay) => { if (!confirm(`删除任务日「${day.title}」？`)) return; await jarvisApi.deleteBackgroundTaskDay(day.id); await loadAll(); setSelectedTaskDay(null); };
-  const removePlanDay = async (day: JarvisPlanDay) => { if (!confirm(`删除计划日「${day.title}」？`)) return; await jarvisApi.deletePlanDay(day.id); await loadAll(); setSelectedPlanDay(null); };
+  const completeTaskDay = async (day: BackgroundTaskDay) => { await jarvisScheduleApi.completeBackgroundTaskDay(day.id); await loadAll(); setSelectedTaskDay(null); };
+  const completePlanDay = async (day: JarvisPlanDay) => { await jarvisScheduleApi.completePlanDay(day.id); await loadAll(); setSelectedPlanDay(null); };
+  const removeTaskDay = async (day: BackgroundTaskDay) => { if (!confirm(`删除任务日「${day.title}」？`)) return; await jarvisScheduleApi.deleteBackgroundTaskDay(day.id); await loadAll(); setSelectedTaskDay(null); };
+  const removePlanDay = async (day: JarvisPlanDay) => { if (!confirm(`删除计划日「${day.title}」？`)) return; await jarvisScheduleApi.deletePlanDay(day.id); await loadAll(); setSelectedPlanDay(null); };
   const handleDeleteKey = (event: React.KeyboardEvent, remove: () => void) => {
     if (event.key !== "Delete" && event.key !== "Backspace") return;
     event.preventDefault();
@@ -426,7 +426,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setReschedulingPlanId(plan.id);
     setReschedulePlanMessage(null);
     try {
-      const result = await jarvisApi.createSecretaryPlan({
+      const result = await jarvisScheduleApi.createSecretaryPlan({
         intent: "reschedule_plan",
         message: "用户请求让秘书基于当前日程重新安排计划",
         today: toDateInput(new Date()),
@@ -447,7 +447,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
 
   const cancelPlan = async (plan: JarvisPlan) => {
     if (!confirm(`?????${plan.title}?????????????????`)) return;
-    await jarvisApi.cancelPlan(plan.id);
+    await jarvisScheduleApi.cancelPlan(plan.id);
     await loadAll();
     setSelectedPlan(null);
     setSelectedPlanDay(null);
@@ -455,7 +455,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
 
   const deletePlan = async (plan: JarvisPlan) => {
     if (!confirm(`删除任务「${plan.title}」？该任务会从“查看所有任务”和日历中隐藏，历史事件仍会保留。`)) return;
-    await jarvisApi.deletePlan(plan.id);
+    await jarvisScheduleApi.deletePlan(plan.id);
     await loadAll();
     setSelectedPlan(null);
     setSelectedPlanDay(null);
@@ -465,7 +465,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
   const previewDuplicateTasks = async () => {
     setTaskCleanupLoading(true);
     try {
-      setTaskCleanupPreview(await jarvisApi.cleanupDuplicatePlannerTasks(false));
+      setTaskCleanupPreview(await jarvisScheduleApi.cleanupDuplicatePlannerTasks(false));
     } finally {
       setTaskCleanupLoading(false);
     }
@@ -476,7 +476,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     if (!confirm(`将合并 ${taskCleanupPreview.duplicate_task_count} 个重复长期任务，是否继续？`)) return;
     setTaskCleanupLoading(true);
     try {
-      setTaskCleanupPreview(await jarvisApi.cleanupDuplicatePlannerTasks(true));
+      setTaskCleanupPreview(await jarvisScheduleApi.cleanupDuplicatePlannerTasks(true));
       await loadAll();
     } finally {
       setTaskCleanupLoading(false);
@@ -488,7 +488,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setDailyMaintenanceLoading(true);
     setDailyMaintenanceMessage(null);
     try {
-      const result = await jarvisApi.runPlannerDailyMaintenanceOnce({ auto_reschedule: true, push_today: true });
+      const result = await jarvisScheduleApi.runPlannerDailyMaintenanceOnce({ auto_reschedule: true, push_today: true });
       setDailyMaintenanceResult(result);
       if (result.skipped || result.already_ran) {
         setDailyMaintenanceMessage("今日维护已运行过");
@@ -511,7 +511,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setOverdueScanLoading(true);
     setOverdueScanMessage(null);
     try {
-      const result = await jarvisApi.markOverduePlannerDaysMissed();
+      const result = await jarvisScheduleApi.markOverduePlannerDaysMissed();
       setOverdueScanResult(result);
       const backgroundCount = countItems(result.background_task_days);
       const planCount = countItems(result.plan_days);
@@ -528,7 +528,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setWorkbenchPushLoading(true);
     setWorkbenchMessage(null);
     try {
-      const result = await jarvisApi.pushDailyTasksToMaxwellWorkbench(toDateInput(new Date()));
+      const result = await jarvisScheduleApi.pushDailyTasksToMaxwellWorkbench(toDateInput(new Date()));
       setWorkbenchMessage(`推送今日任务完成：新增/更新 ${result.pushed_count} 个工作台项`);
       await loadAll();
     } catch (error) {
@@ -571,7 +571,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
       raw_payload: { source: "manual_plan_form" },
     };
     try {
-      const saved = editingPlan === "new" ? await jarvisApi.createPlan(payload) : await jarvisApi.updatePlan(editingPlan!.id, payload);
+      const saved = editingPlan === "new" ? await jarvisScheduleApi.createPlan(payload) : await jarvisScheduleApi.updatePlan(editingPlan!.id, payload);
       setSelectedPlan(saved);
       setSelectedTask(null);
       setEditingPlan(null);
@@ -592,7 +592,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setPlanStructureLoading(true);
     setPlanStructureMessage(null);
     try {
-      const result = await jarvisApi.mergePlans({ source_plan_id: sourcePlan.id, target_plan_id: target.id, reason: "manual merge from calendar panel" });
+      const result = await jarvisScheduleApi.mergePlans({ source_plan_id: sourcePlan.id, target_plan_id: target.id, reason: "manual merge from calendar panel" });
       setPlanStructureMessage(`合并完成：移动 ${result.moved_day_count} 个计划日`);
       setSelectedPlan(result.target_plan);
       setMergeTargetPlanId("");
@@ -611,7 +611,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setPlanStructureLoading(true);
     setPlanStructureMessage(null);
     try {
-      const result = await jarvisApi.splitPlan(sourcePlan.id, { title, plan_day_ids: [selectedPlanDay.id], reason: "manual split from calendar panel" });
+      const result = await jarvisScheduleApi.splitPlan(sourcePlan.id, { title, plan_day_ids: [selectedPlanDay.id], reason: "manual split from calendar panel" });
       setPlanStructureMessage(`拆分完成：移动 ${result.moved_day_count} 个计划日`);
       setSelectedPlan(result.new_plan);
       setSelectedPlanDay(null);
@@ -639,7 +639,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setResolvingConflictKey(key);
     setConflictMessage(null);
     try {
-      await jarvisApi.movePlanDay(movable.id, {
+      await jarvisScheduleApi.movePlanDay(movable.id, {
         plan_date: toDateInput(start),
         start_time: toTimeInput(start),
         end_time: toTimeInput(end),
@@ -697,7 +697,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setBulkPlanDayLoading(true);
     setBulkPlanDayMessage(null);
     try {
-      const result = await jarvisApi.bulkUpdatePlanDays({
+      const result = await jarvisScheduleApi.bulkUpdatePlanDays({
         day_ids: selectedPlanDayIds,
         status: action === "complete" ? "completed" : action === "cancel" ? "cancelled" : undefined,
         reason: `manual ${action} from calendar panel`,
@@ -719,7 +719,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setBackgroundTaskActionLoading(status);
     setBackgroundTaskMessage(null);
     try {
-      await jarvisApi.updateBackgroundTask(task.id, { status });
+      await jarvisScheduleApi.updateBackgroundTask(task.id, { status });
       setBackgroundTaskMessage(`${label}完成`);
       setSelectedTask(null);
       await loadAll();
@@ -734,7 +734,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setProjectingPlanId(plan.id);
     setProjectPlanMessage(null);
     try {
-      const result = await jarvisApi.projectPlanToCalendar(plan.id);
+      const result = await jarvisScheduleApi.projectPlanToCalendar(plan.id);
       const skippedCount = result.skipped?.length ?? 0;
       setProjectPlanMessage(result.projected_count > 0 ? `本次新写入 ${result.projected_count} 个日历项` : `没有新的日历项需要写入${skippedCount ? `，已跳过 ${skippedCount} 项` : ""}`);
       await loadAll();
@@ -824,7 +824,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
 
   useEffect(() => {
     if (!open || !selectedPlan) { setPlanEvents([]); return; }
-    jarvisApi.listPlanEvents(selectedPlan.id).then(setPlanEvents).catch(() => setPlanEvents([]));
+    jarvisScheduleApi.listPlanEvents(selectedPlan.id).then(setPlanEvents).catch(() => setPlanEvents([]));
   }, [open, selectedPlan?.id]);
 
   if (!open) return null;
@@ -841,7 +841,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
   };
   const savePlanDayEdit = async () => {
     if (!editingPlanDay) return;
-    await jarvisApi.updatePlanDay(editingPlanDay.id, {
+    await jarvisScheduleApi.updatePlanDay(editingPlanDay.id, {
       plan_date: planDayForm.date,
       start_time: planDayForm.startTime || null,
       end_time: planDayForm.endTime || null,

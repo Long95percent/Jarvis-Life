@@ -1,6 +1,10 @@
 ﻿import React, { useEffect, useRef, useState } from "react";
 import { useJarvisStore } from "@/stores/jarvisStore";
 import { jarvisApi, type ActionResult, type BehaviorEventType, type EscalationHint } from "@/services/jarvisApi";
+import { jarvisConversationApi } from "@/services/jarvisConversationApi";
+import { jarvisPendingActionApi } from "@/services/jarvisPendingActionApi";
+import { jarvisScheduleApi } from "@/services/jarvisScheduleApi";
+import { jarvisCareApi } from "@/services/jarvisCareApi";
 import { JARVIS_CONVERSATION_HISTORY_CHANGED } from "./ConversationHistoryPanel";
 import { CareCard } from "./CareCard";
 
@@ -260,7 +264,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
 
   const saveAndClose = async () => {
     if (agent) {
-      await jarvisApi.saveConversationHistory({
+      await jarvisConversationApi.saveConversationHistory({
         conversation_id: `private:${sessionId}:${agentId}`,
         conversation_type: "private_chat",
         title: `${agent.name} 私聊`,
@@ -327,13 +331,13 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
       };
 
       try {
-        await jarvisApi.confirmPendingAction(String(pendingId), {
+        await jarvisPendingActionApi.confirmPendingAction(String(pendingId), {
           title,
           arguments: calendarPayload,
         });
       } catch (error) {
         if (!isHttpStatus(error, 404)) throw error;
-        await jarvisApi.addCalendarEvent({
+        await jarvisScheduleApi.addCalendarEvent({
           ...calendarPayload,
           source: "agent_card_fallback",
           status: "confirmed",
@@ -397,7 +401,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     setConfirmationErrors((prev) => ({ ...prev, [key]: "" }));
     setConfirmationMessages((prev) => ({ ...prev, [key]: "" }));
     try {
-      const result = await jarvisApi.confirmPendingAction(String(pendingId), {
+      const result = await jarvisPendingActionApi.confirmPendingAction(String(pendingId), {
         title: toText(action.arguments?.title, "后台任务计划"),
         arguments: buildTaskPlanArguments(action, key),
       });
@@ -424,7 +428,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     try {
       if (proactiveId) {
         const feedback = nextState === "snoozed" ? "snooze" : nextState === "read" ? "handled" : nextState;
-        await jarvisApi.sendCareFeedback(proactiveId, {
+        await jarvisCareApi.sendCareFeedback(proactiveId, {
           feedback: feedback as "helpful" | "too_frequent" | "not_needed" | "snooze" | "handled",
           snooze_minutes: nextState === "snoozed" ? 120 : undefined,
         });
@@ -575,7 +579,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
               </button>
               <button
                 className="px-3 py-1.5 rounded-lg border border-amber-200 bg-white text-amber-700 hover:bg-amber-100"
-                onClick={async () => { const pendingId = action.pending_action_id ?? action.confirmation_id; if (pendingId) await jarvisApi.cancelPendingAction(String(pendingId)); setConfirmations((prev) => ({ ...prev, [key]: "cancelled" })); }}
+                onClick={async () => { const pendingId = action.pending_action_id ?? action.confirmation_id; if (pendingId) await jarvisPendingActionApi.cancelPendingAction(String(pendingId)); setConfirmations((prev) => ({ ...prev, [key]: "cancelled" })); }}
               >
                 取消
               </button>
@@ -640,7 +644,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
               </button>
               <button
                 className="px-3 py-1.5 rounded-lg border border-blue-200 bg-white text-blue-700 hover:bg-blue-100"
-                onClick={async () => { const pendingId = action.pending_action_id ?? action.confirmation_id; if (pendingId) await jarvisApi.cancelPendingAction(String(pendingId)); setConfirmations((prev) => ({ ...prev, [key]: "cancelled" })); }}
+                onClick={async () => { const pendingId = action.pending_action_id ?? action.confirmation_id; if (pendingId) await jarvisPendingActionApi.cancelPendingAction(String(pendingId)); setConfirmations((prev) => ({ ...prev, [key]: "cancelled" })); }}
               >
                 取消
               </button>

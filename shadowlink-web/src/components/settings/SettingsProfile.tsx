@@ -9,6 +9,7 @@
 
 import { useEffect, useState, type KeyboardEvent } from 'react'
 import { Check, Loader2, MapPin, X } from 'lucide-react'
+import { jarvisSettingsApi } from '@/services/jarvisSettingsApi'
 
 interface Location {
   lat: number
@@ -77,9 +78,7 @@ export function SettingsProfile() {
     let alive = true
     ;(async () => {
       try {
-        const res = await fetch('/api/v1/jarvis/profile')
-        if (!res.ok) throw new Error(`HTTP ${res.status}`)
-        const data = await res.json()
+        const data = await jarvisSettingsApi.getProfile()
         if (alive) {
           setProfile({
             ...EMPTY_PROFILE,
