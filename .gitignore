@@ -87,9 +87,12 @@ shadowlink-ai/data/api_keys.json
 
 # ============ AI Models / Indexes ============
 models/
+!shadowlink-ai/app/models/
+!shadowlink-ai/app/models/**
+shadowlink-ai/app/models/__pycache__/
+shadowlink-ai/app/models/**/*.pyc
 rag_indexes/
 Ollama/
-shadowlink-ai/app/models/
 
 # ============ Secrets / Local Config ============
 .env
