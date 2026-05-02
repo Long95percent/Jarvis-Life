@@ -2742,34 +2742,14 @@ async def stream_proactive_messages() -> EventSourceResponse:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-class RoundtableStartRequest(BaseModel):
-    scenario_id: str
-    user_input: str = ""
-    session_id: str
-    mode_id: str = "general"
-    source_session_id: str | None = None
-    source_agent_id: str | None = None
-
-
-class RoundtableAcceptRequest(BaseModel):
-    result_id: str | None = None
-    note: str | None = None
-
-
-class RoundtableReturnRequest(BaseModel):
-    result_id: str | None = None
-    user_choice: str | None = None
-    note: str | None = None
-
-
-class RoundtableSaveRequest(BaseModel):
-    result_id: str | None = None
-    note: str | None = None
-
-
-class RoundtablePlanRequest(BaseModel):
-    result_id: str | None = None
-    note: str | None = None
+from app.api.v1.jarvis.roundtable.schemas import (
+    RoundtableAcceptRequest,
+    RoundtableContinueRequest,
+    RoundtablePlanRequest,
+    RoundtableReturnRequest,
+    RoundtableSaveRequest,
+    RoundtableStartRequest,
+)
 
 
 @router.get("/scenarios")
@@ -2959,7 +2939,6 @@ def _build_decision_result(session_id: str, scenario_id: str, user_input: str, t
     }
 
 
-@router.post("/roundtable/start")
 async def start_roundtable(
     req: RoundtableStartRequest,
     llm_client=Depends(get_llm_client),
@@ -3113,12 +3092,7 @@ async def start_roundtable(
 # ──────────────────────────────────────────────────────────────────────────
 
 
-class RoundtableContinueRequest(BaseModel):
-    session_id: str
-    user_message: str
 
-
-@router.post("/roundtable/continue")
 async def continue_roundtable(
     req: RoundtableContinueRequest,
     llm_client=Depends(get_llm_client),
@@ -3205,7 +3179,6 @@ async def continue_roundtable(
     )
 
 
-@router.get("/roundtable/{session_id}/decision-result")
 async def get_roundtable_decision_result(session_id: str) -> dict[str, Any]:
     from app.jarvis.persistence import get_latest_roundtable_result
 
@@ -3227,7 +3200,6 @@ def _public_brainstorm_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@router.get("/roundtable/{session_id}/brainstorm-result")
 async def get_roundtable_brainstorm_result(session_id: str) -> dict[str, Any]:
     from app.jarvis.persistence import get_latest_roundtable_result
 
@@ -3237,7 +3209,6 @@ async def get_roundtable_brainstorm_result(session_id: str) -> dict[str, Any]:
     return _public_brainstorm_result(result)
 
 
-@router.post("/roundtable/{session_id}/accept")
 async def accept_roundtable_decision(session_id: str, req: RoundtableAcceptRequest) -> dict[str, Any]:
     from uuid import uuid4
 
@@ -3289,7 +3260,6 @@ async def accept_roundtable_decision(session_id: str, req: RoundtableAcceptReque
     return {"result": updated_result, "pending_action": pending, "direct_calendar_mutation": False}
 
 
-@router.post("/roundtable/{session_id}/save")
 async def save_roundtable_brainstorm_memory(session_id: str, req: RoundtableSaveRequest) -> dict[str, Any]:
     from app.jarvis.persistence import get_latest_roundtable_result, get_roundtable_result, save_jarvis_memory, save_roundtable_result
 
@@ -3337,7 +3307,6 @@ async def save_roundtable_brainstorm_memory(session_id: str, req: RoundtableSave
     return {"result": _public_brainstorm_result(updated), "memory": memory, "direct_calendar_mutation": False, "direct_plan_mutation": False}
 
 
-@router.post("/roundtable/{session_id}/plan")
 async def convert_roundtable_brainstorm_to_plan(session_id: str, req: RoundtablePlanRequest) -> dict[str, Any]:
     from uuid import uuid4
 
@@ -3401,7 +3370,6 @@ async def convert_roundtable_brainstorm_to_plan(session_id: str, req: Roundtable
     return {"result": _public_brainstorm_result(updated), "pending_action": pending, "direct_calendar_mutation": False, "direct_plan_mutation": False}
 
 
-@router.post("/roundtable/{session_id}/return")
 async def return_roundtable_to_private_chat(session_id: str, req: RoundtableReturnRequest) -> dict[str, Any]:
     from app.jarvis.persistence import (
         get_latest_roundtable_result,
@@ -4280,3 +4248,4 @@ async def get_past_session_turns(session_id: str) -> list[dict[str, Any]]:
     """Return the full transcript for a past session (oldest turn first)."""
     from app.jarvis.persistence import get_session_turns
     return await get_session_turns(session_id)
+
