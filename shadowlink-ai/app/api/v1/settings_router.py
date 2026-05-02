@@ -14,6 +14,14 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.core.dependencies import get_resource, set_resource
+from app.jarvis.api_key_store import (
+    EXTERNAL_API_KEYS,
+    delete_external_api_key_value,
+    external_api_key_entry,
+    get_external_api_key_value,
+    load_external_api_keys,
+    save_external_api_key_value,
+)
 from app.models.common import Result
 
 logger = structlog.get_logger("api.settings")
@@ -173,9 +181,39 @@ class LLMSettingsUpdate(BaseModel):
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 
 
+class ExternalApiKeyUpdate(BaseModel):
+    api_key: str = Field(min_length=1)
+
+
 def _looks_like_ui_error(value: str | None) -> bool:
     text = (value or "").strip().lower()
     return text.startswith("error:") or ("provider " in text and " not found" in text)
+
+
+# ── External API Key endpoints ───────────────────────────────────
+
+@router.get("/api-keys")
+def list_external_api_keys() -> Result[dict]:
+    keys = load_external_api_keys()
+    return Result.ok(data={"keys": [external_api_key_entry(key_id, keys.get(key_id, "")) for key_id in EXTERNAL_API_KEYS]})
+
+
+@router.put("/api-keys/{key_id}")
+def save_external_api_key(key_id: str, update: ExternalApiKeyUpdate) -> Result[dict]:
+    if key_id not in EXTERNAL_API_KEYS:
+        return Result.fail(code=404, message=f"API key '{key_id}' not supported")
+    api_key = update.api_key.strip()
+    if not api_key:
+        return Result.fail(code=400, message="API key is required")
+    return Result.ok(data=save_external_api_key_value(key_id, api_key))
+
+
+@router.delete("/api-keys/{key_id}")
+def delete_external_api_key(key_id: str) -> Result[None]:
+    if key_id not in EXTERNAL_API_KEYS:
+        return Result.ok(message="API key already deleted")
+    delete_external_api_key_value(key_id)
+    return Result.ok(message="API key deleted")
 
 
 # ── Provider CRUD endpoints ──────────────────────────────────────

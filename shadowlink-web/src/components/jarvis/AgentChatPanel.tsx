@@ -22,6 +22,14 @@ declare global {
 type ConfirmationState = "confirmed" | "cancelled";
 type CareActionState = "read" | "dismissed" | "snoozed" | "helpful" | "too_frequent" | "not_needed" | "handled" | string;
 
+const CHAT_PROGRESS_STEPS = [
+  "正在理解你的请求…",
+  "正在判断是否需要查看日程或调用工具…",
+  "正在检查相关上下文和日程冲突…",
+  "正在让秘书整理执行结果…",
+  "正在生成最终回复…",
+];
+
 interface TaskPlanFormState {
   goal?: string;
   targetDate?: string;
@@ -103,6 +111,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
 
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [progressStep, setProgressStep] = useState(0);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [escalation, setEscalation] = useState<EscalationHint | null>(null);  const [confirmations, setConfirmations] = useState<Record<string, ConfirmationState>>({});
   const [confirmationErrors, setConfirmationErrors] = useState<Record<string, string>>({});
@@ -112,6 +121,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
   const [confirmingKey, setConfirmingKey] = useState<string | null>(null);
 
   const escalationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const openedAtRef = useRef(Date.now());
   const lastUserMessageRef = useRef("");
   const endRef = useRef<HTMLDivElement>(null);
@@ -138,8 +148,24 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
   useEffect(() => {
     return () => {
       if (escalationTimerRef.current) clearInterval(escalationTimerRef.current);
+      if (progressTimerRef.current) clearInterval(progressTimerRef.current);
     };
   }, []);
+
+  const stopProgressTimer = () => {
+    if (progressTimerRef.current) {
+      clearInterval(progressTimerRef.current);
+      progressTimerRef.current = null;
+    }
+  };
+
+  const startProgressTimer = () => {
+    stopProgressTimer();
+    setProgressStep(0);
+    progressTimerRef.current = setInterval(() => {
+      setProgressStep((current) => Math.min(current + 1, CHAT_PROGRESS_STEPS.length - 1));
+    }, 1800);
+  };
 
   useEffect(() => {
     openedAtRef.current = Date.now();
@@ -250,6 +276,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     const message = input.trim();
     if (!message || sending) return;
     setSending(true);
+    startProgressTimer();
     setInput("");
     handleCancelEscalation();
     lastUserMessageRef.current = message;
@@ -264,7 +291,9 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
         setEscalation(hint);
       }
     } finally {
+      stopProgressTimer();
       setSending(false);
+      setProgressStep(0);
     }
   };
   const confirmCalendarAction = async (action: ActionResult, index: number) => {
@@ -709,10 +738,24 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
         ))}
         {sending && (
           <div className="flex justify-start">
-            <div className="px-4 py-2.5 rounded-2xl text-sm flex items-center gap-1" style={{ backgroundColor: `color-mix(in srgb, ${agent.color} 8%, white)`, border: `1px solid color-mix(in srgb, ${agent.color} 20%, transparent)` }}>
-              <span className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: "0ms" }} />
-              <span className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: "150ms" }} />
-              <span className="w-1.5 h-1.5 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: "300ms" }} />
+            <div className="max-w-[75%] rounded-2xl px-4 py-3 text-sm" style={{ backgroundColor: `color-mix(in srgb, ${agent.color} 8%, white)`, border: `1px solid color-mix(in srgb, ${agent.color} 20%, transparent)` }}>
+              <div className="mb-2 flex items-center gap-2 font-medium text-gray-700">
+                <span className="h-2 w-2 animate-pulse rounded-full" style={{ backgroundColor: agent.color }} />
+                {CHAT_PROGRESS_STEPS[progressStep]}
+              </div>
+              <div className="space-y-1.5 text-xs text-gray-500">
+                {CHAT_PROGRESS_STEPS.slice(0, progressStep + 1).map((step, index) => (
+                  <div key={step} className="flex items-center gap-2">
+                    <span
+                      className="flex h-4 w-4 items-center justify-center rounded-full text-[10px] text-white"
+                      style={{ backgroundColor: index === progressStep ? agent.color : `color-mix(in srgb, ${agent.color} 55%, white)` }}
+                    >
+                      {index < progressStep ? "✓" : "…"}
+                    </span>
+                    <span>{step}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         )}

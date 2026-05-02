@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from uuid import uuid4
 
@@ -293,7 +294,7 @@ def _build_daily_plan(
     target_end: str | None,
 ) -> list[dict]:
     start_dt = _parse_plan_date(target_start)
-    start_date = start_dt.date() if start_dt is not None else datetime.utcnow().date()
+    start_date = start_dt.date() if start_dt is not None else datetime.now(ZoneInfo("Asia/Shanghai")).date()
     total_days = _infer_plan_days(user_request, target_start, target_end)
     lowered = user_request.lower()
 
@@ -661,6 +662,8 @@ class JarvisContextSnapshotTool(ShadowLinkTool):
 class JarvisCalendarUpcomingInput(BaseModel):
     hours_ahead: int = Field(default=48, ge=1, le=168, description="How many hours ahead to inspect")
     limit: int = Field(default=10, ge=1, le=20, description="Maximum events to return")
+    start: str | None = Field(default=None, description="Optional ISO8601 window start")
+    end: str | None = Field(default=None, description="Optional ISO8601 window end")
 
 
 class JarvisCalendarUpcomingTool(ShadowLinkTool):
@@ -669,11 +672,16 @@ class JarvisCalendarUpcomingTool(ShadowLinkTool):
     args_schema: type[BaseModel] = JarvisCalendarUpcomingInput
     category: ToolCategory = ToolCategory.SYSTEM
 
-    def _run(self, hours_ahead: int = 48, limit: int = 10) -> list[dict]:
+    def _run(self, hours_ahead: int = 48, limit: int = 10, start: str | None = None, end: str | None = None) -> list[dict]:
         raise NotImplementedError("Use async version")
 
-    async def _arun(self, hours_ahead: int = 48, limit: int = 10) -> list[dict]:
-        events = get_upcoming_events(hours_ahead=hours_ahead)
+    async def _arun(self, hours_ahead: int = 48, limit: int = 10, start: str | None = None, end: str | None = None) -> list[dict]:
+        if start and end:
+            from app.mcp.adapters.calendar_adapter import get_events_between
+
+            events = get_events_between(datetime.fromisoformat(start), datetime.fromisoformat(end))
+        else:
+            events = get_upcoming_events(hours_ahead=hours_ahead)
         return [
             {
                 "id": event.id,
@@ -1222,11 +1230,23 @@ class JarvisTaskPlanDecomposeTool(ShadowLinkTool):
     description: str = (
         "Maxwell-only skill: classify and decompose short/long/future user goals into a background task plan. "
         "For long-term, recurring, exam-prep, travel-prep, or future projects, the returned plan includes daily_plan "
-        "items that can be persisted as one completable task per day after user confirmation."
+        "items that are automatically persisted as editable daily execution items when the user explicitly asks for scheduling."
     )
     args_schema: type[BaseModel] = JarvisTaskPlanDecomposeInput
     category: ToolCategory = ToolCategory.SYSTEM
-    requires_confirmation: bool = True
+    requires_confirmation: bool = False
+
+    @staticmethod
+    def _should_write_to_calendar(text: str) -> bool:
+        return any(marker in text for marker in ["写入日程", "加入日程", "放进日程", "排进日程", "安排学习计划", "帮我安排", "写进日程"])
+
+    @staticmethod
+    def _secretary_intent(text: str) -> str:
+        if any(marker in text for marker in ["重排", "重新安排", "延期", "没完成", "未完成"]):
+            return "reschedule_plan"
+        if any(marker in text for marker in ["未来", "30天", "30 天", "一个月", "长期", "雅思", "ielts", "考研", "考试"]):
+            return "long_plan"
+        return "short_schedule"
 
     def _run(
         self,
@@ -1249,6 +1269,33 @@ class JarvisTaskPlanDecomposeTool(ShadowLinkTool):
         text = user_request.strip()
         if not text:
             return {"type": "task.plan", "ok": False, "error": "missing user_request"}
+
+        if self._should_write_to_calendar(text):
+            llm_client = _get_llm_client()
+            if llm_client is not None:
+                from app.jarvis.secretary_planning_service import run_secretary_plan_request
+
+                today = (target_start or datetime.utcnow().isoformat())[:10]
+                result = await run_secretary_plan_request(
+                    intent=self._secretary_intent(text),
+                    message=text,
+                    today=today,
+                    llm_client=llm_client,
+                    timezone=None,
+                    auto_project_calendar=True,
+                )
+                return {
+                    "type": "task.plan",
+                    "ok": True,
+                    "pending_background_task": False,
+                    "source": "secretary_planning_service",
+                    "intent": result.get("intent"),
+                    "summary": result.get("summary"),
+                    "plan": result.get("plan"),
+                    "plan_days": result.get("plan_days", []),
+                    "calendar_events": result.get("calendar_events", []),
+                    "daily_plan_count": len(result.get("plan_days", [])),
+                }
 
         lowered = text.lower()
         long_markers = ["雅思", "ielts", "考研", "考试", "一个月", "暑假", "长期", "今年", "旅行", "旅游", "搬家", "作品集"]

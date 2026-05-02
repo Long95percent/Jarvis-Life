@@ -17,6 +17,14 @@ _TOOL_BLOCK_RE = re.compile(
     r"<jarvis-tool>\s*(\{.*?\})\s*</jarvis-tool>",
     re.DOTALL | re.IGNORECASE,
 )
+_MODEL_TOOL_CALL_RE = re.compile(
+    r"<tool_call\s+name=[\"']([^\"']+)[\"']\s*>\s*(\{.*?\})\s*</tool_call>",
+    re.DOTALL | re.IGNORECASE,
+)
+_MODEL_TOOL_CALLS_BLOCK_RE = re.compile(
+    r"<tool_calls>.*?</tool_calls>",
+    re.DOTALL | re.IGNORECASE,
+)
 _LEGACY_ACTION_BLOCK_RE = re.compile(
     r"<jarvis-action>\s*(\{.*?\})\s*</jarvis-action>",
     re.DOTALL | re.IGNORECASE,
@@ -55,8 +63,17 @@ def _parse_iso_datetime(raw: Any) -> datetime | None:
     return value
 
 
+def _as_naive_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
 def _timestamp(value: datetime | None) -> float:
-    return value.timestamp() if value is not None else 0.0
+    normalized = _as_naive_utc(value)
+    return normalized.timestamp() if normalized is not None else 0.0
 
 
 def _build_schedule_guard(arguments: dict[str, Any]) -> dict[str, Any] | None:
@@ -77,8 +94,8 @@ def _build_schedule_guard(arguments: dict[str, Any]) -> dict[str, Any] | None:
 
     conflicts: list[dict[str, Any]] = []
     for event in events:
-        event_start = getattr(event, "start", None)
-        event_end = getattr(event, "end", None)
+        event_start = _as_naive_utc(getattr(event, "start", None))
+        event_end = _as_naive_utc(getattr(event, "end", None))
         if event_start is None or event_end is None:
             continue
         if _timestamp(event_end) > _timestamp(start) and _timestamp(event_start) < _timestamp(end):
@@ -95,7 +112,7 @@ def _build_schedule_guard(arguments: dict[str, Any]) -> dict[str, Any] | None:
     sorted_events = sorted(
         [
             item for item in events
-            if getattr(item, "start", None) is not None and getattr(item, "end", None) is not None
+            if _as_naive_utc(getattr(item, "start", None)) is not None and _as_naive_utc(getattr(item, "end", None)) is not None
             and _timestamp(getattr(item, "end")) > _timestamp(window_start)
             and _timestamp(getattr(item, "start")) < _timestamp(window_end)
         ],
@@ -106,11 +123,15 @@ def _build_schedule_guard(arguments: dict[str, Any]) -> dict[str, Any] | None:
     buffer = timedelta(minutes=15)
     required_seconds = duration_minutes * 60
     for event in sorted_events:
-        gap_end = getattr(event, "start") - buffer
+        event_start = _as_naive_utc(getattr(event, "start", None))
+        event_end = _as_naive_utc(getattr(event, "end", None))
+        if event_start is None or event_end is None:
+            continue
+        gap_end = event_start - buffer
         if _timestamp(gap_end) - _timestamp(cursor) >= required_seconds:
             alt_end = cursor + timedelta(minutes=duration_minutes)
             alternatives.append({"start": cursor.isoformat(), "end": alt_end.isoformat()})
-        cursor = max(cursor, getattr(event, "end") + buffer)
+        cursor = max(cursor, event_end + buffer)
         if len(alternatives) >= 3:
             break
     if len(alternatives) < 3 and _timestamp(window_end) - _timestamp(cursor) >= required_seconds:
@@ -220,7 +241,20 @@ def strip_tool_blocks(text: str) -> tuple[str, list[dict[str, Any]]]:
             arguments = {}
         calls.append({"tool_name": tool_name, "arguments": arguments})
 
-    clean_text = _TOOL_BLOCK_RE.sub("", text).strip()
+    for match in _MODEL_TOOL_CALL_RE.finditer(text):
+        tool_name = match.group(1).strip()
+        raw_arguments = match.group(2)
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        if tool_name:
+            calls.append({"tool_name": tool_name, "arguments": arguments})
+
+    clean_text = _TOOL_BLOCK_RE.sub("", text)
+    clean_text = _MODEL_TOOL_CALLS_BLOCK_RE.sub("", clean_text).strip()
     return clean_text, calls
 
 
@@ -423,7 +457,7 @@ def to_action_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }:
             continue
 
-        if item.get("requires_confirmation"):
+        if item.get("requires_confirmation") and tool_name != "jarvis_task_plan_decompose":
             output = item.get("output") if isinstance(item.get("output"), dict) else {}
             arguments = item.get("arguments", {})
             if output:

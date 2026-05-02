@@ -198,7 +198,8 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     }));
     let response;
     try {
-      response = await jarvisApi.chatStream(agentId, message, sessionId);
+      const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      response = await jarvisApi.chatStream(agentId, message, sessionId, browserTimezone);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Jarvis 对话失败：未知错误";
       set((s) => ({

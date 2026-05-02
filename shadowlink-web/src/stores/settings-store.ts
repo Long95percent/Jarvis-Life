@@ -31,6 +31,17 @@ interface ServerProvidersResponse {
   background_id?: string | null
 }
 
+export interface ExternalApiKeyConfig {
+  id: string
+  name: string
+  has_key: boolean
+  api_key_masked: string
+}
+
+interface ExternalApiKeysResponse {
+  keys: ExternalApiKeyConfig[]
+}
+
 function toClient(p: ServerProvider): LLMConfig {
   return {
     id: p.id,
@@ -59,6 +70,7 @@ interface SettingsState {
   activeLlmId: string
   backgroundLlmId: string
   llmConfigs: LLMConfig[]
+  externalApiKeys: ExternalApiKeyConfig[]
   loadingLLM: boolean
   lastError: string | null
 
@@ -72,6 +84,9 @@ interface SettingsState {
   removeLLMConfig: (id: string) => Promise<void>
   setActiveLlmId: (id: string) => Promise<void>
   setBackgroundLlmId: (id: string) => Promise<void>
+  loadExternalApiKeys: () => Promise<void>
+  saveExternalApiKey: (id: string, apiKey: string) => Promise<void>
+  deleteExternalApiKey: (id: string) => Promise<void>
 
   // Local-only preferences
   setLanguage: (lang: string) => void
@@ -117,6 +132,7 @@ export const useSettingsStore = create<SettingsState>()(
       activeLlmId: '',
       backgroundLlmId: '',
       llmConfigs: [],
+      externalApiKeys: [],
       loadingLLM: false,
       lastError: null,
 
@@ -230,6 +246,42 @@ export const useSettingsStore = create<SettingsState>()(
             method: 'POST',
           })
           await get().loadLLMConfigs()
+        } catch (err) {
+          set({ lastError: String(err) })
+          throw err
+        }
+      },
+
+      loadExternalApiKeys: async () => {
+        try {
+          const data = await fetchResult<ExternalApiKeysResponse>('/v1/settings/api-keys')
+          set({ externalApiKeys: data.keys, lastError: null })
+        } catch (err) {
+          set({ lastError: String(err) })
+        }
+      },
+
+      saveExternalApiKey: async (id, apiKey) => {
+        try {
+          await fetchResult(`/v1/settings/api-keys/${id}`, {
+            method: 'PUT',
+            body: JSON.stringify({ api_key: apiKey }),
+          })
+          await get().loadExternalApiKeys()
+        } catch (err) {
+          set({ lastError: String(err) })
+          throw err
+        }
+      },
+
+      deleteExternalApiKey: async (id) => {
+        try {
+          await fetchResult<void>(
+            `/v1/settings/api-keys/${id}`,
+            { method: 'DELETE' },
+            { allowEmptyData: true },
+          )
+          await get().loadExternalApiKeys()
         } catch (err) {
           set({ lastError: String(err) })
           throw err

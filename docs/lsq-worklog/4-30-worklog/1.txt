@@ -1,0 +1,160 @@
+﻿# 2026-05-01 前端工作总结
+
+## 1. 时间 / 定位 / 天气模块前端
+
+### 1.1 浏览器时区透传
+- 修改 `shadowlink-web/src/services/jarvisApi.ts` 和 `shadowlink-web/src/stores/jarvisStore.ts`。
+- Jarvis 聊天与流式聊天请求增加 `browser_timezone`。
+- 前端通过 `Intl.DateTimeFormat().resolvedOptions().timeZone` 获取浏览器时区，并传给后端。
+- 目的：默认 profile 或未手动设置时区时，优先使用用户浏览器所在地时区，避免继续显示东京等默认时区。
+
+### 1.2 个人资料定位链路
+- 修改 `shadowlink-web/src/components/settings/SettingsProfile.tsx` 和 settings store 相关逻辑。
+- 个人资料页点击“获取位置”后，前端读取浏览器经纬度并调用后端解析城市、时区、天气。
+- 修复定位后仍显示固定城市 / current location / 默认经纬度的问题。
+- 设计要求：经纬度、城市名、时区、天气需要一起更新；如果用户手动输入城市，则页面应显示该城市解析后的默认经纬度，而不是历史默认经纬度。
+
+### 1.3 高德 API Key 设置入口
+- 修改 `shadowlink-web/src/components/settings/SettingsLLM.tsx`。
+- 在“设置 - AI 模型”里增加高德地图 API Key 输入、保存、删除能力。
+- 修改 `shadowlink-web/src/stores/settings-store.ts` 和 `shadowlink-web/src/services/jarvisApi.ts`。
+- 前端保存后下次打开仍可读取；点击删除时会调用后端接口删除数据库中的 key。
+- 目的：让用户可以在前端管理地图 API Key，解决国内定位/逆地理编码不可用的问题。
+
+### 1.4 前端验证
+- 多次运行 `cd shadowlink-web; npm.cmd run type-check`。
+- 类型检查通过。
+
+## 2. 日程模块前端修复
+
+### 2.1 日历黑屏问题排查与修复
+- 重点检查 `shadowlink-web/src/components/jarvis/CalendarPanel.tsx`。
+- 早期问题：点击“打开日历”后页面黑屏。
+- 修复方向：不删除复杂业务逻辑，先检查模块代码是否齐全，再定位导致渲染崩溃的点。
+- 后续发现日程模块问题不止黑屏，还包括任务列表、长期计划、冲突、延期、重排等链路混乱。
+
+### 2.2 长期任务在“查看所有任务”中的展示逻辑
+- 修改 `CalendarPanel.tsx` 相关展示逻辑。
+- 目标：像“30 天准备雅思”这样的长期任务，在所有任务面板中只显示长期任务本身。
+- 拆分出来的每日计划日仍进入数据库、今日任务、日历投影，但不应该污染“查看所有任务”。
+- 修复任务仓库混乱、重复显示大量“雅思任务”的问题。
+
+### 2.3 所有任务删除能力
+- 在所有任务面板中增加“删除任务”能力，而不是只能取消。
+- 前端调用对应后端 delete/update API。
+- 目标：用户可以真正清理任务，而不是只把任务改成取消状态。
+
+### 2.4 写入日历按钮语义修复
+- 修改 `CalendarPanel.tsx`。
+- 新增投影状态派生逻辑：
+  - 未写入：显示“写入日历”。
+  - 部分写入：显示“补写入日历”。
+  - 全部写入：显示“已写入日历”，并禁用按钮。
+- 解决长期计划已经自动写入后，前端仍显示“写入日历”导致用户误点的问题。
+
+### 2.5 重复日程错误提示优化
+- 修改 `shadowlink-web/src/services/jarvisApi.ts`。
+- 前端统一解析后端 `duplicate_calendar_event` 结构化错误。
+- 用户看到的提示从原始 HTTP 错误变为可理解文案：已存在同名日程，为避免重复安排，本次没有写入。
+- 删除 / 更新日程也改为复用统一错误解析。
+
+### 2.6 日期 key 运算统一
+- 修改 `CalendarPanel.tsx`。
+- 将单个延期、整体顺延中散落的日期解析逻辑改为统一使用 `localDateFromKey(day.plan_date)`。
+- 避免 `new Date(`${day.plan_date}T00:00:00`)` 在本地日期和时区边界下引发错位。
+
+### 2.7 批量选择交互解耦
+- 修改 `CalendarPanel.tsx`。
+- 问题：每日计划列表整行点击同时承担“查看详情”和“加入批量选择”，容易误操作。
+- 修复：新增 `bulkPlanDaySelectMode`。
+- 普通点击只查看详情；只有点击“批量选择”后才显示复选框并允许批量延期/完成/取消。
+- 目的：把详情查看和批量操作状态拆开，降低误改计划日风险。
+
+### 2.8 前端契约测试
+- 新增 / 修改 `shadowlink-ai/tests/unit/jarvis/test_calendar_frontend_contract.py`。
+- 用后端 pytest 读取前端源码，约束关键前端行为：
+  - 写入日历按钮能反映投影状态。
+  - 重复日程错误能友好展示。
+  - 日期 key 运算不再使用旧的 `new Date(`${day.plan_date}T00:00:00`)`。
+  - 普通点击计划日不触发批量选择。
+
+### 2.9 前端验证
+- 多次运行 `cd shadowlink-web; npm.cmd run type-check`。
+- 类型检查通过。
+- 相关前端契约测试通过。
+
+## 3. 日程模块前端 Demo / 文档工作
+
+### 3.1 Demo 设计文档
+- 编写 `docs/lsq-worklog/4-30-worklog/calendar-module-demo-design.md`。
+- 设计 2-3 个评委展示 demo，覆盖：
+  - 自然语言长期目标到可执行计划。
+  - 计划维护、延期、批量操作。
+  - 冲突处理与 Maxwell 工作台。
+  - Agent 路由和秘书专属 Skill。
+- 文档中补充系统运行链路：用户输入、意图判断、任务拆分、日程写入、重排、延迟能力等。
+- 同时补充客观评测指标。
+
+### 3.2 Demo 前端走查 bug 清单
+- 编写 `docs/lsq-worklog/4-30-worklog/bug/calendar-demo-frontend-e2e-bug-list.md`。
+- 从前端入口模拟用户走查 demo，整理 `CAL-DEMO-FE-001` 到 `CAL-DEMO-FE-010`。
+- 已修复其中部分问题：
+  - `CAL-DEMO-FE-001`：写入日历按钮重复语义。
+  - `CAL-DEMO-FE-010`：重复日程错误提示。
+  - `CAL-DEMO-FE-006`：日期 key 运算残留。
+  - `CAL-DEMO-FE-003`：详情点击与批量选择耦合。
+- `CAL-DEMO-FE-002` Agent 路由可见性按用户要求暂不做。
+
+## 4. 日程模块前端后续重构方向
+
+### 4.1 当前前端体验问题
+- 冲突处理不合理：之前存在“忽略冲突”，不符合真实日程协调逻辑。
+- 延期不合理：前端按钮直接做日期偏移，不能代表秘书式重排。
+- 冲突重排可能把任务改到过去日期，说明前后端缺少硬约束。
+- 前端承担了过多调度决策，导致业务逻辑混乱。
+
+### 4.2 已重新设计方向
+- 编写 `docs/lsq-worklog/4-30-worklog/calendar-module-reschedule-redesign.md`。
+- 新设计：冲突时秘书生成 2-3 个方案，用户选择后再执行。
+- 前端只负责表达意图、展示方案和触发执行。
+- 后端负责确定性校验、proposal 暂存和写库。
+- LLM / Maxwell 负责秘书判断和结构化方案生成，不直接写库。
+
+### 4.3 已编写实施计划
+- 编写 `docs/lsq-worklog/4-30-worklog/calendar-module-reschedule-implementation-plan.md`。
+- 后续前端改造重点：
+  - 移除正式 UI 的“忽略冲突”。
+  - 延期按钮改为“让秘书重排”。
+  - 前端调用 proposal 生成 API，而不是直接写库。
+  - 展示 proposal 方案卡片。
+  - 用户选择方案后调用 apply API。
+
+## 5. 今日前端涉及的主要文件
+
+- `shadowlink-web/src/components/jarvis/CalendarPanel.tsx`
+- `shadowlink-web/src/components/jarvis/DashboardCards.tsx`
+- `shadowlink-web/src/components/settings/SettingsLLM.tsx`
+- `shadowlink-web/src/components/settings/SettingsProfile.tsx`
+- `shadowlink-web/src/services/jarvisApi.ts`
+- `shadowlink-web/src/stores/jarvisStore.ts`
+- `shadowlink-web/src/stores/settings-store.ts`
+
+## 6. 今日前端相关测试 / 验证
+
+- `cd shadowlink-web; npm.cmd run type-check`
+  - 多次运行，结果通过。
+- `python -m pytest shadowlink-ai\tests\unit\jarvis\test_calendar_frontend_contract.py ...`
+  - 覆盖日程前端契约。
+- 部分测试运行时需临时设置：
+  - `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`
+  - 移除 `SSLKEYLOGFILE`
+- 原因：本机 `SSLKEYLOGFILE=D:\sslkey.log` 会导致 pytest 加载网络相关库时触发 `PermissionError`。
+
+## 7. 仍待处理的前端重点
+
+1. 日程前端需要进入 proposal 方案流。
+2. 正式 UI 需要移除“忽略冲突”。
+3. 延期 / 批量延期 / 冲突处理不能再直接改最终日期。
+4. 需要展示秘书生成的 2-3 个重排方案。
+5. 需要让用户选择方案后再写库。
+6. 日程模块还需要继续减少前端业务决策，把调度规则收敛到后端 Guard 和 Maxwell Skill。

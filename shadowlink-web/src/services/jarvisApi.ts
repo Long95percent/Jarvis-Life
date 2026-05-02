@@ -48,6 +48,17 @@ export interface LifeContext {
   source_agent?: string;
 }
 
+export interface JarvisTimeContext {
+  timezone: string;
+  timezone_abbr: string;
+  utc_offset: string;
+  local_iso: string;
+  local_date: string;
+  local_time: string;
+  weekday: string;
+  location_label: string;
+}
+
 export interface JarvisAgent {
   id: string;
   name: string;
@@ -158,9 +169,12 @@ export interface BackgroundTaskDay {
 export interface MaxwellWorkbenchItem {
   id: string;
   task_day_id?: string | null;
+  plan_day_id?: string | null;
+  plan_id?: string | null;
   agent_id: string;
   title: string;
   description?: string | null;
+  plan_date?: string | null;
   due_at?: string | null;
   status: "todo" | "doing" | "done" | "cancelled" | string;
   pushed_at?: number | null;
@@ -228,6 +242,119 @@ export interface JarvisPlanDay {
   reschedule_reason?: string | null;
   created_at: number;
   updated_at: number;
+}
+
+export interface PlanWritePayload {
+  title: string;
+  plan_type?: string;
+  status?: string;
+  original_user_request?: string;
+  goal?: string | null;
+  time_horizon?: Record<string, unknown>;
+  raw_payload?: Record<string, unknown>;
+}
+
+export interface PlannerTaskItem {
+  item_type: "plan" | "background_task" | string;
+  id: string;
+  title: string;
+  status: string;
+  task_type: string;
+  source_agent?: string | null;
+  source_background_task_id?: string | null;
+  original_user_request: string;
+  goal?: string | null;
+  time_horizon: Record<string, unknown>;
+  created_at?: number | null;
+  updated_at?: number | null;
+  payload: Record<string, unknown>;
+}
+
+export interface PlannerTaskCleanupResult {
+  execute: boolean;
+  duplicate_group_count: number;
+  duplicate_task_count: number;
+  deleted_tasks: number;
+  groups: Array<Record<string, unknown>>;
+  deleted_task_ids?: string[];
+}
+
+export interface ProjectPlanCalendarResult {
+  projected_count: number;
+  projected: Array<{ plan_day: JarvisPlanDay; calendar_event: CalendarEvent }>;
+  skipped?: Array<{ id?: string; reason?: string }>;
+}
+
+export interface PlanRescheduleResult {
+  plan_id: string;
+  changed_count: number;
+  changed: Array<Record<string, unknown>>;
+}
+
+export interface PlanMergeResult {
+  source_plan: JarvisPlan;
+  target_plan: JarvisPlan;
+  moved_day_count: number;
+  moved_day_ids: string[];
+}
+
+export interface PlanSplitResult {
+  source_plan: JarvisPlan;
+  new_plan: JarvisPlan;
+  moved_day_count: number;
+  moved_day_ids: string[];
+}
+
+export interface PlanDayBulkUpdateResult {
+  changed_count: number;
+  changed: JarvisPlanDay[];
+  calendar_events: unknown[];
+}
+
+export interface SecretaryPlanRequest {
+  intent: "short_schedule" | "long_plan" | "reschedule_plan" | string;
+  message: string;
+  today?: string | null;
+  plan_id?: string | null;
+  plan_day_ids?: string[];
+  timezone?: string | null;
+  auto_project_calendar?: boolean;
+}
+
+export interface SecretaryPlanResult {
+  intent: string;
+  summary?: string | null;
+  plan?: JarvisPlan | null;
+  plan_days?: JarvisPlan[] | JarvisPlanDay[];
+  changed_count?: number;
+  calendar_events?: unknown[];
+  warnings?: string[];
+}
+
+export interface PlannerDailyMaintenanceResult {
+  routine_id?: string;
+  skipped?: boolean;
+  already_ran?: boolean;
+  today?: string;
+  missed?: {
+    background_task_days?: unknown[];
+    plan_days?: unknown[];
+  };
+  reschedule?: {
+    changed_count?: number;
+    changed?: unknown[];
+    plan_id?: string;
+  } | null;
+  pushed?: unknown[];
+  pushed_count?: number;
+  message?: string;
+}
+
+export interface PlannerOverdueMissedResult {
+  today: string;
+  missed_count: number;
+  background_task_days: BackgroundTaskDay[];
+  plan_days: JarvisPlanDay[];
 }
 
 export interface PlannerCalendarItem {
@@ -417,7 +544,16 @@ async function errorFromResponse(res: Response, fallback: string): Promise<Error
   let detail = fallback;
   try {
     const data = await res.json();
-    if (typeof data?.detail?.message === "string") {
+    if (data?.detail?.code === "duplicate_calendar_event") {
+      const duplicates = Array.isArray(data.detail.duplicates) ? data.detail.duplicates : [];
+      const duplicateTitles = duplicates
+        .map((item: Record<string, unknown>) => typeof item.title === "string" ? item.title : "")
+        .filter(Boolean)
+        .slice(0, 3);
+      detail = duplicateTitles.length > 0
+        ? `已存在同名日程：${duplicateTitles.join("、")}。为避免重复安排，本次没有写入。`
+        : "已存在同名日程。为避免重复安排，本次没有写入。";
+    } else if (typeof data?.detail?.message === "string") {
       detail = data.detail.message;
       if (typeof data.detail.suggestion === "string") detail += `\n建议：${data.detail.suggestion}`;
       if (typeof data.detail.stage === "string") detail += `\n阶段：${data.detail.stage}`;
@@ -496,6 +632,13 @@ export interface RoundtableReturnResponse {
 }
 
 export const jarvisApi = {
+  async getTimeContext(browserTimezone?: string): Promise<JarvisTimeContext> {
+    const query = browserTimezone ? `?browser_timezone=${encodeURIComponent(browserTimezone)}` : "";
+    const res = await fetch(`${BASE}/time/context${query}`);
+    if (!res.ok) throw new Error("Failed to fetch time context");
+    return res.json();
+  },
+
   async getContext(): Promise<LifeContext> {
     const res = await fetch(`${BASE}/context`);
     if (!res.ok) throw new Error("Failed to fetch life context");
@@ -518,11 +661,11 @@ export const jarvisApi = {
     return res.json();
   },
 
-  async chat(agentId: string, message: string, sessionId: string): Promise<ChatResponse> {
+  async chat(agentId: string, message: string, sessionId: string, browserTimezone?: string): Promise<ChatResponse> {
     const res = await fetch(`${BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ agent_id: agentId, message, session_id: sessionId }),
+      body: JSON.stringify({ agent_id: agentId, message, session_id: sessionId, browser_timezone: browserTimezone }),
     });
     if (!res.ok) {
       let detail = `Jarvis chat HTTP ${res.status}`;
@@ -546,13 +689,13 @@ export const jarvisApi = {
     return res.json();
   },
 
-  async chatStream(agentId: string, message: string, sessionId: string): Promise<ChatResponse> {
+  async chatStream(agentId: string, message: string, sessionId: string, browserTimezone?: string): Promise<ChatResponse> {
     const res = await fetch(`${BASE}/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-      body: JSON.stringify({ agent_id: agentId, message, session_id: sessionId }),
+      body: JSON.stringify({ agent_id: agentId, message, session_id: sessionId, browser_timezone: browserTimezone }),
     });
-    if (!res.ok || !res.body) return this.chat(agentId, message, sessionId);
+    if (!res.ok || !res.body) return this.chat(agentId, message, sessionId, browserTimezone);
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -574,7 +717,7 @@ export const jarvisApi = {
         }
       }
     }
-    if (!result) return this.chat(agentId, message, sessionId);
+    if (!result) return this.chat(agentId, message, sessionId, browserTimezone);
     return result;
   },
 
@@ -850,7 +993,7 @@ export const jarvisApi = {
 
   async deleteCalendarEvent(eventId: string): Promise<void> {
     const res = await fetch(`${BASE}/calendar/events/${eventId}`, { method: "DELETE" });
-    if (!res.ok) throw new Error(`delete event HTTP ${res.status}`);
+    if (!res.ok) throw await errorFromResponse(res, `delete event HTTP ${res.status}`);
   },
 
   async updateCalendarEvent(
@@ -874,13 +1017,13 @@ export const jarvisApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),
     });
-    if (!res.ok) throw new Error(`update event HTTP ${res.status}`);
+    if (!res.ok) throw await errorFromResponse(res, `update event HTTP ${res.status}`);
     return res.json();
   },
 
   async listPendingActions(status = "pending"): Promise<PendingAction[]> {
     const res = await fetch(`${BASE}/pending-actions?status=${encodeURIComponent(status)}`);
-    if (!res.ok) return [];
+    if (!res.ok) throw await errorFromResponse(res, `list pending actions HTTP ${res.status}`);
     return res.json();
   },
 
@@ -925,7 +1068,17 @@ export const jarvisApi = {
     if (status) params.set("status", status);
     const suffix = params.toString() ? `?${params.toString()}` : "";
     const res = await fetch(`${BASE}/background-tasks${suffix}`);
-    if (!res.ok) return [];
+    if (!res.ok) throw await errorFromResponse(res, `list background tasks HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async updateBackgroundTask(taskId: string, payload: Partial<Pick<BackgroundTask, "status" | "notes">>): Promise<BackgroundTask> {
+    const res = await fetch(`${BASE}/background-tasks/${taskId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `update background task HTTP ${res.status}`);
     return res.json();
   },
 
@@ -937,12 +1090,12 @@ export const jarvisApi = {
     if (params?.taskId) {
       const suffix = query.toString() ? `?${query.toString()}` : "";
       const res = await fetch(`${BASE}/background-tasks/${params.taskId}/days${suffix}`);
-      if (!res.ok) return [];
+      if (!res.ok) throw await errorFromResponse(res, `list background task days HTTP ${res.status}`);
       return res.json();
     }
     const suffix = query.toString() ? `?${query.toString()}` : "";
     const res = await fetch(`${BASE}/background-task-days${suffix}`);
-    if (!res.ok) return [];
+    if (!res.ok) throw await errorFromResponse(res, `list background task days HTTP ${res.status}`);
     return res.json();
   },
 
@@ -953,12 +1106,59 @@ export const jarvisApi = {
     return data.task_day;
   },
 
+  async deleteBackgroundTaskDay(dayId: string): Promise<BackgroundTaskDay> {
+    const res = await fetch(`${BASE}/background-task-days/${dayId}`, { method: "DELETE" });
+    if (!res.ok) throw await errorFromResponse(res, `delete background task day HTTP ${res.status}`);
+    const data = await res.json();
+    return data.task_day;
+  },
+
   async listPlans(status?: string): Promise<JarvisPlan[]> {
     const query = new URLSearchParams();
     if (status) query.set("status", status);
     const suffix = query.toString() ? `?${query.toString()}` : "";
     const res = await fetch(`${BASE}/plans${suffix}`);
-    if (!res.ok) return [];
+    if (!res.ok) throw await errorFromResponse(res, `list plans HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async createPlan(payload: PlanWritePayload): Promise<JarvisPlan> {
+    const res = await fetch(`${BASE}/plans`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `create plan HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async updatePlan(planId: string, payload: Partial<PlanWritePayload>): Promise<JarvisPlan> {
+    const res = await fetch(`${BASE}/plans/${planId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `update plan HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async mergePlans(payload: { source_plan_id: string; target_plan_id: string; reason?: string | null }): Promise<PlanMergeResult> {
+    const res = await fetch(`${BASE}/plans/merge`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `merge plans HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async splitPlan(planId: string, payload: { title: string; plan_day_ids: string[]; reason?: string | null }): Promise<PlanSplitResult> {
+    const res = await fetch(`${BASE}/plans/${planId}/split`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `split plan HTTP ${res.status}`);
     return res.json();
   },
 
@@ -971,14 +1171,67 @@ export const jarvisApi = {
     if (params?.limit) query.set("limit", String(params.limit));
     const suffix = query.toString() ? `?${query.toString()}` : "";
     const res = await fetch(`${BASE}/plan-days${suffix}`);
-    if (!res.ok) return [];
+    if (!res.ok) throw await errorFromResponse(res, `list plan days HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async listPlannerTasks(status?: string): Promise<PlannerTaskItem[]> {
+    const query = new URLSearchParams();
+    if (status) query.set("status", status);
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const res = await fetch(`${BASE}/planner/tasks${suffix}`);
+    if (!res.ok) throw await errorFromResponse(res, `list planner tasks HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async cleanupDuplicatePlannerTasks(execute = false): Promise<PlannerTaskCleanupResult> {
+    const query = new URLSearchParams({ execute: String(execute) });
+    const res = await fetch(`${BASE}/planner/tasks/cleanup-duplicates?${query.toString()}`, { method: "POST" });
+    if (!res.ok) throw await errorFromResponse(res, `cleanup duplicate planner tasks HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async projectPlanToCalendar(planId: string): Promise<ProjectPlanCalendarResult> {
+    const res = await fetch(`${BASE}/plans/${planId}/project-calendar`, { method: "POST" });
+    if (!res.ok) throw await errorFromResponse(res, `project plan to calendar HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async reschedulePlan(planId: string, payload: { reason?: string; days: Array<{ plan_date: string; start_time?: string | null; end_time?: string | null; reason?: string | null }> }): Promise<PlanRescheduleResult> {
+    const res = await fetch(`${BASE}/plans/${planId}/reschedule`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `reschedule plan HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async createSecretaryPlan(payload: SecretaryPlanRequest): Promise<SecretaryPlanResult> {
+    const res = await fetch(`${BASE}/planner/secretary-plan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `create secretary plan HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async runPlannerDailyMaintenanceOnce(params?: { today?: string; auto_reschedule?: boolean; push_today?: boolean }): Promise<PlannerDailyMaintenanceResult> {
+    const query = new URLSearchParams();
+    if (params?.today) query.set("today", params.today);
+    if (typeof params?.auto_reschedule === "boolean") query.set("auto_reschedule", String(params.auto_reschedule));
+    if (typeof params?.push_today === "boolean") query.set("push_today", String(params.push_today));
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const res = await fetch(`${BASE}/planner/daily-maintenance/once${suffix}`, { method: "POST" });
+    if (!res.ok) throw await errorFromResponse(res, `run planner daily maintenance once HTTP ${res.status}`);
     return res.json();
   },
 
   async getPlannerCalendar(range: { start: string; end: string }): Promise<PlannerCalendarResponse> {
     const query = new URLSearchParams({ start: range.start, end: range.end });
     const res = await fetch(`${BASE}/planner/calendar-items?${query.toString()}`);
-    if (!res.ok) return { items: [], conflicts: [], free_windows: [] };
+    if (!res.ok) throw await errorFromResponse(res, `get planner calendar HTTP ${res.status}`);
     const data = await res.json();
     return {
       items: Array.isArray(data?.items) ? data.items : [],
@@ -994,6 +1247,13 @@ export const jarvisApi = {
   async completePlanDay(dayId: string): Promise<JarvisPlanDay> {
     const res = await fetch(`${BASE}/plan-days/${dayId}/complete`, { method: "POST" });
     if (!res.ok) throw await errorFromResponse(res, `complete plan day HTTP ${res.status}`);
+    const data = await res.json();
+    return data.plan_day;
+  },
+
+  async deletePlanDay(dayId: string): Promise<JarvisPlanDay> {
+    const res = await fetch(`${BASE}/plan-days/${dayId}`, { method: "DELETE" });
+    if (!res.ok) throw await errorFromResponse(res, `delete plan day HTTP ${res.status}`);
     const data = await res.json();
     return data.plan_day;
   },
@@ -1020,9 +1280,26 @@ export const jarvisApi = {
     return data.plan_day;
   },
 
+  async bulkUpdatePlanDays(payload: { day_ids: string[]; status?: string | null; shift_days?: number | null; reason?: string | null }): Promise<PlanDayBulkUpdateResult> {
+    const res = await fetch(`${BASE}/plan-days/bulk-update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `bulk update plan days HTTP ${res.status}`);
+    return res.json();
+  },
+
   async cancelPlan(planId: string): Promise<JarvisPlan> {
     const res = await fetch(`${BASE}/plans/${planId}/cancel`, { method: "POST" });
     if (!res.ok) throw await errorFromResponse(res, `cancel plan HTTP ${res.status}`);
+    const data = await res.json();
+    return data.plan;
+  },
+
+  async deletePlan(planId: string): Promise<JarvisPlan> {
+    const res = await fetch(`${BASE}/plans/${planId}`, { method: "DELETE" });
+    if (!res.ok) throw await errorFromResponse(res, `delete plan HTTP ${res.status}`);
     const data = await res.json();
     return data.plan;
   },
@@ -1040,7 +1317,7 @@ export const jarvisApi = {
     if (params?.limit) query.set("limit", String(params.limit));
     const suffix = query.toString() ? `?${query.toString()}` : "";
     const res = await fetch(`${BASE}/maxwell/workbench-items${suffix}`);
-    if (!res.ok) return [];
+    if (!res.ok) throw await errorFromResponse(res, `list maxwell workbench items HTTP ${res.status}`);
     return res.json();
   },
 
@@ -1053,13 +1330,17 @@ export const jarvisApi = {
     return res.json();
   },
 
-  async markOverdueBackgroundTaskDaysMissed(today?: string): Promise<{ today: string; missed_count: number; task_days: BackgroundTaskDay[] }> {
+  async markOverduePlannerDaysMissed(today?: string): Promise<PlannerOverdueMissedResult> {
     const query = new URLSearchParams();
     if (today) query.set("today", today);
     const suffix = query.toString() ? `?${query.toString()}` : "";
-    const res = await fetch(`${BASE}/background-task-days/mark-overdue-missed${suffix}`, { method: "POST" });
-    if (!res.ok) throw await errorFromResponse(res, `mark overdue task days HTTP ${res.status}`);
+    const res = await fetch(`${BASE}/planner/mark-overdue-missed${suffix}`, { method: "POST" });
+    if (!res.ok) throw await errorFromResponse(res, `mark overdue planner days HTTP ${res.status}`);
     return res.json();
+  },
+
+  async markOverdueBackgroundTaskDaysMissed(today?: string): Promise<PlannerOverdueMissedResult> {
+    return this.markOverduePlannerDaysMissed(today);
   },
 
   async startTeamCollaboration(payload: TeamCollaborationRequest): Promise<TeamCollaborationResponse> {

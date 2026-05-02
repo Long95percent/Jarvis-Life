@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { jarvisApi, type JarvisTimeContext } from "@/services/jarvisApi";
 import { useJarvisStore } from "@/stores/jarvisStore";
 
 interface DashboardCardsProps {
@@ -134,7 +135,9 @@ const WeatherCard: React.FC = () => {
 
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const loadWeather = async () => {
+      setLoading(true);
+      setErrorMsg(null);
       try {
         const [lifeRes, profileRes] = await Promise.all([
           fetch("/api/v1/jarvis/local-life"),
@@ -154,9 +157,12 @@ const WeatherCard: React.FC = () => {
       } finally {
         if (!cancelled) setLoading(false);
       }
-    })();
+    };
+    void loadWeather();
+    window.addEventListener("jarvis:profile-updated", loadWeather);
     return () => {
       cancelled = true;
+      window.removeEventListener("jarvis:profile-updated", loadWeather);
     };
   }, []);
 
@@ -194,8 +200,81 @@ const WeatherCard: React.FC = () => {
   );
 };
 
+const TimeCard: React.FC = () => {
+  const [timeContext, setTimeContext] = useState<JarvisTimeContext | null>(null);
+  const [now, setNow] = useState<Date>(new Date());
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    (async () => {
+      try {
+        const data = await jarvisApi.getTimeContext(browserTimezone);
+        if (!cancelled) {
+          setTimeContext(data);
+          setNow(new Date(data.local_iso));
+        }
+      } catch (err) {
+        if (!cancelled) setErrorMsg(String(err));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNow((current) => new Date(current.getTime() + 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const displayTime = timeContext
+    ? new Intl.DateTimeFormat("zh-CN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+        timeZone: timeContext.timezone,
+      }).format(now)
+    : "--:--:--";
+  const displayDate = timeContext
+    ? new Intl.DateTimeFormat("zh-CN", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        weekday: "short",
+        timeZone: timeContext.timezone,
+      }).format(now)
+    : "Loading local time";
+
+  return (
+    <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+      <h3 className="text-sm font-semibold text-gray-700 mb-2">Local Time</h3>
+      {errorMsg ? (
+        <p className="text-xs text-gray-400 py-3 text-center" title={errorMsg}>
+          Time unavailable
+        </p>
+      ) : (
+        <div>
+          <div className="text-2xl font-semibold tabular-nums text-gray-900">{displayTime}</div>
+          <div className="text-xs text-gray-500 mt-1">{displayDate}</div>
+          <div className="text-[11px] text-gray-400 mt-2 truncate">
+            {(timeContext?.location_label || "Auto detected") + " · "}
+            {timeContext?.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone}
+            {timeContext ? ` · UTC${timeContext.utc_offset}` : ""}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const DashboardCards: React.FC<DashboardCardsProps> = ({ onOpenCalendar }) => (
-  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+  <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+    <TimeCard />
     <ScheduleCard onOpenCalendar={onOpenCalendar} />
     <LifeStateCard />
     <WeatherCard />

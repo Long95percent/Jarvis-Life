@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from pydantic import Field
@@ -124,6 +125,26 @@ class _FileProcessingSettings(BaseSettings):
     )
 
 
+class _GeocodingSettings(BaseSettings):
+    """Location lookup provider configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SHADOWLINK_GEOCODING_",
+        env_file=(".env", _PROJECT_ENV_FILE),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    provider: str = Field(default="auto", description="auto | amap | osm")
+    amap_key: str = Field(default="", description="AMap/Gaode Web Service API key")
+    timeout_seconds: float = Field(default=5.0, ge=1.0)
+    osm_enabled: bool = True
+
+    def model_post_init(self, __context: object) -> None:
+        if not self.amap_key:
+            self.amap_key = os.getenv("SHADOWLINK_AMAP_KEY", "").strip()
+
+
 class Settings(BaseSettings):
     """Root application settings, aggregating all sub-settings."""
 
@@ -154,6 +175,7 @@ class Settings(BaseSettings):
     agent: _AgentSettings = Field(default_factory=_AgentSettings)
     memory: _MemorySettings = Field(default_factory=_MemorySettings)
     file_processing: _FileProcessingSettings = Field(default_factory=_FileProcessingSettings)
+    geocoding: _GeocodingSettings = Field(default_factory=_GeocodingSettings)
 
     def model_post_init(self, __context: object) -> None:
         data_path = Path(self.data_dir)

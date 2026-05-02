@@ -82,6 +82,8 @@ data/jarvis_settings.json
 shadowlink-ai/data/jarvis_settings.json
 data/llm_providers.json
 shadowlink-ai/data/llm_providers.json
+data/api_keys.json
+shadowlink-ai/data/api_keys.json
 
 # ============ AI Models / Indexes ============
 models/

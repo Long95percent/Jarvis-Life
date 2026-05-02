@@ -3,7 +3,7 @@
 import asyncio
 import json
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -24,6 +24,13 @@ from app.jarvis.agent_consultation import run_agent_consultations
 from app.jarvis.context_bus import LifeContextBus, get_life_context_bus
 from app.jarvis.memory_extractor import extract_and_save_chat_memories
 from app.jarvis.memory_compactor import maybe_compact_old_raw_memories
+
+
+def _raise_planner_guard_violation(exc: ValueError) -> None:
+    raise HTTPException(
+        status_code=422,
+        detail={"code": "planner_guard_violation", "message": str(exc), "recoverable": True},
+    ) from exc
 from app.jarvis.memory_recall import build_bounded_memory_recall_prefix
 from app.jarvis.preference_learner import build_preference_profile_prefix
 from app.jarvis.intent_router import plan_agent_intent
@@ -32,6 +39,146 @@ from app.llm.background_client import get_background_llm_client
 
 logger = structlog.get_logger("jarvis.api")
 router = APIRouter(prefix="/jarvis", tags=["jarvis"])
+
+
+async def _fetch_weather_for_location(lat: float, lng: float) -> dict[str, Any]:
+    from app.mcp.adapters import weather_adapter
+
+    return await weather_adapter.get_current_weather(latitude=lat, longitude=lng)
+
+
+async def _fetch_browser_location_metadata(lat: float, lng: float) -> dict[str, Any]:
+    from app.jarvis.geocoding import reverse_geocode
+
+    label = ""
+    label_error = ""
+    geocoding: dict[str, Any] = {}
+    try:
+        resolved = await reverse_geocode(lat, lng)
+        if resolved:
+            geocoding = resolved.to_dict()
+            label = resolved.label
+    except Exception as exc:
+        label_error = str(exc)
+        label = ""
+    weather: dict[str, Any] = {}
+    try:
+        weather = await _fetch_weather_for_location(lat, lng)
+    except Exception as exc:
+        weather = {"error": str(exc), "is_good_weather": False}
+    return {"label": label, "label_error": label_error, "weather": weather, "geocoding": geocoding}
+
+
+async def _persist_task_plan_result(
+    *,
+    arguments: dict[str, Any],
+    source_agent: str | None,
+    source_pending_id: str | None = None,
+    confirmed_by_user: bool = False,
+) -> dict[str, Any]:
+    from app.jarvis.persistence import (
+        find_active_background_task_by_identity,
+        get_background_task,
+        list_jarvis_plan_days,
+        save_background_task,
+        save_background_task_days,
+        save_jarvis_plan,
+    )
+
+    plan = arguments.get("plan") if isinstance(arguments.get("plan"), dict) else arguments
+    task_title = str(plan.get("title") or arguments.get("title") or "后台任务")
+    raw_task_type = str(plan.get("type") or arguments.get("classification") or "long_project")
+    task_type = "long_project" if raw_task_type in {"future_project", "recurring_plan"} else raw_task_type
+    original_user_request = str(plan.get("original_user_request") or arguments.get("user_request") or "")
+    goal = str(plan.get("goal") or plan.get("title") or task_title)
+    existing_task = await find_active_background_task_by_identity(
+        title=task_title,
+        task_type=task_type,
+        goal=goal,
+        original_user_request=original_user_request,
+    )
+    fallback_id = source_pending_id or str(plan.get("id") or arguments.get("task_id") or f"task_{int(time.time() * 1000)}")
+    task_id = str((existing_task or {}).get("id") or plan.get("id") or arguments.get("task_id") or fallback_id)
+    user_filled_fields = plan.get("user_filled_fields") if isinstance(plan.get("user_filled_fields"), dict) else arguments.get("user_filled_fields")
+    notes = "用户确认了 Maxwell 的长期/后台任务拆解计划" if confirmed_by_user else "Maxwell 自动写入长期/后台任务拆解计划"
+    if isinstance(user_filled_fields, dict) and user_filled_fields:
+        filled_parts = [f"{key}={value}" for key, value in user_filled_fields.items() if value]
+        if filled_parts:
+            notes = f"{notes}；用户补充：" + "；".join(filled_parts)
+    await save_background_task(
+        task_id=task_id,
+        title=task_title,
+        task_type=task_type,
+        status="active",
+        source_agent=plan.get("source_agent") if isinstance(plan.get("source_agent"), str) else source_agent,
+        original_user_request=original_user_request,
+        goal=goal,
+        time_horizon=plan.get("time_horizon") if isinstance(plan.get("time_horizon"), dict) else {},
+        milestones=plan.get("milestones") if isinstance(plan.get("milestones"), list) else [],
+        subtasks=plan.get("subtasks") if isinstance(plan.get("subtasks"), list) else [],
+        calendar_candidates=plan.get("calendar_candidates") if isinstance(plan.get("calendar_candidates"), list) else [],
+        notes=notes,
+    )
+    persisted_task = await get_background_task(task_id)
+    if persisted_task is None:
+        raise HTTPException(status_code=500, detail=f"后台任务 {task_id!r} 保存后回读失败：请检查 jarvis.db/background_tasks 写入。")
+
+    daily_plan = plan.get("daily_plan") if isinstance(plan.get("daily_plan"), list) else []
+    persisted_days = await save_background_task_days(task_id=task_id, daily_plan=daily_plan)
+    if daily_plan and not persisted_days:
+        raise HTTPException(status_code=500, detail=f"后台任务 {task_id!r} 已保存，但每日任务写入失败：请检查 background_task_days 写入。")
+
+    distinct_dates = {str(day.get("date") or day.get("plan_date") or "")[:10] for day in daily_plan if isinstance(day, dict)}
+    plan_type = "short_term" if len(distinct_dates) <= 1 else "long_term"
+    plan_days_payload = []
+    for day in persisted_days:
+        payload = dict(day)
+        payload["source_task_day_id"] = day.get("id")
+        plan_days_payload.append(payload)
+    persisted_plan = await save_jarvis_plan(
+        plan_id=str((f"plan_{task_id}" if existing_task else plan.get("plan_id")) or f"plan_{task_id}"),
+        title=str(plan.get("title") or arguments.get("title") or task_title),
+        plan_type=plan_type,
+        status="active",
+        source_agent=plan.get("source_agent") if isinstance(plan.get("source_agent"), str) else source_agent,
+        source_pending_id=source_pending_id,
+        source_background_task_id=task_id,
+        original_user_request=original_user_request,
+        goal=goal,
+        time_horizon=plan.get("time_horizon") if isinstance(plan.get("time_horizon"), dict) else {},
+        raw_payload=plan,
+        days=plan_days_payload,
+    )
+    saved_plan_days = await list_jarvis_plan_days(plan_id=persisted_plan["id"], limit=2000)
+    projected_calendar = []
+    for plan_day in saved_plan_days:
+        projected = await _project_plan_day_to_calendar(plan_day, source_agent=persisted_plan.get("source_agent"), reason="长期计划自动写入日历")
+        if projected:
+            projected_calendar.append(projected)
+    return {
+        "task": persisted_task,
+        "task_days": persisted_days,
+        "task_day_count": len(persisted_days),
+        "plan": persisted_plan,
+        "plan_day_count": len(plan_days_payload),
+        "calendar_projection_count": len(projected_calendar),
+        "calendar_projection": projected_calendar,
+        "persisted": True,
+    }
+
+
+async def _persist_task_plan_actions(action_results: list[dict[str, Any]], source_agent: str) -> None:
+    for action in action_results:
+        if action.get("type") != "task.plan" or not action.get("ok") or action.get("persisted"):
+            continue
+        try:
+            result = await _persist_task_plan_result(arguments=action, source_agent=source_agent)
+            action.update(result)
+            action["persisted"] = True
+        except Exception as exc:
+            logger.warning("jarvis.chat.task_plan_auto_persist_failed", agent_id=source_agent, error=str(exc))
+            action["ok"] = False
+            action["error"] = f"长期计划自动写入失败：{exc}"
 
 
 async def _save_background_completion_notice(*, kind: str, count: int, source_agent: str) -> None:
@@ -214,6 +361,7 @@ class AgentChatRequest(BaseModel):
     agent_id: str
     message: str
     session_id: str
+    browser_timezone: str | None = None
 
 
 class AgentChatResponse(BaseModel):
@@ -245,6 +393,38 @@ class PendingActionConfirmRequest(BaseModel):
     title: str | None = None
 
 
+class PlanCreateRequest(BaseModel):
+    title: str
+    plan_type: str = "long_term"
+    status: str = "active"
+    original_user_request: str = ""
+    goal: str | None = None
+    time_horizon: dict[str, Any] = Field(default_factory=dict)
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class PlanUpdateRequest(BaseModel):
+    title: str | None = None
+    plan_type: str | None = None
+    status: str | None = None
+    original_user_request: str | None = None
+    goal: str | None = None
+    time_horizon: dict[str, Any] | None = None
+    raw_payload: dict[str, Any] | None = None
+
+
+class PlanMergeRequest(BaseModel):
+    source_plan_id: str
+    target_plan_id: str
+    reason: str | None = None
+
+
+class PlanSplitRequest(BaseModel):
+    title: str
+    plan_day_ids: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class PlanDayUpdateRequest(BaseModel):
     plan_date: str | None = None
     title: str | None = None
@@ -263,9 +443,31 @@ class PlanDayMoveRequest(BaseModel):
     reason: str | None = None
 
 
+class PlanDayBulkUpdateRequest(BaseModel):
+    day_ids: list[str] = Field(default_factory=list)
+    status: str | None = None
+    shift_days: int | None = None
+    reason: str | None = None
+
+
+class BackgroundTaskUpdateRequest(BaseModel):
+    status: str | None = None
+    notes: str | None = None
+
+
 class PlanRescheduleRequest(BaseModel):
     days: list[PlanDayMoveRequest] = Field(default_factory=list)
     reason: str | None = None
+
+
+class SecretaryPlanRequest(BaseModel):
+    intent: str
+    message: str
+    today: str | None = None
+    plan_id: str | None = None
+    plan_day_ids: list[str] = Field(default_factory=list)
+    timezone: str | None = None
+    auto_project_calendar: bool = True
 
 
 
@@ -495,6 +697,22 @@ class ProfilePatchRequest(BaseModel):
     interests: list[str] | None = None
 
 
+class TimeContextRequest(BaseModel):
+    browser_timezone: str | None = None
+
+
+class BrowserLocationRequest(BaseModel):
+    lat: float
+    lng: float
+    browser_timezone: str | None = None
+    current_label: str | None = None
+
+
+class CityLocationRequest(BaseModel):
+    city_name: str
+    browser_timezone: str | None = None
+
+
 class AgentConfigPatchRequest(BaseModel):
     enabled: bool | None = None
     interrupt_budget: int | None = None
@@ -504,6 +722,70 @@ class AgentConfigPatchRequest(BaseModel):
 async def get_user_profile() -> dict[str, Any]:
     from app.jarvis.user_settings import get_settings
     return get_settings().profile.model_dump()
+
+
+@router.get("/time/context")
+async def get_time_context(browser_timezone: str | None = None) -> dict[str, Any]:
+    from app.jarvis.time_context import build_time_context
+
+    try:
+        return build_time_context(browser_timezone=browser_timezone)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/time/context")
+async def post_time_context(req: TimeContextRequest) -> dict[str, Any]:
+    return await get_time_context(browser_timezone=req.browser_timezone)
+
+
+@router.post("/time/browser-location")
+async def suggest_browser_location(req: BrowserLocationRequest) -> dict[str, Any]:
+    from app.jarvis.time_context import suggest_location_from_browser_coordinates
+
+    try:
+        metadata = await _fetch_browser_location_metadata(req.lat, req.lng)
+        result = suggest_location_from_browser_coordinates(
+            lat=req.lat,
+            lng=req.lng,
+            browser_timezone=req.browser_timezone,
+            current_label=req.current_label,
+            reverse_geocode=lambda _lat, _lng: metadata.get("label") or "",
+            label_error=metadata.get("label_error") or None,
+        )
+        result["weather"] = metadata.get("weather") or {}
+        result["geocoding"] = metadata.get("geocoding") or {}
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/time/city-location")
+async def suggest_city_location(req: CityLocationRequest) -> dict[str, Any]:
+    from app.jarvis.time_context import suggest_location_from_city_name
+    from app.jarvis.geocoding import geocode_city
+
+    try:
+        resolved: dict[str, Any] | None = None
+        try:
+            geocoded = await geocode_city(req.city_name)
+            resolved = geocoded.to_dict() if geocoded else None
+        except Exception as exc:
+            logger.warning("jarvis.time.city_geocode_failed", city=req.city_name, error=str(exc))
+            resolved = None
+        result = suggest_location_from_city_name(
+            city_name=req.city_name,
+            browser_timezone=req.browser_timezone,
+            geocode=lambda _city: resolved,
+        )
+        result["geocoding"] = resolved or {}
+        try:
+            result["weather"] = await _fetch_weather_for_location(result["lat"], result["lng"])
+        except Exception as exc:
+            result["weather"] = {"error": str(exc), "is_good_weather": False}
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.patch("/profile")
@@ -895,21 +1177,17 @@ async def chat_with_agent(
         )
         mark_span("consult", consult_started, actions=len(consult_result.actions), prefix_chars=len(consult_result.prompt_prefix))
 
-        from zoneinfo import ZoneInfo
         from app.jarvis.user_settings import get_settings
+        from app.jarvis.time_context import build_time_context, build_time_prompt_line, resolve_timezone
 
-        profile_location = get_settings().profile.location.label or "Asia/Shanghai"
-        try:
-            local_tz = ZoneInfo("Asia/Shanghai")
-            local_now = datetime.now(local_tz)
-            timezone_label = local_now.strftime("%Z") or "Asia/Shanghai"
-        except Exception:
-            local_now = datetime.now(timezone(timedelta(hours=8)))
-            timezone_label = "UTC+08:00"
+        profile = get_settings().profile
+        time_payload = build_time_context(profile=profile, browser_timezone=req.browser_timezone)
+        local_now = datetime.fromisoformat(time_payload["local_iso"])
+        local_tz = resolve_timezone(time_payload["timezone"])
+        local_now = local_now.astimezone(local_tz)
         time_context = (
             "## 当前时间\n"
-            f"本地参考时间: {local_now.strftime('%Y-%m-%d %H:%M:%S')} {timezone_label}\n"
-            f"用户位置标签: {profile_location}\n"
+            f"{build_time_prompt_line(profile=profile, browser_timezone=req.browser_timezone)}"
             "制定今天/明天/几点到几点的计划时，必须参考这个当前时间；不要安排已经过去的时间段。\n\n"
         )
         local_life_started = time.perf_counter()
@@ -924,7 +1202,7 @@ async def chat_with_agent(
         "## 交互规则\n"
         "如需读取最新信息或执行操作，请优先使用你的专属工具包。\n"
         "涉及日程或生活状态的写操作，只能在用户明确要求执行时提出工具调用。\n"
-        "日程新增、修改、删除、完成标记会先生成待确认卡片，用户确认后才会真正写入。\n"
+        "长期计划和明确要求写入的多日计划会自动生成可编辑日程；单次日程修改、删除等高风险操作仍可生成待确认卡片。\n"
         "用户要求规划日程时，应尽量根据当前时间给出开始和结束时间；如果用户没有给时间，请由你先做合理规划，不要强迫用户提供严格格式。\n"
         "如果不需要工具，直接回答。\n\n"
     )
@@ -948,7 +1226,7 @@ async def chat_with_agent(
                 f"提取槽位: {json.dumps(intent_decision.slots, ensure_ascii=False, default=str)}\n\n"
                 f"{format_tool_results(planned_tool_results)}\n\n"
                 "你已经拿到了上面的工具结果。请直接基于结果自然回复用户；"
-                "如果工具结果需要确认，请说明已生成待确认卡片，用户确认后才会写入。\n\n"
+                "如果工具结果已持久化，请直接说明已写入完整计划；只有工具结果明确 pending_confirmation 时才提示用户确认。\n\n"
             )
         elif intent_decision.next_action == "ask_missing_slots":
             missing = "、".join(intent_decision.missing_slots)
@@ -1029,6 +1307,7 @@ async def chat_with_agent(
         except Exception as exc:
             logger.warning("jarvis.chat.mood_care_failed", agent_id=req.agent_id, error=str(exc))
     action_results = [*care_actions, *consult_result.actions, *to_action_results(all_tool_results)]
+    await _persist_task_plan_actions(action_results, routed_agent_id)
     for action in action_results:
         if not action.get("pending_confirmation"):
             continue
@@ -1501,6 +1780,32 @@ async def list_background_task_items(status: str | None = None, limit: int = 50)
     return await list_background_tasks(status=status, limit=limit)
 
 
+@router.patch("/background-tasks/{task_id}")
+async def update_background_task_item(task_id: str, req: BackgroundTaskUpdateRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import hard_delete_background_task, list_jarvis_plan_days, mark_plans_for_background_task, update_background_task
+
+    patch = req.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(status_code=400, detail="No background task fields provided")
+    if "status" in patch and patch["status"] not in {"active", "paused", "completed", "archived", "deleted"}:
+        raise HTTPException(status_code=400, detail="Unsupported background task status")
+    if patch.get("status") == "deleted":
+        deleted = await hard_delete_background_task(task_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"Background task {task_id!r} not found")
+        return deleted
+    updated = await update_background_task(task_id, patch)
+    if not updated:
+        raise HTTPException(status_code=404, detail=f"Background task {task_id!r} not found")
+    if patch.get("status") == "archived":
+        target_status = "cancelled"
+        linked_plans = await mark_plans_for_background_task(task_id, target_status)
+        for plan in linked_plans:
+            for day in await list_jarvis_plan_days(plan_id=str(plan["id"]), limit=2000):
+                _sync_plan_day_calendar_event(day, {"status": target_status})
+    return updated
+
+
 @router.get("/background-tasks/{task_id}/days")
 async def list_background_task_day_items(task_id: str, status: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
     from app.jarvis.persistence import list_background_task_days
@@ -1530,6 +1835,16 @@ async def complete_background_task_day_item(day_id: str) -> dict[str, Any]:
     return {"task_day": updated}
 
 
+@router.delete("/background-task-days/{day_id}")
+async def delete_background_task_day_item(day_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import hard_delete_background_task_day
+
+    updated = await hard_delete_background_task_day(day_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Background task day {day_id!r} not found")
+    return {"task_day": updated}
+
+
 @router.get("/maxwell/workbench-items")
 async def list_maxwell_workbench_items(
     status: str | None = None,
@@ -1543,22 +1858,20 @@ async def list_maxwell_workbench_items(
 
 @router.post("/maxwell/workbench/push-daily-tasks")
 async def push_maxwell_daily_tasks(plan_date: str | None = None) -> dict[str, Any]:
-    from zoneinfo import ZoneInfo
-
+    from app.jarvis.time_context import build_time_context
     from app.jarvis.persistence import push_planner_days_to_workbench
 
-    effective_date = plan_date or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    effective_date = plan_date or build_time_context()["local_date"]
     items = await push_planner_days_to_workbench(effective_date)
     return {"plan_date": effective_date[:10], "pushed_count": len(items), "items": items}
 
 
 @router.post("/background-task-days/mark-overdue-missed")
 async def mark_overdue_background_task_day_items(today: str | None = None) -> dict[str, Any]:
-    from zoneinfo import ZoneInfo
-
+    from app.jarvis.time_context import build_time_context
     from app.jarvis.persistence import mark_overdue_planner_days_missed
 
-    effective_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    effective_today = today or build_time_context()["local_date"]
     missed = await mark_overdue_planner_days_missed(effective_today)
     total = len(missed["background_task_days"]) + len(missed["plan_days"])
     return {"today": effective_today[:10], "missed_count": total, **missed}
@@ -1580,11 +1893,10 @@ async def run_planner_daily_maintenance_item(
     push_today: bool = True,
     llm_client: Any = Depends(get_llm_client),
 ) -> dict[str, Any]:
-    from zoneinfo import ZoneInfo
-
+    from app.jarvis.time_context import build_time_context
     from app.jarvis.planner_maintenance import run_planner_daily_maintenance
 
-    effective_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    effective_today = today or build_time_context()["local_date"]
     return await run_planner_daily_maintenance(
         today=effective_today,
         llm_client=llm_client,
@@ -1600,11 +1912,10 @@ async def run_planner_daily_maintenance_once_item(
     push_today: bool = True,
     llm_client: Any = Depends(get_llm_client),
 ) -> dict[str, Any]:
-    from zoneinfo import ZoneInfo
-
+    from app.jarvis.time_context import build_time_context
     from app.jarvis.planner_maintenance import run_planner_daily_maintenance_once
 
-    effective_today = today or datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+    effective_today = today or build_time_context()["local_date"]
     return await run_planner_daily_maintenance_once(
         today=effective_today,
         llm_client=llm_client,
@@ -1623,55 +1934,22 @@ def _combine_plan_day_datetime(plan_day: dict[str, Any], time_value: str | None,
 
 
 def _sync_plan_day_calendar_event(plan_day: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any] | None:
-    calendar_event_id = plan_day.get("calendar_event_id")
-    if not isinstance(calendar_event_id, str) or not calendar_event_id:
-        return None
-    from app.mcp.adapters.calendar_adapter import get_event, update_event
+    from app.jarvis.planner_calendar_projection import sync_plan_day_calendar_event
 
-    existing = get_event(calendar_event_id)
-    event_patch: dict[str, Any] = {}
-    if "title" in patch:
-        event_patch["title"] = plan_day.get("title")
-    if "description" in patch:
-        event_patch["notes"] = plan_day.get("description")
-    if "status" in patch:
-        event_patch["status"] = "cancelled" if plan_day.get("status") == "cancelled" else "confirmed"
-    if any(key in patch for key in ("plan_date", "start_time", "end_time")):
-        start_dt = _combine_plan_day_datetime(plan_day, plan_day.get("start_time"), existing.start if existing else None)
-        end_dt = _combine_plan_day_datetime(plan_day, plan_day.get("end_time"), existing.end if existing else None)
-        if start_dt is not None:
-            event_patch["start"] = start_dt
-        if end_dt is not None:
-            event_patch["end"] = end_dt
-    if not event_patch:
-        return existing.model_dump() if existing else None
-    updated = update_event(calendar_event_id, **event_patch)
-    return updated.model_dump() if updated else None
+    return sync_plan_day_calendar_event(plan_day, patch)
 
 
 
 def _plan_day_has_time(day: dict[str, Any]) -> bool:
-    return bool(day.get("plan_date") and day.get("start_time") and day.get("end_time"))
+    from app.jarvis.planner_calendar_projection import plan_day_has_projectable_time
+
+    return plan_day_has_projectable_time(day)
 
 
 async def _project_plan_day_to_calendar(day: dict[str, Any], *, source_agent: str | None = None, reason: str = "?? day ?????") -> dict[str, Any] | None:
-    if day.get("calendar_event_id") or not _plan_day_has_time(day):
-        return None
-    event_req = CalendarEventRequest(
-        title=str(day.get("title") or "????"),
-        start=datetime.fromisoformat(f"{str(day['plan_date'])[:10]}T{str(day['start_time'])[:5]}:00"),
-        end=datetime.fromisoformat(f"{str(day['plan_date'])[:10]}T{str(day['end_time'])[:5]}:00"),
-        stress_weight=1.0,
-        notes=day.get("description") if isinstance(day.get("description"), str) else None,
-        source="planner_projection",
-        source_agent=source_agent,
-        created_reason=reason,
-        status="confirmed",
-    )
-    result = await add_calendar_event(event_req)
-    from app.jarvis.persistence import update_jarvis_plan_day
-    updated = await update_jarvis_plan_day(day["id"], {"calendar_event_id": result["event_id"], "status": day.get("status") or "scheduled"}, event_type="calendar.changed")
-    return {"event": result["event"], "plan_day": updated}
+    from app.jarvis.planner_calendar_projection import project_plan_day_to_calendar
+
+    return await project_plan_day_to_calendar(day, source_agent=source_agent, reason=reason)
 
 @router.get("/plans")
 async def list_plan_items(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
@@ -1680,11 +1958,132 @@ async def list_plan_items(status: str | None = None, limit: int = 100) -> list[d
     return await list_jarvis_plans(status=status, limit=limit)
 
 
+@router.post("/plans")
+async def create_plan_item(req: PlanCreateRequest) -> dict[str, Any]:
+    from uuid import uuid4
+
+    from app.jarvis.persistence import save_jarvis_plan
+
+    title = req.title.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Plan title is required")
+    return await save_jarvis_plan(
+        plan_id=f"plan_manual_{uuid4().hex}",
+        title=title,
+        plan_type=req.plan_type or "long_term",
+        status=req.status or "active",
+        source_agent="user_ui",
+        original_user_request=req.original_user_request or title,
+        goal=req.goal,
+        time_horizon=req.time_horizon,
+        raw_payload={**req.raw_payload, "source": "manual_plan_form"},
+        days=None,
+    )
+
+
+@router.patch("/plans/{plan_id}")
+async def update_plan_item(plan_id: str, req: PlanUpdateRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import update_jarvis_plan
+
+    patch = req.model_dump(exclude_unset=True)
+    if "title" in patch:
+        patch["title"] = str(patch["title"]).strip()
+        if not patch["title"]:
+            raise HTTPException(status_code=400, detail="Plan title is required")
+    updated = await update_jarvis_plan(plan_id, patch)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    return updated
+
+
+@router.post("/plans/merge")
+async def merge_plan_items(req: PlanMergeRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import merge_jarvis_plans
+
+    result = await merge_jarvis_plans(req.source_plan_id, req.target_plan_id, req.reason)
+    if not result:
+        raise HTTPException(status_code=400, detail="Unable to merge plans")
+    return result
+
+
+@router.post("/plans/{plan_id}/split")
+async def split_plan_item(plan_id: str, req: PlanSplitRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import split_jarvis_plan
+
+    result = await split_jarvis_plan(plan_id, title=req.title, plan_day_ids=req.plan_day_ids, reason=req.reason)
+    if not result:
+        raise HTTPException(status_code=400, detail="Unable to split plan")
+    return result
+
+
 @router.get("/plans/{plan_id}/events")
 async def list_plan_agent_events(plan_id: str, event_type: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     from app.jarvis.persistence import list_agent_events
 
     return await list_agent_events(plan_id=plan_id, event_type=event_type, limit=limit)
+
+
+@router.get("/planner/tasks")
+async def list_planner_task_items(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    from app.jarvis.persistence import list_background_tasks, list_jarvis_plans
+
+    plans = await list_jarvis_plans(status=status, limit=limit)
+    linked_task_ids = {plan.get("source_background_task_id") for plan in plans if plan.get("source_background_task_id")}
+    tasks = [task for task in await list_background_tasks(status=status, limit=limit) if task.get("id") not in linked_task_ids]
+    items: list[dict[str, Any]] = []
+    for plan in plans:
+        items.append({
+            "item_type": "plan",
+            "id": plan["id"],
+            "title": plan["title"],
+            "status": plan["status"],
+            "task_type": plan.get("plan_type") or "long_term",
+            "source_agent": plan.get("source_agent"),
+            "source_background_task_id": plan.get("source_background_task_id"),
+            "original_user_request": plan.get("original_user_request") or "",
+            "goal": plan.get("goal"),
+            "time_horizon": plan.get("time_horizon") if isinstance(plan.get("time_horizon"), dict) else {},
+            "created_at": plan.get("created_at"),
+            "updated_at": plan.get("updated_at"),
+            "payload": plan,
+        })
+    for task in tasks:
+        items.append({
+            "item_type": "background_task",
+            "id": task["id"],
+            "title": task["title"],
+            "status": task["status"],
+            "task_type": task.get("task_type") or "background_task",
+            "source_agent": task.get("source_agent"),
+            "source_background_task_id": None,
+            "original_user_request": task.get("original_user_request") or "",
+            "goal": task.get("goal"),
+            "time_horizon": task.get("time_horizon") if isinstance(task.get("time_horizon"), dict) else {},
+            "created_at": task.get("created_at"),
+            "updated_at": task.get("updated_at"),
+            "payload": task,
+        })
+    return sorted(
+        items,
+        key=lambda item: (0 if item.get("item_type") == "plan" else 1, -float(item.get("updated_at") or 0)),
+    )[:limit]
+
+
+@router.post("/planner/tasks/cleanup-duplicates")
+async def cleanup_duplicate_planner_tasks(execute: bool = False) -> dict[str, Any]:
+    from app.jarvis.persistence import cleanup_duplicate_background_tasks, preview_duplicate_background_tasks
+
+    preview = await preview_duplicate_background_tasks()
+    if not execute:
+        return {"execute": False, "deleted_tasks": 0, **preview}
+    result = await cleanup_duplicate_background_tasks()
+    return {
+        "execute": True,
+        "duplicate_group_count": preview.get("duplicate_group_count", 0),
+        "duplicate_task_count": preview.get("duplicate_task_count", 0),
+        "groups": preview.get("groups", []),
+        **result,
+    }
 
 
 @router.get("/plan-days")
@@ -1716,12 +2115,63 @@ def _item_start_end(item: dict[str, Any]) -> tuple[datetime | None, datetime | N
     return None, None
 
 
+def _as_naive_local(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone().replace(tzinfo=None)
+
+
+def _normalize_event_title(title: str) -> str:
+    return "".join(ch.lower() for ch in title.strip() if not ch.isspace() and ch not in "，,。.!！?？:：；;")
+
+
+def _calendar_event_time_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+    left_start = _as_naive_local(a_start)
+    left_end = _as_naive_local(a_end)
+    right_start = _as_naive_local(b_start)
+    right_end = _as_naive_local(b_end)
+    return left_start < right_end and right_start < left_end
+
+
+def _find_duplicate_calendar_events(req: "CalendarEventRequest") -> list[dict[str, Any]]:
+    if req.source == "planner_projection":
+        return []
+    normalized_title = _normalize_event_title(req.title)
+    if not normalized_title:
+        return []
+    from app.mcp.adapters.calendar_adapter import get_events_between
+
+    window_start = _as_naive_local(req.start) - timedelta(days=30)
+    window_end = _as_naive_local(req.end) + timedelta(days=30)
+    duplicates = []
+    for event in get_events_between(window_start, window_end):
+        if event.status in {"deleted", "cancelled"}:
+            continue
+        if _normalize_event_title(event.title) != normalized_title:
+            continue
+        duplicates.append({
+            "id": event.id,
+            "title": event.title,
+            "start": event.start.isoformat(),
+            "end": event.end.isoformat(),
+            "status": event.status,
+            "same_time": _calendar_event_time_overlap(req.start, req.end, event.start, event.end),
+        })
+    return duplicates
+
+
 def _build_planner_conflicts_and_free_windows(items: list[dict[str, Any]], start: datetime, end: datetime) -> dict[str, Any]:
     timed = []
+    window_start = _as_naive_local(start)
+    window_end = _as_naive_local(end)
     for item in items:
         if item.get("status") in {"completed", "cancelled", "deleted"}:
             continue
         start_dt, end_dt = _item_start_end(item)
+        if start_dt is not None:
+            start_dt = _as_naive_local(start_dt)
+        if end_dt is not None:
+            end_dt = _as_naive_local(end_dt)
         if start_dt is None or end_dt is None or end_dt <= start_dt:
             continue
         timed.append({"item": item, "start": start_dt, "end": end_dt})
@@ -1738,14 +2188,14 @@ def _build_planner_conflicts_and_free_windows(items: list[dict[str, Any]], start
                 "reason": "time_overlap",
             })
     free_windows = []
-    cursor = start
+    cursor = window_start
     for row in timed:
         if row["start"] > cursor and (row["start"] - cursor).total_seconds() >= 30 * 60:
             free_windows.append({"start": cursor.isoformat(), "end": row["start"].isoformat(), "minutes": int((row["start"] - cursor).total_seconds() / 60)})
         if row["end"] > cursor:
             cursor = row["end"]
-    if end > cursor and (end - cursor).total_seconds() >= 30 * 60:
-        free_windows.append({"start": cursor.isoformat(), "end": end.isoformat(), "minutes": int((end - cursor).total_seconds() / 60)})
+    if window_end > cursor and (window_end - cursor).total_seconds() >= 30 * 60:
+        free_windows.append({"start": cursor.isoformat(), "end": window_end.isoformat(), "minutes": int((window_end - cursor).total_seconds() / 60)})
     return {"conflicts": conflicts, "free_windows": free_windows}
 
 @router.get("/planner/calendar-items")
@@ -1763,12 +2213,18 @@ async def list_planner_calendar_items(start: datetime, end: datetime) -> dict[st
     plan_items = [
         {"item_type": "plan_day", "id": day["id"], "date": day["plan_date"], "start_time": day.get("start_time"), "end_time": day.get("end_time"), "title": day["title"], "status": day["status"], "plan_id": day["plan_id"], "calendar_event_id": day.get("calendar_event_id"), "payload": day}
         for day in plan_days
+        if not day.get("calendar_event_id")
     ]
     background_days = await list_background_task_days(limit=1000)
+    plan_source_task_day_ids = {
+        str(day.get("source_task_day_id"))
+        for day in plan_days
+        if day.get("source_task_day_id") and day.get("calendar_event_id")
+    }
     background_items = [
         {"item_type": "background_task_day", "id": day["id"], "date": day["plan_date"], "start_time": day.get("start_time"), "end_time": day.get("end_time"), "title": day["title"], "status": day["status"], "task_id": day["task_id"], "calendar_event_id": day.get("calendar_event_id"), "payload": day}
         for day in background_days
-        if start_day <= str(day.get("plan_date") or "")[:10] <= end_day
+        if start_day <= str(day.get("plan_date") or "")[:10] <= end_day and str(day.get("id")) not in plan_source_task_day_ids
     ]
     items = sorted([*events, *plan_items, *background_items], key=lambda item: (item.get("date") or "", item.get("start") or item.get("start_time") or ""))
     availability = _build_planner_conflicts_and_free_windows(items, start, end)
@@ -1781,11 +2237,40 @@ async def get_planner_availability(start: datetime, end: datetime) -> dict[str, 
     return {"start": calendar["start"], "end": calendar["end"], "conflicts": calendar.get("conflicts", []), "free_windows": calendar.get("free_windows", [])}
 
 
+@router.post("/planner/secretary-plan")
+async def create_secretary_plan(req: SecretaryPlanRequest, llm_client=Depends(get_llm_client)) -> dict[str, Any]:
+    from app.jarvis.secretary_planning_service import run_secretary_plan_request
+
+    today = (req.today or date.today().isoformat())[:10]
+    try:
+        return await run_secretary_plan_request(
+            intent=req.intent,
+            message=req.message,
+            today=today,
+            llm_client=llm_client,
+            plan_id=req.plan_id,
+            plan_day_ids=req.plan_day_ids,
+            timezone=req.timezone,
+            auto_project_calendar=req.auto_project_calendar,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": "secretary_plan_failed", "message": str(exc), "recoverable": True}) from exc
+
+
 @router.patch("/plan-days/{day_id}")
 async def update_plan_day_item(day_id: str, req: PlanDayUpdateRequest) -> dict[str, Any]:
-    from app.jarvis.persistence import update_jarvis_plan_day
+    from app.jarvis.persistence import list_jarvis_plan_days, update_jarvis_plan_day
+    from app.jarvis.planner_guard import validate_plan_day_move
 
     patch = req.model_dump(exclude_unset=True)
+    if any(key in patch for key in ("plan_date", "start_time", "end_time")):
+        existing = next((day for day in await list_jarvis_plan_days(limit=5000) if day.get("id") == day_id), None)
+        if existing is None:
+            raise HTTPException(status_code=404, detail=f"Plan day {day_id!r} not found")
+        try:
+            validate_plan_day_move(existing, patch, today=date.today().isoformat())
+        except ValueError as exc:
+            _raise_planner_guard_violation(exc)
     updated = await update_jarvis_plan_day(day_id, patch, event_type="plan_day.updated")
     if updated is None:
         raise HTTPException(status_code=404, detail=f"Plan day {day_id!r} not found")
@@ -1805,11 +2290,29 @@ async def complete_plan_day_item(day_id: str) -> dict[str, Any]:
     return {"plan_day": updated, "calendar_event": calendar_event}
 
 
+@router.delete("/plan-days/{day_id}")
+async def delete_plan_day_item(day_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import hard_delete_jarvis_plan_day
+
+    updated = await hard_delete_jarvis_plan_day(day_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"Plan day {day_id!r} not found")
+    return {"plan_day": updated, "calendar_event": None}
+
+
 @router.post("/plan-days/{day_id}/move")
 async def move_plan_day_item(day_id: str, req: PlanDayMoveRequest) -> dict[str, Any]:
-    from app.jarvis.persistence import update_jarvis_plan_day
+    from app.jarvis.persistence import list_jarvis_plan_days, update_jarvis_plan_day
+    from app.jarvis.planner_guard import validate_plan_day_move
 
     patch = {"plan_date": req.plan_date[:10], "start_time": req.start_time, "end_time": req.end_time, "status": "rescheduled", "reschedule_reason": req.reason or "??????/??"}
+    existing = next((day for day in await list_jarvis_plan_days(limit=5000) if day.get("id") == day_id), None)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"Plan day {day_id!r} not found")
+    try:
+        validate_plan_day_move(existing, patch, today=date.today().isoformat())
+    except ValueError as exc:
+        _raise_planner_guard_violation(exc)
     updated = await update_jarvis_plan_day(
         day_id,
         patch,
@@ -1819,6 +2322,49 @@ async def move_plan_day_item(day_id: str, req: PlanDayMoveRequest) -> dict[str, 
         raise HTTPException(status_code=404, detail=f"Plan day {day_id!r} not found")
     calendar_event = _sync_plan_day_calendar_event(updated, patch)
     return {"plan_day": updated, "calendar_event": calendar_event}
+
+
+@router.post("/plan-days/bulk-update")
+async def bulk_update_plan_day_items(req: PlanDayBulkUpdateRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import get_jarvis_plan, list_jarvis_plan_days, record_agent_event, update_jarvis_plan_day
+    from app.jarvis.planner_guard import validate_plan_day_move
+
+    day_ids = [day_id for day_id in dict.fromkeys(req.day_ids) if isinstance(day_id, str) and day_id.strip()]
+    if not day_ids:
+        raise HTTPException(status_code=400, detail="day_ids is required")
+    if req.status is None and req.shift_days is None:
+        raise HTTPException(status_code=400, detail="status or shift_days is required")
+    changed: list[dict[str, Any]] = []
+    calendar_events: list[dict[str, Any]] = []
+    for day_id in day_ids:
+        existing = (await list_jarvis_plan_days(limit=5000))
+        day = next((item for item in existing if item.get("id") == day_id), None)
+        if not day:
+            continue
+        patch: dict[str, Any] = {}
+        if req.status is not None:
+            patch["status"] = req.status
+        if req.shift_days is not None:
+            try:
+                shifted = datetime.fromisoformat(f"{str(day.get('plan_date') or '')[:10]}T00:00:00") + timedelta(days=req.shift_days)
+            except ValueError:
+                continue
+            patch["plan_date"] = shifted.date().isoformat()
+            patch["reschedule_reason"] = req.reason or "batch plan day shift"
+        try:
+            validate_plan_day_move(day, patch, today=date.today().isoformat())
+        except ValueError as exc:
+            _raise_planner_guard_violation(exc)
+        updated = await update_jarvis_plan_day(day_id, patch, event_type="plan_day.bulk_updated")
+        if updated:
+            changed.append(updated)
+            if (event := _sync_plan_day_calendar_event(updated, patch)) is not None:
+                calendar_events.append(event)
+    plan_ids = sorted({str(day.get("plan_id")) for day in changed if day.get("plan_id")})
+    for plan_id in plan_ids:
+        if await get_jarvis_plan(plan_id):
+            await record_agent_event(event_type="plan_day.bulk_updated", agent_id="user_ui", plan_id=plan_id, payload={"day_ids": [day["id"] for day in changed if day.get("plan_id") == plan_id], "status": req.status, "shift_days": req.shift_days, "reason": req.reason})
+    return {"changed_count": len(changed), "changed": changed, "calendar_events": calendar_events}
 
 
 @router.post("/plans/{plan_id}/cancel")
@@ -1835,6 +2381,16 @@ async def cancel_plan_item(plan_id: str) -> dict[str, Any]:
         if (event := _sync_plan_day_calendar_event(day, {"status": "cancelled"})) is not None
     ]
     return {"plan": cancelled, "cancelled_days": days, "calendar_events": synced_events}
+
+
+@router.delete("/plans/{plan_id}")
+async def delete_plan_item(plan_id: str) -> dict[str, Any]:
+    from app.jarvis.persistence import hard_delete_jarvis_plan
+
+    deleted = await hard_delete_jarvis_plan(plan_id)
+    if deleted is None:
+        raise HTTPException(status_code=404, detail=f"Plan {plan_id!r} not found")
+    return {"plan": deleted, "deleted_days": [], "calendar_events": []}
 
 
 @router.post("/plans/{plan_id}/project-calendar")
@@ -1862,6 +2418,7 @@ async def project_plan_calendar_items(plan_id: str) -> dict[str, Any]:
 @router.post("/plans/{plan_id}/reschedule")
 async def reschedule_plan_days(plan_id: str, req: PlanRescheduleRequest) -> dict[str, Any]:
     from app.jarvis.persistence import list_jarvis_plan_days, record_agent_event, update_jarvis_plan_day
+    from app.jarvis.planner_guard import validate_plan_day_move
 
     existing_days = await list_jarvis_plan_days(plan_id=plan_id, limit=2000)
     if not existing_days:
@@ -1873,6 +2430,10 @@ async def reschedule_plan_days(plan_id: str, req: PlanRescheduleRequest) -> dict
     changed = []
     for day, move in zip(active_days, updates):
         patch = {"plan_date": move.plan_date[:10], "start_time": move.start_time, "end_time": move.end_time, "status": "rescheduled", "reschedule_reason": move.reason or req.reason or "??/Maxwell ????"}
+        try:
+            validate_plan_day_move(day, patch, today=date.today().isoformat())
+        except ValueError as exc:
+            _raise_planner_guard_violation(exc)
         updated = await update_jarvis_plan_day(day["id"], patch, event_type="plan.rescheduled")
         if updated:
             calendar_event = _sync_plan_day_calendar_event(updated, patch)
@@ -1943,83 +2504,16 @@ async def confirm_pending_action_item(pending_id: str, req: PendingActionConfirm
 
     arguments = req.arguments if req.arguments is not None else item.get("arguments", {})
     if item.get("action_type") == "task.plan":
-        from app.jarvis.persistence import get_background_task, save_background_task, save_background_task_days, save_jarvis_plan
-
-        plan = arguments.get("plan") if isinstance(arguments.get("plan"), dict) else arguments
-        task_id = str(plan.get("id") or arguments.get("task_id") or pending_id)
-        user_filled_fields = plan.get("user_filled_fields") if isinstance(plan.get("user_filled_fields"), dict) else arguments.get("user_filled_fields")
-        notes = "用户确认了 Maxwell 的长期/后台任务拆解计划"
-        if isinstance(user_filled_fields, dict) and user_filled_fields:
-            filled_parts = [f"{key}={value}" for key, value in user_filled_fields.items() if value]
-            if filled_parts:
-                notes = f"{notes}；用户补充：" + "；".join(filled_parts)
-        saved_task = await save_background_task(
-            task_id=task_id,
-            title=str(plan.get("title") or arguments.get("title") or item.get("title") or "后台任务"),
-            task_type=str(plan.get("type") or arguments.get("classification") or "long_project"),
-            status="active",
-            source_agent=plan.get("source_agent") if isinstance(plan.get("source_agent"), str) else item.get("agent_id"),
-            original_user_request=str(plan.get("original_user_request") or arguments.get("user_request") or ""),
-            goal=str(plan.get("goal") or plan.get("title") or item.get("title") or ""),
-            time_horizon=plan.get("time_horizon") if isinstance(plan.get("time_horizon"), dict) else {},
-            milestones=plan.get("milestones") if isinstance(plan.get("milestones"), list) else [],
-            subtasks=plan.get("subtasks") if isinstance(plan.get("subtasks"), list) else [],
-            calendar_candidates=plan.get("calendar_candidates") if isinstance(plan.get("calendar_candidates"), list) else [],
-            notes=notes,
-        )
-        persisted_task = await get_background_task(task_id)
-        if persisted_task is None:
-            raise HTTPException(
-                status_code=500,
-                detail=f"后台任务 {task_id!r} 保存后回读失败：请检查 jarvis.db/background_tasks 写入。",
-            )
-        daily_plan = plan.get("daily_plan") if isinstance(plan.get("daily_plan"), list) else []
-        persisted_days = await save_background_task_days(task_id=task_id, daily_plan=daily_plan)
-        if daily_plan and not persisted_days:
-            raise HTTPException(
-                status_code=500,
-                detail=f"后台任务 {task_id!r} 已保存，但每日任务写入失败：请检查 background_task_days 写入。",
-            )
-        plan_type = "short_term" if len({str(day.get("date") or day.get("plan_date") or "")[:10] for day in daily_plan if isinstance(day, dict)}) <= 1 else "long_term"
-        plan_days_payload = []
-        for day in persisted_days:
-            payload = dict(day)
-            payload["source_task_day_id"] = day.get("id")
-            plan_days_payload.append(payload)
-        persisted_plan = await save_jarvis_plan(
-            plan_id=str(plan.get("plan_id") or f"plan_{task_id}"),
-            title=str(plan.get("title") or arguments.get("title") or item.get("title") or "计划"),
-            plan_type=plan_type,
-            status="active",
-            source_agent=plan.get("source_agent") if isinstance(plan.get("source_agent"), str) else item.get("agent_id"),
+        result = await _persist_task_plan_result(
+            arguments=arguments,
+            source_agent=item.get("agent_id") if isinstance(item.get("agent_id"), str) else None,
             source_pending_id=pending_id,
-            source_background_task_id=task_id,
-            original_user_request=str(plan.get("original_user_request") or arguments.get("user_request") or ""),
-            goal=str(plan.get("goal") or plan.get("title") or item.get("title") or ""),
-            time_horizon=plan.get("time_horizon") if isinstance(plan.get("time_horizon"), dict) else {},
-            raw_payload=plan,
-            days=plan_days_payload,
+            confirmed_by_user=True,
         )
-        from app.jarvis.persistence import list_jarvis_plan_days
-        saved_plan_days = await list_jarvis_plan_days(plan_id=persisted_plan["id"], limit=2000)
-        projected_calendar = []
-        for plan_day in saved_plan_days:
-            projected = await _project_plan_day_to_calendar(plan_day, source_agent=persisted_plan.get("source_agent"), reason="?????????????????")
-            if projected:
-                projected_calendar.append(projected)
-        updated = await update_pending_action(pending_id, status="confirmed", arguments=arguments, title=saved_task.get("title"))
+        updated = await update_pending_action(pending_id, status="confirmed", arguments=arguments, title=result["task"].get("title"))
         return {
             "pending_action": updated,
-            "result": {
-                "task": persisted_task,
-                "task_days": persisted_days,
-                "task_day_count": len(persisted_days),
-                "plan": persisted_plan,
-                "plan_day_count": len(plan_days_payload),
-                "calendar_projection_count": len(projected_calendar),
-                "calendar_projection": projected_calendar,
-                "persisted": True,
-            },
+            "result": result,
             "fallback": False,
         }
 
@@ -2138,6 +2632,16 @@ async def list_calendar_events(
 @router.post("/calendar/events")
 async def add_calendar_event(req: CalendarEventRequest) -> dict[str, Any]:
     from app.mcp.adapters.calendar_adapter import add_event, compute_schedule_density, get_upcoming_events
+    duplicates = _find_duplicate_calendar_events(req)
+    if duplicates:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "duplicate_calendar_event",
+                "message": "已存在同名日程，避免重复安排。请修改已有日程或换一个标题。",
+                "duplicates": duplicates,
+            },
+        )
     event = add_event(
         req.title,
         req.start,
@@ -2324,12 +2828,11 @@ def _build_brainstorm_result(session_id: str, scenario_id: str, topic: str, synt
 
 
 async def _prepare_decision_context() -> dict[str, Any]:
-    from zoneinfo import ZoneInfo
-
+    from app.jarvis.time_context import build_time_context
     from app.jarvis.persistence import list_background_task_days, list_maxwell_workbench_items, list_mood_snapshots, list_stress_signals
     from app.mcp.adapters.calendar_adapter import get_events_between
 
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    today = datetime.fromisoformat(build_time_context()["local_iso"]).date()
     start = datetime.combine(today, datetime.min.time())
     end = datetime.combine(today, datetime.max.time())
     snapshots = await list_mood_snapshots(start=today.isoformat(), end=today.isoformat(), limit=1)

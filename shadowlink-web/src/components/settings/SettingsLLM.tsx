@@ -12,6 +12,7 @@ import {
   ChevronUp,
   Plus,
   Server,
+  MapPin,
   Trash2,
   Zap,
 } from 'lucide-react'
@@ -33,17 +34,25 @@ export function SettingsLLM() {
   const removeLLMConfig = useSettingsStore((s) => s.removeLLMConfig)
   const setActiveLlmId = useSettingsStore((s) => s.setActiveLlmId)
   const setBackgroundLlmId = useSettingsStore((s) => s.setBackgroundLlmId)
+  const externalApiKeys = useSettingsStore((s) => s.externalApiKeys)
+  const loadExternalApiKeys = useSettingsStore((s) => s.loadExternalApiKeys)
+  const saveExternalApiKey = useSettingsStore((s) => s.saveExternalApiKey)
+  const deleteExternalApiKey = useSettingsStore((s) => s.deleteExternalApiKey)
+  const amapKey = externalApiKeys.find((item) => item.id === 'amap')
 
   // Load providers from backend on mount
   useEffect(() => {
     loadLLMConfigs()
-  }, [loadLLMConfigs])
+    loadExternalApiKeys()
+  }, [loadLLMConfigs, loadExternalApiKeys])
 
   // Currently editing config
   const [editingId, setEditingId] = useState<string | null>(null)
 
   // Local state for the config being edited
   const [form, setForm] = useState<LLMConfig | null>(null)
+  const [amapApiKey, setAmapApiKey] = useState('')
+  const [apiKeyMessage, setApiKeyMessage] = useState<string | null>(null)
 
   // When a config is selected to edit
   const startEdit = (id: string) => {
@@ -106,6 +115,24 @@ export function SettingsLLM() {
         setForm(null)
       }
     }
+  }
+
+  const handleSaveAmapKey = async () => {
+    const value = amapApiKey.trim()
+    if (!value) {
+      setApiKeyMessage('请输入高德地图 API Key')
+      return
+    }
+    await saveExternalApiKey('amap', value)
+    setAmapApiKey('')
+    setApiKeyMessage('高德地图 API Key 已保存，本地时间/定位模块会立即优先使用它。')
+  }
+
+  const handleDeleteAmapKey = async () => {
+    if (!confirm('确定删除已保存的高德地图 API Key？删除后后端本地存储也会清除。')) return
+    await deleteExternalApiKey('amap')
+    setAmapApiKey('')
+    setApiKeyMessage('高德地图 API Key 已删除。')
   }
 
   return (
@@ -297,6 +324,58 @@ export function SettingsLLM() {
               </div>
             )
           })}
+        </div>
+      </section>
+
+      <section className="surface-card p-5 space-y-4">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-medium text-foreground flex items-center gap-2">
+              <MapPin size={15} className="text-primary-400" />
+              外部服务 API Key
+            </h2>
+            <p className="text-xs text-muted mt-0.5">
+              管理本地时间、定位和天气模块使用的第三方服务 Key。
+            </p>
+          </div>
+          <span className={`px-2 py-1 rounded text-[11px] ${amapKey?.has_key ? 'bg-green-500/15 text-green-400' : 'bg-amber-500/15 text-amber-400'}`}>
+            {amapKey?.has_key ? `已配置 ${amapKey.api_key_masked}` : '未配置'}
+          </span>
+        </div>
+
+        <label className="block">
+          <span className="text-xs font-medium text-muted">高德地图 API Key</span>
+          <input
+            type="password"
+            value={amapApiKey}
+            onChange={(e) => setAmapApiKey(e.target.value)}
+            placeholder={amapKey?.has_key ? '输入新 Key 可覆盖当前配置' : '请输入高德 Web 服务 Key'}
+            className="mt-1.5 w-full px-3 py-2 rounded-lg bg-surface-secondary text-sm text-foreground border border-white/5 focus:border-primary-500/50 outline-none transition-all"
+          />
+        </label>
+
+        {apiKeyMessage ? <div className="text-xs text-muted">{apiKeyMessage}</div> : null}
+
+        <div className="flex items-center justify-between gap-3 pt-2 border-t border-white/5">
+          <p className="text-xs text-muted">
+            保存后会写入后端本地存储；删除会同步清除后端保存的 Key。
+          </p>
+          <div className="flex items-center gap-2">
+            {amapKey?.has_key ? (
+              <button
+                onClick={handleDeleteAmapKey}
+                className="px-3 py-1.5 rounded-lg text-xs text-red-400 bg-red-500/10 hover:bg-red-500/20 transition-colors"
+              >
+                删除
+              </button>
+            ) : null}
+            <button
+              onClick={handleSaveAmapKey}
+              className="px-4 py-1.5 rounded-lg bg-primary-500 text-white text-xs font-medium hover:bg-primary-600 transition-colors"
+            >
+              保存 Key
+            </button>
+          </div>
         </div>
       </section>
 

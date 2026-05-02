@@ -14,6 +14,8 @@ interface Location {
   lat: number
   lng: number
   label: string
+  timezone: string
+  timezone_source: 'auto' | 'manual' | string
 }
 
 interface SleepSchedule {
@@ -31,11 +33,25 @@ interface UserProfile {
   interests: string[]
 }
 
+interface WeatherPreview {
+  temperature_c?: number
+  weather_code?: number
+  wind_kmh?: number
+  precipitation_mm?: number
+  is_good_weather?: boolean
+  error?: string
+}
+
+interface LocationSuggestion extends Partial<Location> {
+  weather?: WeatherPreview
+  label_error?: string
+}
+
 const EMPTY_PROFILE: UserProfile = {
   name: '',
   pronouns: '',
   occupation: '',
-  location: { lat: 35.6762, lng: 139.6503, label: 'Tokyo' },
+  location: { lat: 35.6762, lng: 139.6503, label: 'Tokyo', timezone: 'Asia/Tokyo', timezone_source: 'auto' },
   sleep_schedule: { bedtime: '23:00', wake: '07:00' },
   diet_restrictions: [],
   interests: [],
@@ -50,6 +66,12 @@ export function SettingsProfile() {
   const [dietInput, setDietInput] = useState('')
   const [interestInput, setInterestInput] = useState('')
   const [geoBusy, setGeoBusy] = useState(false)
+  const [cityResolving, setCityResolving] = useState(false)
+  const [weatherPreview, setWeatherPreview] = useState<WeatherPreview | null>(null)
+  const [locationHint, setLocationHint] = useState<string | null>(null)
+
+  const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai'
+  const notifyProfileChanged = () => window.dispatchEvent(new Event('jarvis:profile-updated'))
 
   useEffect(() => {
     let alive = true
@@ -86,17 +108,33 @@ export function SettingsProfile() {
     return () => clearTimeout(t)
   }, [savedAt])
 
+  const saveProfile = async (nextProfile: UserProfile): Promise<UserProfile> => {
+    const res = await fetch('/api/v1/jarvis/profile', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(nextProfile),
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const saved = await res.json()
+    const normalized = {
+      ...EMPTY_PROFILE,
+      ...saved,
+      location: { ...EMPTY_PROFILE.location, ...(saved.location ?? {}) },
+      sleep_schedule: { ...EMPTY_PROFILE.sleep_schedule, ...(saved.sleep_schedule ?? {}) },
+      diet_restrictions: saved.diet_restrictions ?? [],
+      interests: saved.interests ?? [],
+    }
+    setProfile(normalized)
+    setSavedAt(Date.now())
+    notifyProfileChanged()
+    return normalized
+  }
+
   const handleSave = async () => {
     setSaving(true)
     setError(null)
     try {
-      const res = await fetch('/api/v1/jarvis/profile', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(profile),
-      })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setSavedAt(Date.now())
+      await saveProfile(profile)
     } catch (e) {
       setError(String(e))
     } finally {
@@ -111,16 +149,54 @@ export function SettingsProfile() {
     }
     setGeoBusy(true)
     navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        setProfile((p) => ({
-          ...p,
+      async (pos) => {
+        const lat = Number(pos.coords.latitude.toFixed(6))
+        const lng = Number(pos.coords.longitude.toFixed(6))
+        let suggestedLocation: LocationSuggestion = {
+          lat,
+          lng,
+          label: 'Current Location',
+          timezone: browserTimezone,
+          timezone_source: 'browser',
+        }
+        try {
+          const res = await fetch('/api/v1/jarvis/time/browser-location', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              lat,
+              lng,
+              browser_timezone: browserTimezone,
+              current_label: profile.location.label,
+            }),
+          })
+          if (res.ok) {
+            const data = await res.json()
+            const { weather, label_error, ...location } = data
+            suggestedLocation = { ...suggestedLocation, ...location }
+            setWeatherPreview(weather ?? null)
+            setLocationHint(label_error ? `城市名解析失败：${label_error}` : null)
+          }
+        } catch {
+          // Keep the browser-derived fallback above.
+          setLocationHint('城市名解析失败：网络或地理编码服务不可用')
+        }
+        const { weather: _weather, label_error: _labelError, ...locationFields } = suggestedLocation
+        const nextProfile = {
+          ...profile,
           location: {
-            ...p.location,
-            lat: Number(pos.coords.latitude.toFixed(6)),
-            lng: Number(pos.coords.longitude.toFixed(6)),
+            ...profile.location,
+            ...locationFields,
           },
-        }))
-        setGeoBusy(false)
+        }
+        try {
+          await saveProfile(nextProfile)
+        } catch (e) {
+          setProfile(nextProfile)
+          setError(String(e))
+        } finally {
+          setGeoBusy(false)
+        }
       },
       (err) => {
         setError(`定位失败: ${err.message}`)
@@ -128,6 +204,32 @@ export function SettingsProfile() {
       },
       { enableHighAccuracy: false, timeout: 10000 },
     )
+  }
+
+  const resolveCityLocation = async () => {
+    const cityName = profile.location.label.trim()
+    if (!cityName) return
+    setCityResolving(true)
+    setError(null)
+    try {
+      const res = await fetch('/api/v1/jarvis/time/city-location', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ city_name: cityName, browser_timezone: browserTimezone }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      const { weather, ...location } = data
+      setWeatherPreview(weather ?? null)
+      await saveProfile({
+        ...profile,
+        location: { ...profile.location, ...location },
+      })
+    } catch (e) {
+      setError(`城市位置解析失败: ${String(e)}`)
+    } finally {
+      setCityResolving(false)
+    }
   }
 
   const addTag = (field: 'diet_restrictions' | 'interests', value: string) => {
@@ -251,10 +353,64 @@ export function SettingsProfile() {
             onChange={(e) =>
               setProfile({ ...profile, location: { ...profile.location, label: e.target.value } })
             }
-            placeholder="Tokyo"
+            onBlur={resolveCityLocation}
+            placeholder="Nanjing / Shanghai / New York"
             className="mt-1.5 w-full px-3 py-2 rounded-lg bg-surface-secondary text-sm text-foreground border border-white/5 focus:border-primary-500/50 outline-none transition-all"
           />
+          <div className="mt-2 flex items-center justify-between gap-3">
+            <p className="text-[10px] text-muted">输入城市名后点击解析，系统会保存该城市默认经纬度。</p>
+            <button
+              type="button"
+              disabled={cityResolving}
+              className="text-[10px] text-primary-400 hover:underline disabled:opacity-50"
+              onClick={resolveCityLocation}
+            >
+              {cityResolving ? 'Resolving...' : '解析并保存'}
+            </button>
+          </div>
         </label>
+        <label className="block">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-xs font-medium text-muted">Timezone (IANA)</span>
+            <button
+              type="button"
+              className="text-[10px] text-primary-400 hover:underline"
+              onClick={() =>
+                setProfile({ ...profile, location: { ...profile.location, timezone: browserTimezone, timezone_source: 'manual' } })
+              }
+            >
+              Use browser timezone
+            </button>
+          </div>
+          <input
+            type="text"
+            value={profile.location.timezone}
+            onChange={(e) =>
+              setProfile({ ...profile, location: { ...profile.location, timezone: e.target.value, timezone_source: 'manual' } })
+            }
+            placeholder="Asia/Shanghai"
+            className="mt-1.5 w-full px-3 py-2 rounded-lg bg-surface-secondary text-sm text-foreground border border-white/5 focus:border-primary-500/50 outline-none transition-all"
+          />
+          <p className="mt-1 text-[10px] text-muted">Browser detected: {browserTimezone}</p>
+        </label>
+        <div className="rounded-xl border border-surface-tertiary bg-surface-secondary/60 p-3 text-xs text-muted">
+          <div className="font-medium text-foreground mb-1">当前位置预览</div>
+          <div>城市：{profile.location.label || '未设置'}</div>
+          <div>时区：{profile.location.timezone || browserTimezone}</div>
+          {locationHint ? <div className="text-amber-500">{locationHint}</div> : null}
+          {weatherPreview ? (
+            weatherPreview.error ? (
+              <div title={weatherPreview.error}>天气：获取失败</div>
+            ) : (
+              <div>
+                天气：{weatherPreview.temperature_c !== undefined ? `${weatherPreview.temperature_c.toFixed(0)}°C` : '未知'}
+                {weatherPreview.wind_kmh !== undefined ? ` · 风 ${weatherPreview.wind_kmh.toFixed(0)}km/h` : ''}
+              </div>
+            )
+          ) : (
+            <div>天气：定位或解析城市后显示</div>
+          )}
+        </div>
         <div className="grid grid-cols-2 gap-4">
           <label className="block">
             <span className="text-xs font-medium text-muted">Latitude</span>

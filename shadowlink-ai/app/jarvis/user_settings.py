@@ -20,6 +20,8 @@ class Location(BaseModel):
     lat: float = 35.6762
     lng: float = 139.6503
     label: str = "Tokyo"
+    timezone: str = "Asia/Tokyo"
+    timezone_source: str = "auto"
 
 
 class SleepSchedule(BaseModel):
@@ -121,6 +123,8 @@ def update_profile(patch: dict[str, Any]) -> JarvisSettings:
             # For nested models accept dict patch
             current_attr = getattr(new_profile, key)
             if isinstance(current_attr, BaseModel) and isinstance(value, dict):
+                if key == "location" and value.get("timezone"):
+                    value = {**value, "timezone_source": value.get("timezone_source") or "manual"}
                 setattr(new_profile, key, current_attr.model_copy(update=value))
             else:
                 setattr(new_profile, key, value)

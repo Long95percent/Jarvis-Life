@@ -123,7 +123,7 @@ def _plan_maxwell(agent_id: str, text: str, now: datetime) -> AgentIntentDecisio
             intent="task_decompose",
             tool_name="jarvis_task_plan_decompose",
             confidence=0.78,
-            slots={"user_request": text, "source_agent": agent_id},
+            slots={"user_request": text, "source_agent": agent_id, "target_start": now.isoformat()},
             reason="long_term_goal",
         )
 
@@ -302,7 +302,7 @@ def _plan_athena(agent_id: str, text: str, now: datetime) -> AgentIntentDecision
             intent="learning_plan",
             tool_name="jarvis_task_plan_decompose",
             confidence=0.82,
-            slots={"user_request": text, "source_agent": agent_id},
+            slots={"user_request": text, "source_agent": agent_id, "target_start": now.isoformat()},
             reason="learning_strategy_or_study_plan",
         )
 

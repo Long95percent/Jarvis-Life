@@ -72,6 +72,7 @@ dependencies = [
     "orjson>=3.10,<4",
     "aiofiles>=23,<25",
     "cachetools>=5.3,<6",
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

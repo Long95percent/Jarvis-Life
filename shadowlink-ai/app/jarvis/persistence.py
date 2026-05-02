@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -3459,23 +3460,309 @@ async def get_background_task(task_id: str) -> dict[str, Any] | None:
     return await asyncio.to_thread(_get_background_task_sync, task_id)
 
 
+def _background_task_identity_key(item: dict[str, Any]) -> tuple[str, str] | None:
+    task_type = str(item.get("task_type") or "")
+    normalized_type = "long_project" if task_type in {"future_project", "recurring_plan"} else task_type
+    if normalized_type not in {"long_project", "short_project"}:
+        return None
+    for field in ["title", "goal", "original_user_request"]:
+        identity = _normalize_task_identity(item.get(field))
+        if identity:
+            return normalized_type, identity
+    return None
+
+
+def _dedupe_background_tasks_for_listing(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        key = _background_task_identity_key(item)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        unique.append(item)
+    return unique
+
+
 def _list_background_tasks_sync(status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
     with _conn() as con:
         if status:
             rows = con.execute(
                 "SELECT * FROM background_tasks WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
-                (status, limit),
+                (status, max(limit * 3, limit)),
             ).fetchall()
         else:
             rows = con.execute(
-                "SELECT * FROM background_tasks ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
+                "SELECT * FROM background_tasks WHERE status NOT IN ('archived', 'deleted') ORDER BY updated_at DESC LIMIT ?",
+                (max(limit * 3, limit),),
             ).fetchall()
-    return [_row_to_background_task(row) for row in rows]
+    return _dedupe_background_tasks_for_listing([_row_to_background_task(row) for row in rows])[:limit]
 
 
 async def list_background_tasks(status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
     return await asyncio.to_thread(_list_background_tasks_sync, status, limit)
+
+
+def _update_background_task_sync(task_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = {"status", "notes"}
+    updates = {key: value for key, value in patch.items() if key in allowed}
+    if not updates:
+        return None
+    updates["updated_at"] = time.time()
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    with _conn() as con:
+        existing = con.execute("SELECT id FROM background_tasks WHERE id = ?", (task_id,)).fetchone()
+        if not existing:
+            return None
+        con.execute(f"UPDATE background_tasks SET {assignments} WHERE id = ?", (*updates.values(), task_id))
+        row = con.execute("SELECT * FROM background_tasks WHERE id = ?", (task_id,)).fetchone()
+        con.commit()
+    return _row_to_background_task(row) if row else None
+
+
+async def update_background_task(task_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_update_background_task_sync, task_id, patch)
+
+
+def _mark_plans_for_background_task_sync(task_id: str, status: str) -> list[dict[str, Any]]:
+    now = time.time()
+    with _conn() as con:
+        rows = con.execute("SELECT * FROM jarvis_plans WHERE source_background_task_id = ?", (task_id,)).fetchall()
+        if not rows:
+            return []
+        plan_ids = [str(row["id"]) for row in rows]
+        placeholders = ",".join("?" for _ in plan_ids)
+        con.execute(f"UPDATE jarvis_plans SET status = ?, updated_at = ? WHERE id IN ({placeholders})", (status, now, *plan_ids))
+        if status == "deleted":
+            con.execute(f"UPDATE jarvis_plan_days SET status = 'deleted', updated_at = ? WHERE plan_id IN ({placeholders}) AND status != 'completed'", (now, *plan_ids))
+        elif status == "cancelled":
+            con.execute(f"UPDATE jarvis_plan_days SET status = 'cancelled', updated_at = ? WHERE plan_id IN ({placeholders}) AND status IN ('pending','scheduled','pushed','rescheduled')", (now, *plan_ids))
+        for plan_id in plan_ids:
+            con.execute(
+                "INSERT INTO jarvis_agent_events (id, event_type, agent_id, plan_id, payload_json, created_at) VALUES (?, ?, 'user_ui', ?, ?, ?)",
+                (f"event_{uuid4().hex}", f"plan.{status}", plan_id, json.dumps({"source_background_task_id": task_id}, ensure_ascii=False), now),
+            )
+        con.commit()
+        updated_rows = con.execute(f"SELECT * FROM jarvis_plans WHERE id IN ({placeholders}) ORDER BY updated_at DESC", (*plan_ids,)).fetchall()
+    return [_row_to_jarvis_plan(row) for row in updated_rows]
+
+
+async def mark_plans_for_background_task(task_id: str, status: str) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(_mark_plans_for_background_task_sync, task_id, status)
+
+
+def _hard_delete_jarvis_plan_sync(plan_id: str) -> dict[str, Any] | None:
+    with _conn() as con:
+        row = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (plan_id,)).fetchone()
+        if row is None:
+            return None
+        plan = _row_to_jarvis_plan(row)
+        event_rows = con.execute(
+            "SELECT calendar_event_id FROM jarvis_plan_days WHERE plan_id = ? AND calendar_event_id IS NOT NULL",
+            (plan_id,),
+        ).fetchall()
+        event_ids = [str(item["calendar_event_id"]) for item in event_rows if item["calendar_event_id"]]
+        if event_ids:
+            placeholders = ",".join("?" for _ in event_ids)
+            con.execute(f"DELETE FROM jarvis_calendar_events WHERE id IN ({placeholders})", (*event_ids,))
+        con.execute("DELETE FROM maxwell_workbench_items WHERE plan_day_id IN (SELECT id FROM jarvis_plan_days WHERE plan_id = ?)", (plan_id,))
+        con.execute("DELETE FROM jarvis_agent_events WHERE plan_id = ? OR plan_day_id IN (SELECT id FROM jarvis_plan_days WHERE plan_id = ?)", (plan_id, plan_id))
+        con.execute("DELETE FROM jarvis_plan_days WHERE plan_id = ?", (plan_id,))
+        con.execute("DELETE FROM jarvis_plans WHERE id = ?", (plan_id,))
+        con.commit()
+    return {**plan, "status": "deleted"}
+
+
+async def hard_delete_jarvis_plan(plan_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_hard_delete_jarvis_plan_sync, plan_id)
+
+
+def _hard_delete_jarvis_plan_day_sync(day_id: str) -> dict[str, Any] | None:
+    with _conn() as con:
+        row = con.execute("SELECT * FROM jarvis_plan_days WHERE id = ?", (day_id,)).fetchone()
+        if row is None:
+            return None
+        day = _row_to_jarvis_plan_day(row)
+        if day.get("calendar_event_id"):
+            con.execute("DELETE FROM jarvis_calendar_events WHERE id = ?", (day["calendar_event_id"],))
+        con.execute("DELETE FROM maxwell_workbench_items WHERE plan_day_id = ?", (day_id,))
+        con.execute("DELETE FROM jarvis_agent_events WHERE plan_day_id = ?", (day_id,))
+        con.execute("DELETE FROM jarvis_plan_days WHERE id = ?", (day_id,))
+        con.commit()
+    return {**day, "status": "deleted"}
+
+
+async def hard_delete_jarvis_plan_day(day_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_hard_delete_jarvis_plan_day_sync, day_id)
+
+
+def _hard_delete_background_task_sync(task_id: str) -> dict[str, Any] | None:
+    with _conn() as con:
+        row = con.execute("SELECT * FROM background_tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        task = _row_to_background_task(row)
+        plan_rows = con.execute("SELECT id FROM jarvis_plans WHERE source_background_task_id = ?", (task_id,)).fetchall()
+        plan_ids = [str(item["id"]) for item in plan_rows]
+    for plan_id in plan_ids:
+        _hard_delete_jarvis_plan_sync(plan_id)
+    with _conn() as con:
+        day_event_rows = con.execute(
+            "SELECT calendar_event_id FROM background_task_days WHERE task_id = ? AND calendar_event_id IS NOT NULL",
+            (task_id,),
+        ).fetchall()
+        event_ids = [str(item["calendar_event_id"]) for item in day_event_rows if item["calendar_event_id"]]
+        if event_ids:
+            placeholders = ",".join("?" for _ in event_ids)
+            con.execute(f"DELETE FROM jarvis_calendar_events WHERE id IN ({placeholders})", (*event_ids,))
+        con.execute("DELETE FROM maxwell_workbench_items WHERE task_day_id IN (SELECT id FROM background_task_days WHERE task_id = ?)", (task_id,))
+        con.execute("DELETE FROM background_task_days WHERE task_id = ?", (task_id,))
+        con.execute("DELETE FROM background_tasks WHERE id = ?", (task_id,))
+        con.commit()
+    return {**task, "status": "deleted"}
+
+
+async def hard_delete_background_task(task_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_hard_delete_background_task_sync, task_id)
+
+
+def _hard_delete_background_task_day_sync(day_id: str) -> dict[str, Any] | None:
+    with _conn() as con:
+        row = con.execute("SELECT * FROM background_task_days WHERE id = ?", (day_id,)).fetchone()
+        if row is None:
+            return None
+        day = _row_to_background_task_day(row)
+        if day.get("calendar_event_id"):
+            con.execute("DELETE FROM jarvis_calendar_events WHERE id = ?", (day["calendar_event_id"],))
+        con.execute("DELETE FROM maxwell_workbench_items WHERE task_day_id = ?", (day_id,))
+        con.execute("DELETE FROM background_task_days WHERE id = ?", (day_id,))
+        con.commit()
+    return {**day, "status": "deleted"}
+
+
+async def hard_delete_background_task_day(day_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_hard_delete_background_task_day_sync, day_id)
+
+
+def _normalize_task_identity(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"[\W_]+", "", text, flags=re.UNICODE)
+    return text
+
+
+def _find_active_background_task_by_identity_sync(*, title: str, task_type: str, goal: str | None = None, original_user_request: str | None = None) -> dict[str, Any] | None:
+    wanted_title = _normalize_task_identity(title)
+    wanted_goal = _normalize_task_identity(goal)
+    wanted_request = _normalize_task_identity(original_user_request)
+    candidates = {value for value in [wanted_title, wanted_goal, wanted_request] if value}
+    if not candidates:
+        return None
+    normalized_type = "long_project" if task_type in {"future_project", "recurring_plan"} else task_type
+    with _conn() as con:
+        rows = con.execute(
+            "SELECT * FROM background_tasks WHERE status = 'active' ORDER BY updated_at DESC LIMIT 200"
+        ).fetchall()
+    for row in rows:
+        item = _row_to_background_task(row)
+        existing_type = "long_project" if item.get("task_type") in {"future_project", "recurring_plan"} else item.get("task_type")
+        if existing_type != normalized_type:
+            continue
+        existing_candidates = {
+            value for value in [
+                _normalize_task_identity(item.get("title")),
+                _normalize_task_identity(item.get("goal")),
+                _normalize_task_identity(item.get("original_user_request")),
+            ] if value
+        }
+        if candidates & existing_candidates:
+            return item
+    return None
+
+
+async def find_active_background_task_by_identity(*, title: str, task_type: str, goal: str | None = None, original_user_request: str | None = None) -> dict[str, Any] | None:
+    return await asyncio.to_thread(
+        _find_active_background_task_by_identity_sync,
+        title=title,
+        task_type=task_type,
+        goal=goal,
+        original_user_request=original_user_request,
+    )
+
+
+def _cleanup_duplicate_background_tasks_sync() -> dict[str, Any]:
+    now = time.time()
+    with _conn() as con:
+        rows = con.execute("SELECT * FROM background_tasks ORDER BY updated_at DESC, created_at DESC").fetchall()
+        tasks = [_row_to_background_task(row) for row in rows]
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for task in tasks:
+            key = _background_task_identity_key(task)
+            if key is None:
+                continue
+            groups.setdefault(key, []).append(task)
+
+        merged_groups: list[dict[str, Any]] = []
+        deleted_tasks: list[str] = []
+        for key, group in groups.items():
+            active_group = [task for task in group if task.get("status") == "active"]
+            candidates = active_group or group
+            if len(candidates) <= 1:
+                canonical = candidates[0]
+                canonical_type = key[0]
+                if canonical.get("task_type") != canonical_type:
+                    con.execute("UPDATE background_tasks SET task_type = ?, updated_at = ? WHERE id = ?", (canonical_type, now, canonical["id"]))
+                continue
+            canonical = candidates[0]
+            canonical_id = str(canonical["id"])
+            duplicate_ids = [str(task["id"]) for task in candidates[1:]]
+            canonical_type = key[0]
+
+            con.execute("UPDATE background_tasks SET task_type = ?, updated_at = ? WHERE id = ?", (canonical_type, now, canonical_id))
+            for duplicate_id in duplicate_ids:
+                con.execute("UPDATE background_task_days SET task_id = ?, updated_at = ? WHERE task_id = ?", (canonical_id, now, duplicate_id))
+                con.execute("UPDATE jarvis_plans SET source_background_task_id = ?, updated_at = ? WHERE source_background_task_id = ?", (canonical_id, now, duplicate_id))
+                con.execute("DELETE FROM background_tasks WHERE id = ?", (duplicate_id,))
+            deleted_tasks.extend(duplicate_ids)
+            merged_groups.append({"identity": key, "canonical_task_id": canonical_id, "deleted_task_ids": duplicate_ids})
+        con.commit()
+    return {"merged_groups": merged_groups, "deleted_tasks": len(deleted_tasks), "deleted_task_ids": deleted_tasks}
+
+
+async def cleanup_duplicate_background_tasks() -> dict[str, Any]:
+    return await asyncio.to_thread(_cleanup_duplicate_background_tasks_sync)
+
+
+def _preview_duplicate_background_tasks_sync() -> dict[str, Any]:
+    with _conn() as con:
+        rows = con.execute("SELECT * FROM background_tasks ORDER BY updated_at DESC, created_at DESC").fetchall()
+    tasks = [_row_to_background_task(row) for row in rows]
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for task in tasks:
+        key = _background_task_identity_key(task)
+        if key is not None and task.get("status") == "active":
+            groups.setdefault(key, []).append(task)
+    duplicate_groups = []
+    for key, group in groups.items():
+        if len(group) <= 1:
+            continue
+        duplicate_groups.append({
+            "identity": key,
+            "canonical_task_id": group[0]["id"],
+            "duplicate_task_ids": [task["id"] for task in group[1:]],
+            "task_count": len(group),
+            "title": group[0].get("title"),
+        })
+    return {
+        "duplicate_group_count": len(duplicate_groups),
+        "duplicate_task_count": sum(max(0, group["task_count"] - 1) for group in duplicate_groups),
+        "groups": duplicate_groups,
+    }
+
+
+async def preview_duplicate_background_tasks() -> dict[str, Any]:
+    return await asyncio.to_thread(_preview_duplicate_background_tasks_sync)
 
 
 def _row_to_background_task_day(row: sqlite3.Row) -> dict[str, Any]:
@@ -3603,6 +3890,8 @@ def _list_background_task_days_sync(
     if status:
         clauses.append("status = ?")
         params.append(status)
+    else:
+        clauses.append("status != 'deleted'")
     if plan_date:
         clauses.append("plan_date = ?")
         params.append(plan_date[:10])
@@ -3757,7 +4046,7 @@ def update_calendar_event_sync(event_id: str, patch: dict[str, Any]) -> dict[str
 
 def delete_calendar_event_sync(event_id: str) -> bool:
     with _conn() as con:
-        cur = con.execute("UPDATE jarvis_calendar_events SET status = 'deleted', updated_at = ? WHERE id = ? AND status != 'deleted'", (time.time(), event_id))
+        cur = con.execute("DELETE FROM jarvis_calendar_events WHERE id = ?", (event_id,))
         con.commit()
     return cur.rowcount > 0
 
@@ -3896,6 +4185,15 @@ def _save_jarvis_plan_sync(
             ),
         )
         if days is not None:
+            stale_event_rows = con.execute(
+                "SELECT calendar_event_id FROM jarvis_plan_days WHERE plan_id = ? AND calendar_event_id IS NOT NULL",
+                (plan_id,),
+            ).fetchall()
+            stale_event_ids = [str(row["calendar_event_id"]) for row in stale_event_rows if row["calendar_event_id"]]
+            if stale_event_ids:
+                placeholders = ",".join("?" for _ in stale_event_ids)
+                con.execute(f"DELETE FROM jarvis_calendar_events WHERE id IN ({placeholders})", (*stale_event_ids,))
+            con.execute("DELETE FROM maxwell_workbench_items WHERE plan_day_id IN (SELECT id FROM jarvis_plan_days WHERE plan_id = ?)", (plan_id,))
             con.execute("DELETE FROM jarvis_plan_days WHERE plan_id = ?", (plan_id,))
         for day in normalized_days:
             con.execute(
@@ -3939,12 +4237,135 @@ async def get_jarvis_plan(plan_id: str) -> dict[str, Any] | None:
     return await asyncio.to_thread(_get_jarvis_plan_sync, plan_id)
 
 
+def _update_jarvis_plan_sync(plan_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = {"title", "plan_type", "status", "original_user_request", "goal", "time_horizon", "raw_payload"}
+    updates = {key: value for key, value in patch.items() if key in allowed}
+    if not updates:
+        return _get_jarvis_plan_sync(plan_id)
+    now = time.time()
+    columns: list[str] = []
+    params: list[Any] = []
+    for key, value in updates.items():
+        column = f"{key}_json" if key in {"time_horizon", "raw_payload"} else key
+        columns.append(f"{column} = ?")
+        params.append(json.dumps(value or {}, ensure_ascii=False, default=str) if key in {"time_horizon", "raw_payload"} else value)
+    columns.append("updated_at = ?")
+    params.append(now)
+    params.append(plan_id)
+    with _conn() as con:
+        existing = con.execute("SELECT id FROM jarvis_plans WHERE id = ?", (plan_id,)).fetchone()
+        if not existing:
+            return None
+        con.execute(f"UPDATE jarvis_plans SET {', '.join(columns)} WHERE id = ?", tuple(params))
+        con.execute(
+            """
+            INSERT INTO jarvis_agent_events (id, event_type, agent_id, plan_id, payload_json, created_at)
+            VALUES (?, 'plan.updated', ?, ?, ?, ?)
+            """,
+            (f"event_{uuid4().hex}", "user_ui", plan_id, json.dumps({"updated_fields": sorted(updates)}, ensure_ascii=False), now),
+        )
+        con.commit()
+        row = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (plan_id,)).fetchone()
+    return _row_to_jarvis_plan(row) if row else None
+
+
+async def update_jarvis_plan(plan_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_update_jarvis_plan_sync, plan_id, patch)
+
+
+def _merge_jarvis_plans_sync(source_plan_id: str, target_plan_id: str, reason: str | None = None) -> dict[str, Any] | None:
+    if source_plan_id == target_plan_id:
+        return None
+    now = time.time()
+    with _conn() as con:
+        source = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (source_plan_id,)).fetchone()
+        target = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (target_plan_id,)).fetchone()
+        if not source or not target:
+            return None
+        moved_rows = con.execute("SELECT id FROM jarvis_plan_days WHERE plan_id = ? ORDER BY plan_date ASC, sort_order ASC", (source_plan_id,)).fetchall()
+        con.execute("UPDATE jarvis_plan_days SET plan_id = ?, updated_at = ? WHERE plan_id = ?", (target_plan_id, now, source_plan_id))
+        con.execute("UPDATE jarvis_plans SET status = 'merged', updated_at = ? WHERE id = ?", (now, source_plan_id))
+        con.execute("UPDATE jarvis_plans SET updated_at = ? WHERE id = ?", (now, target_plan_id))
+        payload = {"source_plan_id": source_plan_id, "target_plan_id": target_plan_id, "reason": reason, "moved_day_ids": [row["id"] for row in moved_rows]}
+        con.execute(
+            "INSERT INTO jarvis_agent_events (id, event_type, agent_id, plan_id, payload_json, created_at) VALUES (?, 'plan.merged', 'user_ui', ?, ?, ?)",
+            (f"event_{uuid4().hex}", target_plan_id, json.dumps(payload, ensure_ascii=False), now),
+        )
+        con.commit()
+        source_after = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (source_plan_id,)).fetchone()
+        target_after = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (target_plan_id,)).fetchone()
+    return {"source_plan": _row_to_jarvis_plan(source_after), "target_plan": _row_to_jarvis_plan(target_after), "moved_day_count": len(moved_rows), "moved_day_ids": payload["moved_day_ids"]}
+
+
+async def merge_jarvis_plans(source_plan_id: str, target_plan_id: str, reason: str | None = None) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_merge_jarvis_plans_sync, source_plan_id, target_plan_id, reason)
+
+
+def _split_jarvis_plan_sync(source_plan_id: str, *, title: str, plan_day_ids: list[str], reason: str | None = None) -> dict[str, Any] | None:
+    title = title.strip()
+    day_ids = [day_id for day_id in dict.fromkeys(plan_day_ids) if isinstance(day_id, str) and day_id.strip()]
+    if not title or not day_ids:
+        return None
+    now = time.time()
+    new_plan_id = f"plan_split_{uuid4().hex}"
+    with _conn() as con:
+        source = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (source_plan_id,)).fetchone()
+        if not source:
+            return None
+        placeholders = ",".join("?" for _ in day_ids)
+        rows = con.execute(f"SELECT id FROM jarvis_plan_days WHERE plan_id = ? AND id IN ({placeholders})", (source_plan_id, *day_ids)).fetchall()
+        moved_ids = [row["id"] for row in rows]
+        if not moved_ids:
+            return None
+        source_plan = _row_to_jarvis_plan(source)
+        con.execute(
+            """
+            INSERT INTO jarvis_plans
+              (id, title, plan_type, status, source_agent, source_pending_id, source_background_task_id,
+               original_user_request, goal, time_horizon_json, raw_payload_json, created_at, updated_at)
+            VALUES (?, ?, ?, 'active', 'user_ui', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_plan_id,
+                title,
+                source_plan.get("plan_type") or "long_term",
+                source_plan.get("source_pending_id"),
+                source_plan.get("source_background_task_id"),
+                source_plan.get("original_user_request") or title,
+                title,
+                json.dumps(source_plan.get("time_horizon") or {}, ensure_ascii=False, default=str),
+                json.dumps({"source": "manual_plan_split", "source_plan_id": source_plan_id, "reason": reason}, ensure_ascii=False, default=str),
+                now,
+                now,
+            ),
+        )
+        move_placeholders = ",".join("?" for _ in moved_ids)
+        con.execute(f"UPDATE jarvis_plan_days SET plan_id = ?, updated_at = ? WHERE id IN ({move_placeholders})", (new_plan_id, now, *moved_ids))
+        payload = {"source_plan_id": source_plan_id, "new_plan_id": new_plan_id, "reason": reason, "moved_day_ids": moved_ids}
+        con.execute(
+            "INSERT INTO jarvis_agent_events (id, event_type, agent_id, plan_id, payload_json, created_at) VALUES (?, 'plan.split', 'user_ui', ?, ?, ?)",
+            (f"event_{uuid4().hex}", new_plan_id, json.dumps(payload, ensure_ascii=False), now),
+        )
+        con.execute(
+            "INSERT INTO jarvis_agent_events (id, event_type, agent_id, plan_id, payload_json, created_at) VALUES (?, 'plan.split.source', 'user_ui', ?, ?, ?)",
+            (f"event_{uuid4().hex}", source_plan_id, json.dumps(payload, ensure_ascii=False), now),
+        )
+        con.commit()
+        source_after = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (source_plan_id,)).fetchone()
+        new_plan = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (new_plan_id,)).fetchone()
+    return {"source_plan": _row_to_jarvis_plan(source_after), "new_plan": _row_to_jarvis_plan(new_plan), "moved_day_count": len(moved_ids), "moved_day_ids": moved_ids}
+
+
+async def split_jarvis_plan(source_plan_id: str, *, title: str, plan_day_ids: list[str], reason: str | None = None) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_split_jarvis_plan_sync, source_plan_id, title=title, plan_day_ids=plan_day_ids, reason=reason)
+
+
 def _list_jarvis_plans_sync(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     with _conn() as con:
         if status:
             rows = con.execute("SELECT * FROM jarvis_plans WHERE status = ? ORDER BY updated_at DESC LIMIT ?", (status, limit)).fetchall()
         else:
-            rows = con.execute("SELECT * FROM jarvis_plans ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+            rows = con.execute("SELECT * FROM jarvis_plans WHERE status != 'deleted' ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
     return [_row_to_jarvis_plan(row) for row in rows]
 
 
@@ -4019,6 +4440,27 @@ def _cancel_jarvis_plan_sync(plan_id: str) -> dict[str, Any] | None:
 
 async def cancel_jarvis_plan(plan_id: str) -> dict[str, Any] | None:
     return await asyncio.to_thread(_cancel_jarvis_plan_sync, plan_id)
+
+
+def _delete_jarvis_plan_sync(plan_id: str) -> dict[str, Any] | None:
+    now = time.time()
+    with _conn() as con:
+        existing = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (plan_id,)).fetchone()
+        if not existing:
+            return None
+        con.execute("UPDATE jarvis_plans SET status = 'deleted', updated_at = ? WHERE id = ?", (now, plan_id))
+        con.execute("UPDATE jarvis_plan_days SET status = 'deleted', updated_at = ? WHERE plan_id = ? AND status != 'completed'", (now, plan_id))
+        con.execute(
+            "INSERT INTO jarvis_agent_events (id, event_type, agent_id, plan_id, payload_json, created_at) VALUES (?, 'plan.deleted', 'user_ui', ?, '{}', ?)",
+            (f"event_{uuid4().hex}", plan_id, now),
+        )
+        con.commit()
+        row = con.execute("SELECT * FROM jarvis_plans WHERE id = ?", (plan_id,)).fetchone()
+    return _row_to_jarvis_plan(row) if row else None
+
+
+async def delete_jarvis_plan(plan_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_delete_jarvis_plan_sync, plan_id)
 
 
 def _row_to_maxwell_workbench_item(row: sqlite3.Row) -> dict[str, Any]:

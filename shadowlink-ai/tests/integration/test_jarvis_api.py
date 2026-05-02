@@ -1,10 +1,14 @@
 from unittest.mock import AsyncMock
+import asyncio
+import json
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from fastapi.testclient import TestClient
 
 from app.api.v1 import jarvis_router
 from app.jarvis import persistence
@@ -42,6 +46,13 @@ from app.tools.jarvis_tools import (
     JarvisSpecialistOrchestrateTool,
     JarvisTaskPrioritizeTool,
 )
+
+
+def test_pick_geocode_label_supports_display_name_and_district_fields():
+    from app.jarvis.geocoding import pick_osm_geocode_label
+
+    assert pick_osm_geocode_label({"address": {"city_district": "Xuanwu District"}}) == "Xuanwu District"
+    assert pick_osm_geocode_label({"display_name": "Nanjing, Jiangsu, China"}) == "Nanjing"
 
 
 @pytest.fixture
@@ -97,6 +108,159 @@ async def client_with_mock_llm(monkeypatch):
         yield c, mock_llm
 
 
+def test_secretary_plan_endpoint_creates_long_plan(monkeypatch):
+    app = create_app()
+    mock_llm = AsyncMock()
+
+    async def override_get_llm_client():
+        return mock_llm
+
+    app.dependency_overrides[get_llm_client] = override_get_llm_client
+    db_dir = Path("data") / "test_dbs"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    tmp = db_dir / f"jarvis-secretary-api-{uuid4().hex}.db"
+    monkeypatch.setattr(persistence, "_DB_PATH", tmp)
+    persistence._initialized = False
+    mock_llm.chat = AsyncMock(return_value=json.dumps({
+        "schema_version": "secretary_long_plan.v1",
+        "intent": "long_plan",
+        "plan": {
+            "title": "雅思 3 天备考计划",
+            "goal": "完成三天基础训练",
+            "plan_type": "long_term",
+            "start_date": "2026-05-01",
+            "target_date": "2026-05-03",
+        },
+        "days": [
+            {"day_index": 1, "date": "2026-05-01", "start_time": "19:30", "end_time": "21:00", "title": "听力诊断", "description": "听力", "estimated_minutes": 90, "reason": "start"},
+            {"day_index": 2, "date": "2026-05-02", "start_time": "19:30", "end_time": "21:00", "title": "阅读训练", "description": "阅读", "estimated_minutes": 90, "reason": "continue"},
+        ],
+    }, ensure_ascii=False))
+
+    client = TestClient(app)
+    resp = client.post("/api/v1/jarvis/planner/secretary-plan", json={
+        "intent": "long_plan",
+        "message": "我要考雅思，未来 3 天帮我安排学习计划",
+        "today": "2026-05-01",
+        "auto_project_calendar": False,
+    })
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["intent"] == "long_plan"
+    assert data["plan"]["title"] == "雅思 3 天备考计划"
+    assert len(data["plan_days"]) == 2
+    assert mock_llm.chat.await_count == 1
+    persistence._initialized = False
+
+
+def test_secretary_plan_endpoint_creates_short_schedule(monkeypatch):
+    app = create_app()
+    mock_llm = AsyncMock()
+
+    async def override_get_llm_client():
+        return mock_llm
+
+    app.dependency_overrides[get_llm_client] = override_get_llm_client
+    db_dir = Path("data") / "test_dbs"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    tmp = db_dir / f"jarvis-secretary-short-api-{uuid4().hex}.db"
+    monkeypatch.setattr(persistence, "_DB_PATH", tmp)
+    persistence._initialized = False
+    mock_llm.chat = AsyncMock(return_value=json.dumps({
+        "schema_version": "secretary_schedule.v1",
+        "intent": "short_schedule",
+        "summary": "明晚安排一次雅思听力复习。",
+        "items": [{
+            "client_item_id": "short-1",
+            "date": "2026-05-02",
+            "start_time": "19:30",
+            "end_time": "21:00",
+            "title": "雅思听力复习",
+            "description": "完成 Section 1-2 并整理错题。",
+            "estimated_minutes": 90,
+            "priority": "high",
+            "reason": "用户指定明晚。",
+        }],
+    }, ensure_ascii=False))
+
+    client = TestClient(app)
+    resp = client.post("/api/v1/jarvis/planner/secretary-plan", json={
+        "intent": "short_schedule",
+        "message": "明天晚上帮我安排一次雅思听力复习",
+        "today": "2026-05-01",
+        "auto_project_calendar": False,
+    })
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["intent"] == "short_schedule"
+    assert data["plan"]["plan_type"] == "short_term"
+    assert data["plan_days"][0]["title"] == "雅思听力复习"
+    assert mock_llm.chat.await_count == 1
+    persistence._initialized = False
+
+
+def test_secretary_plan_endpoint_reschedules_existing_plan(monkeypatch):
+    app = create_app()
+    mock_llm = AsyncMock()
+
+    async def override_get_llm_client():
+        return mock_llm
+
+    app.dependency_overrides[get_llm_client] = override_get_llm_client
+    db_dir = Path("data") / "test_dbs"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    tmp = db_dir / f"jarvis-secretary-reschedule-api-{uuid4().hex}.db"
+    monkeypatch.setattr(persistence, "_DB_PATH", tmp)
+    persistence._initialized = False
+    plan = asyncio.run(persistence.save_jarvis_plan(
+        plan_id="plan-api-reschedule",
+        title="雅思计划",
+        plan_type="long_term",
+        status="active",
+        source_agent="maxwell",
+        original_user_request="雅思计划",
+        goal="备考",
+        days=[{"id": "api-reschedule-day-1", "date": "2026-05-02", "title": "旧听力", "start_time": "19:00", "end_time": "20:00"}],
+    ))
+    mock_llm.chat = AsyncMock(return_value=json.dumps({
+        "schema_version": "secretary_reschedule.v1",
+        "intent": "reschedule_plan",
+        "summary": "已重新安排。",
+        "plan_id": plan["id"],
+        "days": [{
+            "id": "api-reschedule-day-1",
+            "date": "2026-05-03",
+            "start_time": "20:00",
+            "end_time": "21:00",
+            "title": "新听力",
+            "description": "重排后继续听力",
+            "estimated_minutes": 60,
+            "reason": "用户未完成。",
+        }],
+    }, ensure_ascii=False))
+
+    client = TestClient(app)
+    resp = client.post("/api/v1/jarvis/planner/secretary-plan", json={
+        "intent": "reschedule_plan",
+        "message": "今天没完成，帮我重新安排后面的计划",
+        "today": "2026-05-01",
+        "plan_id": plan["id"],
+        "plan_day_ids": ["api-reschedule-day-1"],
+        "auto_project_calendar": False,
+    })
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["intent"] == "reschedule_plan"
+    assert data["changed_count"] == 1
+    assert data["plan_days"][0]["plan_date"] == "2026-05-03"
+    assert data["plan_days"][0]["title"] == "新听力"
+    assert mock_llm.chat.await_count == 1
+    persistence._initialized = False
+
+
 @pytest.mark.asyncio
 async def test_get_life_context(client):
     resp = await client.get("/api/v1/jarvis/context")
@@ -117,6 +281,85 @@ async def test_update_life_context(client):
 
 
 @pytest.mark.asyncio
+async def test_get_time_context_uses_saved_profile_timezone(client):
+    profile_resp = await client.patch(
+        "/api/v1/jarvis/profile",
+        json={"location": {"label": "New York", "timezone": "America/New_York"}},
+    )
+    assert profile_resp.status_code == 200
+
+    resp = await client.get("/api/v1/jarvis/time/context?browser_timezone=Asia/Tokyo")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["timezone"] == "America/New_York"
+    assert data["location_label"] == "New York"
+    assert "local_date" in data
+    assert "utc_offset" in data
+
+
+@pytest.mark.asyncio
+async def test_get_time_context_rejects_bad_browser_timezone(client):
+    await client.patch("/api/v1/jarvis/profile", json={"location": {"timezone": ""}})
+
+    resp = await client.get("/api/v1/jarvis/time/context?browser_timezone=Mars/Olympus")
+
+    assert resp.status_code == 400
+    assert "Invalid timezone" in resp.json()["detail"]
+
+
+@pytest.mark.anyio
+async def test_browser_location_returns_city_timezone_and_weather(client, monkeypatch):
+    async def fake_fetch_location_metadata(lat: float, lng: float):
+        assert lat == 32.0603
+        assert lng == 118.7969
+        return {"label": "Nanjing", "weather": {"temperature_c": 25.0, "weather_code": 1}}
+
+    monkeypatch.setattr(jarvis_router, "_fetch_browser_location_metadata", fake_fetch_location_metadata)
+
+    resp = await client.post(
+        "/api/v1/jarvis/time/browser-location",
+        json={"lat": 32.0603, "lng": 118.7969, "browser_timezone": "Asia/Shanghai"},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["label"] == "Nanjing"
+    assert data["timezone"] == "Asia/Shanghai"
+    assert data["weather"]["temperature_c"] == 25.0
+
+
+@pytest.mark.anyio
+async def test_city_location_saves_when_weather_fails(client, monkeypatch):
+    async def fake_geocode_city(city_name: str):
+        assert city_name == "南京"
+
+        class _Result:
+            def to_dict(self):
+                return {"label": "南京市", "lat": 32.060255, "lng": 118.796877, "provider": "amap"}
+
+        return _Result()
+
+    async def fake_fetch_weather(lat: float, lng: float):
+        raise RuntimeError("weather unavailable")
+
+    monkeypatch.setattr("app.jarvis.geocoding.geocode_city", fake_geocode_city)
+    monkeypatch.setattr(jarvis_router, "_fetch_weather_for_location", fake_fetch_weather)
+
+    resp = await client.post(
+        "/api/v1/jarvis/time/city-location",
+        json={"city_name": "南京", "browser_timezone": "Asia/Shanghai"},
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["label"] == "南京市"
+    assert data["lat"] == 32.060255
+    assert data["lng"] == 118.796877
+    assert data["weather"]["error"] == "weather unavailable"
+
+
+@pytest.mark.asyncio
 async def test_chat_with_agent(client):
     resp = await client.post("/api/v1/jarvis/chat", json={
         "agent_id": "alfred",
@@ -129,6 +372,27 @@ async def test_chat_with_agent(client):
     context_resp = await client.get("/api/v1/jarvis/context")
     assert context_resp.status_code == 200
     assert context_resp.json()["source_agent"] == "user_chat"
+
+
+@pytest.mark.anyio
+async def test_chat_with_agent_uses_browser_timezone_for_default_profile(client_with_mock_llm):
+    client, mock_llm = client_with_mock_llm
+    await client.patch(
+        "/api/v1/jarvis/profile",
+        json={"location": {"label": "", "timezone": "Asia/Tokyo", "timezone_source": "auto"}},
+    )
+
+    resp = await client.post("/api/v1/jarvis/chat", json={
+        "agent_id": "alfred",
+        "message": "Plan my morning",
+        "session_id": "browser-timezone-session",
+        "browser_timezone": "America/Los_Angeles",
+    })
+
+    assert resp.status_code == 200
+    first_call = mock_llm.chat.await_args_list[0].kwargs
+    assert "America/Los_Angeles" in first_call["message"]
+    assert "Asia/Tokyo" not in first_call["message"]
 
 
 @pytest.mark.asyncio
