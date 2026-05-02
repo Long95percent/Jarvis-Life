@@ -72,6 +72,40 @@ async def test_local_lifestyle_graph_streams_roles_then_checkpoint():
 
 
 @pytest.mark.asyncio
+async def test_local_lifestyle_c_state_emits_activity_artifacts():
+    executor = LocalLifestyleGraphExecutor(llm_client=FakeLocalLifestyleLLM())
+    events = []
+
+    async for event in executor.start_round(
+        session_id="rt-local-c",
+        user_goal="今天附近有什么轻松活动",
+        context={"local_life_context": "附近近期活动缓存"},
+    ):
+        events.append(event)
+
+    names = [event["event"] for event in events]
+    stage_payloads = [json.loads(event["data"]) for event in events if event["event"] == "scenario_stage"]
+    state_payload = json.loads(next(event["data"] for event in events if event["event"] == "scenario_state"))
+
+    assert names.count("scenario_stage") == 7
+    assert [payload["stage_id"] for payload in stage_payloads] == [
+        "collect_constraints",
+        "discover_candidates",
+        "enrich_candidates",
+        "feasibility_score",
+        "energy_filter",
+        "rank_options",
+        "plan_candidate",
+    ]
+    assert state_payload["state_type"] == "local_lifestyle_c"
+    assert state_payload["graph_executor"] == "local_lifestyle_c_v1"
+    assert "user_constraints" in state_payload["artifacts"]
+    assert "candidate_pool" in state_payload["artifacts"]
+    assert "scorecards" in state_payload["artifacts"]
+    assert "ranked_activities" in state_payload["artifacts"]
+
+
+@pytest.mark.asyncio
 async def test_local_lifestyle_finalize_emits_brainstorm_result_and_done():
     executor = LocalLifestyleGraphExecutor(llm_client=FakeLocalLifestyleLLM())
     events = []
@@ -90,7 +124,9 @@ async def test_local_lifestyle_finalize_emits_brainstorm_result_and_done():
     assert names == ["final_result", "brainstorm_result", "done"]
     assert result["mode"] == "brainstorm"
     assert result["handoff_target"] == "maxwell"
-    assert result["context"]["graph_executor"] == "local_lifestyle_langgraph_v1"
+    assert result["context"]["graph_executor"] == "local_lifestyle_c_v1"
+    assert result["context"]["c_artifacts"]["state_type"] == "local_lifestyle_c"
+    assert "ranked_activities" in result["context"]
 
 
 def test_graph_round_dispatch_includes_local_lifestyle():

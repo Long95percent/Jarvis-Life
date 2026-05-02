@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from app.jarvis.intent_router import plan_agent_intent
+from app.jarvis.intent_router import plan_agent_intent, plan_roundtable_intent
 
 
 NOW = datetime(2026, 4, 30, 10, 0, 0)
@@ -130,3 +130,17 @@ def test_small_talk_is_chat_only():
 
     assert decision.intent == "chat_only"
     assert decision.next_action == "chat_only"
+
+
+def test_roundtable_document_read_intent_uses_shared_router():
+    decision = plan_roundtable_intent(
+        ["mira", "maxwell", "athena", "alfred"],
+        "帮我读一下 code-learning-paper 科研文档，然后继续讨论",
+        local_now=NOW,
+    )
+
+    assert decision.agent_id == "athena"
+    assert decision.intent == "document_read"
+    assert decision.tool_name == "file_read"
+    assert decision.next_action == "call_tool"
+    assert decision.slots["filename_query"] == "code-learning-paper"

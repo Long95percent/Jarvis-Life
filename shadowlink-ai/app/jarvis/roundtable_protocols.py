@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -114,6 +115,7 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
         result_contract={
             "mode": "decision",
             "fields": ["summary", "recommended_option", "options", "tradeoffs", "actions"],
+            "semantic_fields": ["calendar_adjustment_candidates", "protected_blocks", "pending_actions"],
         },
         safety_rules=[
             "不直接修改日历",
@@ -194,6 +196,7 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
         result_contract={
             "mode": "decision",
             "fields": ["summary", "recommended_option", "options", "tradeoffs", "actions"],
+            "semantic_fields": ["continue_or_recover_decision", "minimum_study_block", "recovery_boundary", "reschedule_option"],
         },
         safety_rules=[
             "不做诊断",
@@ -206,10 +209,22 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
         mode="brainstorm",
         phases=[
             _phase(
-                "candidate_discovery",
-                "候选发现",
+                "collect_constraints",
+                "收集约束",
+                "alfred",
+                "收集位置、时间、预算、偏好和体力约束。",
+                {
+                    "leo": "先询问或推断活动类型偏好，不急着推荐。",
+                    "maxwell": "关注可用时间和往返缓冲。",
+                    "nora": "关注体力、饮食和恢复负担。",
+                    "alfred": "把用户约束整理成筛选条件。",
+                },
+            ),
+            _phase(
+                "discover_candidates",
+                "发现候选",
                 "leo",
-                "先列出可做的本地活动候选。",
+                "基于上下文提出本地活动候选。",
                 {
                     "leo": "优先提出今天或近期仍有效的本地活动候选。",
                     "maxwell": "只补充时间窗口和往返缓冲。",
@@ -218,10 +233,22 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
                 },
             ),
             _phase(
-                "feasibility_filter",
-                "可行性过滤",
+                "enrich_candidates",
+                "补全候选事实",
+                "leo",
+                "补全候选的天气、距离、时效、交通和耗时事实。",
+                {
+                    "leo": "补足候选活动的关键事实；不确定时明确说明缺失。",
+                    "maxwell": "标记交通和耗时信息是否足够。",
+                    "nora": "标记体力和饮食信息是否足够。",
+                    "alfred": "记录哪些事实还需要用户补充。",
+                },
+            ),
+            _phase(
+                "feasibility_score",
+                "可行性评分",
                 "maxwell",
-                "过滤掉时间不合适、往返不合理或窗口过短的候选。",
+                "按时间窗口和往返缓冲给候选打可行性分。",
                 {
                     "leo": "保留仍然可去的活动。",
                     "maxwell": "优先筛掉时间不可行的活动。",
@@ -242,7 +269,7 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
                 },
             ),
             _phase(
-                "ranking",
+                "rank_options",
                 "候选排序",
                 "alfred",
                 "把候选按生活感、恢复友好度和可行性排序。",
@@ -254,15 +281,15 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
                 },
             ),
             _phase(
-                "recommendation",
-                "推荐输出",
-                "alfred",
-                "输出推荐结果、拒绝原因和可选的计划动作。",
+                "plan_candidate",
+                "计划候选",
+                "maxwell",
+                "把首选候选整理成可选待确认安排。",
                 {
-                    "leo": "保留本地活动推荐结论。",
-                    "maxwell": "保留时间可行性的最终结论。",
-                    "nora": "保留体力匹配的最终结论。",
-                    "alfred": "给出最终推荐和后续问题。",
+                    "leo": "保留活动体验结论。",
+                    "maxwell": "把首选活动整理成可确认安排，但不要直接写日程。",
+                    "nora": "保留活动前后的身体支持建议。",
+                    "alfred": "给出最终推荐、拒绝原因和后续问题。",
                 },
             ),
         ],
@@ -274,6 +301,7 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
         result_contract={
             "mode": "brainstorm",
             "fields": ["summary", "themes", "ideas", "tensions", "followup_questions"],
+            "semantic_fields": ["ranked_activities", "rejected_reasons", "fit_scores", "optional_plan_action"],
         },
         safety_rules=[
             "不声称已经实时搜索",
@@ -354,6 +382,7 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
         result_contract={
             "mode": "brainstorm",
             "fields": ["summary", "themes", "ideas", "tensions", "followup_questions"],
+            "semantic_fields": ["care_summary", "low_barrier_actions", "safety_note", "what_to_avoid"],
         },
         safety_rules=[
             "不制造紧迫感",
@@ -434,6 +463,7 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
         result_contract={
             "mode": "brainstorm",
             "fields": ["summary", "themes", "ideas", "tensions", "followup_questions"],
+            "semantic_fields": ["weekend_rhythm", "activity_blocks", "blank_blocks", "energy_budget", "optional_pending_plan"],
         },
         safety_rules=[
             "不要把周末排满",
@@ -458,6 +488,18 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
                 },
             ),
             _phase(
+                "ingest_context",
+                "吸收上下文",
+                "moderator",
+                "吸收用户文档、历史讨论和当前限制，决定本轮发散边界。",
+                {
+                    "moderator": "把上下文转成问题边界和讨论约束。",
+                    "explorer": "只基于已确认上下文准备发散。",
+                    "critic": "记录可能影响可行性的限制。",
+                    "synthesizer": "记录后续需要合并的主线。",
+                },
+            ),
+            _phase(
                 "divergent_ideas",
                 "发散想法",
                 "explorer",
@@ -467,6 +509,18 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
                     "explorer": "提出 2-3 个具体候选。",
                     "critic": "准备指出风险和验证成本。",
                     "synthesizer": "准备合并候选。",
+                },
+            ),
+            _phase(
+                "cluster_ideas",
+                "想法分组",
+                "explorer",
+                "把发散想法分组，避免后续批判阶段只看到散点。",
+                {
+                    "moderator": "确认分组仍围绕原问题。",
+                    "explorer": "把候选按主题或价值主线分组。",
+                    "critic": "准备按分组评估风险。",
+                    "synthesizer": "记录每组的共同主线。",
                 },
             ),
             _phase(
@@ -515,6 +569,7 @@ _SCENARIO_PROTOCOLS: dict[str, ScenarioProtocol] = {
         result_contract={
             "mode": "brainstorm",
             "fields": ["summary", "themes", "ideas", "tensions", "followup_questions"],
+            "semantic_fields": ["themes", "ideas", "risks", "minimum_validation_steps", "followup_questions"],
         },
         safety_rules=[
             "不调用 Jarvis 生活工具",
@@ -540,3 +595,42 @@ def select_roundtable_phase(protocol: ScenarioProtocol, turn_index: int) -> Roun
 def final_roundtable_phase(protocol: ScenarioProtocol) -> RoundtableProtocolPhase:
     return protocol.phases[-1]
 
+
+def format_roundtable_protocol_block(
+    protocol: ScenarioProtocol,
+    *,
+    turn_index: int,
+    agent_id: str,
+    stage_id: str | None = None,
+) -> str:
+    phase = next((item for item in protocol.phases if item.id == stage_id), None) if stage_id else None
+    if phase is None:
+        phase = select_roundtable_phase(protocol, turn_index)
+    role_instruction = phase.role_instructions.get(agent_id, "从你的角色职责回应当前阶段目标。")
+    lines = [
+        "## 场景协议",
+        f"protocol_id: {protocol.scenario_id}",
+        f"protocol_mode: {protocol.mode}",
+        "phase_sequence: " + ", ".join(item.id for item in protocol.phases),
+        f"current_phase: {phase.id}",
+        f"current_phase_title: {phase.title}",
+        f"current_phase_owner: {phase.owner_agent or 'shared'}",
+        f"current_phase_objective: {phase.objective}",
+        f"current_role_instruction: {role_instruction}",
+        "tool_policy: " + json.dumps(protocol.tool_policy, ensure_ascii=False, default=str),
+        "safety_rules: " + "；".join(protocol.safety_rules),
+        "result_contract: " + json.dumps(protocol.result_contract, ensure_ascii=False, default=str),
+    ]
+    if phase.id == "crossfire":
+        lines.append("crossfire_rule: 必须回应前面发言中的至少一个共识、分歧、风险或约束。")
+    return "\n".join(lines)
+
+
+def protocol_context(protocol: ScenarioProtocol) -> dict[str, Any]:
+    return {
+        "scenario_protocol_id": protocol.scenario_id,
+        "scenario_protocol_mode": protocol.mode,
+        "scenario_protocol_phases": [phase.id for phase in protocol.phases],
+        "scenario_protocol_handoff_target": protocol.handoff_target,
+        "scenario_protocol_result_contract": protocol.result_contract,
+    }

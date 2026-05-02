@@ -77,6 +77,63 @@ def plan_agent_intent(
     return decision
 
 
+def plan_roundtable_intent(
+    participants: list[str],
+    message: str,
+    local_now: datetime | None = None,
+) -> AgentIntentDecision:
+    """Plan shared intents for roundtable turns.
+
+    The roundtable calls this central router, then adapts the returned intent
+    into roundtable-specific context injection or actions.
+    """
+
+    now = local_now or datetime.now()
+    text = _normalize(message)
+    if not text:
+        return _chat_only(_roundtable_intent_agent(participants), "empty_message")
+
+    document_query = _extract_document_filename_query(text)
+    if document_query is not None:
+        agent_id = _roundtable_intent_agent(participants)
+        return _decision(
+            agent_id,
+            intent="document_read",
+            tool_name="file_read",
+            confidence=0.84,
+            slots={
+                "filename_query": document_query,
+                "raw_message": text,
+                "max_chars": 12000,
+                "source": "roundtable",
+            },
+            reason="roundtable_document_read",
+        )
+
+    for agent_id in _roundtable_agent_order(participants):
+        decision = plan_agent_intent(agent_id, text, local_now=now)
+        if decision.next_action != "chat_only":
+            return decision
+    return _chat_only(_roundtable_intent_agent(participants), "no_roundtable_intent")
+
+
+def _roundtable_agent_order(participants: list[str]) -> list[str]:
+    supported = {"maxwell", "nora", "mira", "leo", "athena"}
+    preferred = ["athena", "maxwell", "mira", "nora", "leo"]
+    ordered = [agent_id for agent_id in preferred if agent_id in participants and agent_id in supported]
+    ordered.extend(agent_id for agent_id in participants if agent_id in supported and agent_id not in ordered)
+    return ordered
+
+
+def _roundtable_intent_agent(participants: list[str]) -> str:
+    ordered = _roundtable_agent_order(participants)
+    if ordered:
+        return ordered[0]
+    if "alfred" in participants:
+        return "alfred"
+    return participants[0] if participants else "alfred"
+
+
 def _plan_local_life(agent_id: str, text: str, now: datetime) -> AgentIntentDecision | None:
     nearby_markers = ["附近", "周边", "本地", "附近的", "这附近"]
     discovery_markers = ["活动", "市集", "展览", "去哪", "哪里", "推荐", "找一个", "找个", "有什么", "可以去"]
@@ -364,6 +421,66 @@ def _is_small_talk(text: str) -> bool:
     small_talk_markers = ["你好", "早上好", "晚上好", "今天还不错", "谢谢", "辛苦了"]
     action_markers = ["安排", "提醒", "吃", "喝", "营养", "焦虑", "活动", "回访", "计划"]
     return _has_any(text, small_talk_markers) and not _has_any(text, action_markers)
+
+
+_DOCUMENT_READ_MARKERS = [
+    "读",
+    "读取",
+    "看一下",
+    "总结",
+    "文档",
+    "文件",
+    "科研",
+    "论文",
+    "file",
+    "document",
+    "read",
+    "summarize",
+    "summary",
+]
+
+_DOCUMENT_FILENAME_STOPWORDS = {
+    "帮我",
+    "读一下",
+    "读取",
+    "看一下",
+    "总结",
+    "本地",
+    "科研",
+    "文档",
+    "文件",
+    "论文",
+    "一下",
+    "然后",
+    "继续",
+    "讨论",
+    "给",
+    "read",
+    "file",
+    "document",
+    "summarize",
+    "summary",
+    "local",
+}
+
+
+def _extract_document_filename_query(text: str) -> str | None:
+    if not _has_any(text, _DOCUMENT_READ_MARKERS):
+        return None
+
+    ascii_tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]{1,}", text)
+    if ascii_tokens:
+        return max(ascii_tokens, key=len)
+
+    chinese_tokens = re.findall(r"[\u4e00-\u9fff]{2,}", text)
+    for token in chinese_tokens:
+        cleaned = token
+        for stopword in _DOCUMENT_FILENAME_STOPWORDS:
+            cleaned = cleaned.replace(stopword, "")
+        cleaned = cleaned.strip()
+        if len(cleaned) >= 2:
+            return cleaned
+    return None
 
 
 def _extract_calendar_title(text: str) -> str:

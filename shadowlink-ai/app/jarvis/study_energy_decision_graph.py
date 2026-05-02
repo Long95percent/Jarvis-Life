@@ -10,7 +10,15 @@ from app.jarvis.roundtable_graph import (
     RoundtableGraphState,
     RoundtableRoleOutput,
     RoundtableRoundSummary,
+    roundtable_content_deltas,
     round_event,
+    run_roundtable_agent_turn,
+)
+from app.jarvis.roundtable_protocols import (
+    final_roundtable_phase,
+    format_roundtable_protocol_block,
+    get_roundtable_protocol,
+    protocol_context,
 )
 
 
@@ -147,7 +155,6 @@ class StudyEnergyDecisionGraphExecutor:
 
     async def _run_role(self, state: RoundtableGraphState, agent_id: str) -> AsyncIterator[dict[str, str]]:
         agent = get_agent(agent_id)
-        content_parts: list[str] = []
         yield round_event(
             "role_started",
             {
@@ -159,20 +166,23 @@ class StudyEnergyDecisionGraphExecutor:
                 "round_index": state.round_index,
             },
         )
-        async for delta in self.llm_client.chat_stream(
+        turn_result = await run_roundtable_agent_turn(
+            agent_id=agent_id,
+            llm_client=self.llm_client,
             message=self._role_prompt(state, agent_id),
             system_prompt=agent["system_prompt"],
             temperature=0.35,
-        ):
-            content_parts.append(delta)
+            session_id=state.session_id,
+            enable_tools=True,
+        )
+        for delta in roundtable_content_deltas(turn_result.content):
             yield round_event("role_delta", {"agent_id": agent_id, "delta": delta, "round_index": state.round_index})
 
-        content = "".join(content_parts).strip()
         output = RoundtableRoleOutput(
             agent_id=agent_id,
             agent_name=agent["name"],
             role=agent["role"],
-            content=content,
+            content=turn_result.content,
             round_index=state.round_index,
         )
         state.role_outputs.append(output)
@@ -185,11 +195,19 @@ class StudyEnergyDecisionGraphExecutor:
                 "agent_icon": agent.get("icon"),
                 "agent_color": agent.get("color"),
                 "content": output.content,
+                "tool_results": turn_result.tool_results,
+                "action_results": turn_result.action_results,
                 "round_index": output.round_index,
             },
         )
 
     def _role_prompt(self, state: RoundtableGraphState, agent_id: str) -> str:
+        protocol = get_roundtable_protocol("study_energy_decision")
+        protocol_block = format_roundtable_protocol_block(
+            protocol,
+            turn_index=len(state.role_outputs),
+            agent_id=agent_id,
+        )
         feedback = "\n".join(f"- {item}" for item in state.user_feedback_history) or "无"
         previous = "\n\n".join(f"{item.agent_name}: {item.content}" for item in state.role_outputs) or "无"
         role_tasks = {
@@ -201,19 +219,25 @@ class StudyEnergyDecisionGraphExecutor:
         return (
             "## 疲惫学习决策圆桌\n"
             f"用户诉求: {state.user_goal}\n\n"
+            f"{protocol_block}\n\n"
             f"结构化上下文: {json.dumps(state.context, ensure_ascii=False, default=str)[:5000]}\n\n"
             f"用户上一轮反馈:\n{feedback}\n\n"
             f"前面角色公开发言:\n{previous}\n\n"
-            f"你的职责: {role_tasks.get(agent_id, '从你的角色视角给出建议。')}\n"
+            f"你的基础职责: {role_tasks.get(agent_id, '从你的角色视角给出建议。')}\n"
+            "请优先遵守场景协议里的 current_phase 和 current_role_instruction。\n"
             "请输出面向用户公开展示的会议发言，3-5 句。"
             "只展示结论、依据和取舍，不要展示隐藏思维链，不要诊断，不要直接承诺修改日程。"
         )
 
     async def _summarize_round(self, state: RoundtableGraphState) -> RoundtableRoundSummary:
+        protocol = get_roundtable_protocol("study_energy_decision")
+        final_phase = final_roundtable_phase(protocol)
         prompt = (
             "请把疲惫学习决策圆桌本轮讨论整理成严格 JSON。"
             "字段必须为 minutes, consensus, disagreements, questions_for_user, next_round_focus。"
             "minutes 是对象数组，每项至少包含 agent_id 和 summary。不要输出 Markdown。\n\n"
+            f"场景协议阶段: {', '.join(phase.id for phase in protocol.phases)}\n"
+            f"最终收敛阶段: {final_phase.id} - {final_phase.objective}\n\n"
             + "\n\n".join(f"{item.agent_id}: {item.content}" for item in state.role_outputs)
         )
         raw = await self.llm_client.chat(message=prompt, system_prompt=get_agent("alfred")["system_prompt"], temperature=0.2)
@@ -237,9 +261,14 @@ class StudyEnergyDecisionGraphExecutor:
         feedback_history: list[str],
         round_summaries: list[RoundtableRoundSummary],
     ) -> dict[str, Any]:
+        protocol = get_roundtable_protocol("study_energy_decision")
+        final_phase = final_roundtable_phase(protocol)
         prompt = (
             "请基于疲惫学习决策圆桌，输出严格 JSON，字段为 summary, recommended_option, options, tradeoffs, actions。"
             "actions 必须是待确认动作，不要表示已经修改日程或已经完成学习。\n\n"
+            f"场景协议: {protocol.scenario_id}\n"
+            f"最终阶段: {final_phase.id} - {final_phase.objective}\n"
+            f"结果契约: {json.dumps(protocol.result_contract, ensure_ascii=False, default=str)}\n"
             f"用户诉求: {user_goal}\n"
             f"用户反馈: {json.dumps(feedback_history, ensure_ascii=False)}\n"
             f"上下文: {json.dumps(context, ensure_ascii=False, default=str)[:5000]}"
@@ -272,6 +301,7 @@ class StudyEnergyDecisionGraphExecutor:
             "handoff_target": "maxwell",
             "context": {
                 **context,
+                **protocol_context(protocol),
                 "user_input": user_goal,
                 "scenario_id": "study_energy_decision",
                 "graph_executor": GRAPH_EXECUTOR_ID,

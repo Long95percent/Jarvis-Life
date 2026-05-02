@@ -161,6 +161,27 @@ def _build_schedule_guard(arguments: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def _deferred_confirmation_result(
+    *,
+    tool_name: str,
+    description: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    confirmation_arguments = dict(arguments)
+    if tool_name == "jarvis_calendar_add":
+        schedule_guard = _build_schedule_guard(confirmation_arguments)
+        if schedule_guard is not None:
+            confirmation_arguments["schedule_guard"] = schedule_guard
+    return {
+        "tool_name": tool_name,
+        "success": True,
+        "requires_confirmation": True,
+        "confirmation_id": uuid4().hex,
+        "description": description,
+        "arguments": confirmation_arguments,
+    }
+
+
 def get_allowed_tool_names(agent_id: str) -> list[str]:
     agent = get_agent(agent_id)
     return list(agent.get("tool_whitelist", []))
@@ -368,9 +389,15 @@ def strip_tool_like_blocks(text: str) -> tuple[str, list[dict[str, Any]]]:
     return fully_clean, calls + legacy_calls + bash_calls
 
 
-async def execute_tool_calls(agent_id: str, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def execute_tool_calls(
+    agent_id: str,
+    calls: list[dict[str, Any]],
+    *,
+    defer_confirmation_tools: set[str] | None = None,
+) -> list[dict[str, Any]]:
     registry = _get_registry()
     allowed_names = set(get_allowed_tool_names(agent_id))
+    deferred_names = defer_confirmation_tools or set()
     results: list[dict[str, Any]] = []
 
     if registry is None:
@@ -399,20 +426,12 @@ async def execute_tool_calls(agent_id: str, calls: list[dict[str, Any]]) -> list
 
         tool_info, handler = registered
 
-        if getattr(handler, "requires_confirmation", False) and tool_name != "jarvis_task_plan_decompose":
-            confirmation_arguments = dict(arguments)
-            if tool_name == "jarvis_calendar_add":
-                schedule_guard = _build_schedule_guard(confirmation_arguments)
-                if schedule_guard is not None:
-                    confirmation_arguments["schedule_guard"] = schedule_guard
-            results.append({
-                "tool_name": tool_name,
-                "success": True,
-                "requires_confirmation": True,
-                "confirmation_id": uuid4().hex,
-                "description": tool_info.description,
-                "arguments": confirmation_arguments,
-            })
+        if tool_name in deferred_names or (getattr(handler, "requires_confirmation", False) and tool_name != "jarvis_task_plan_decompose"):
+            results.append(_deferred_confirmation_result(
+                tool_name=tool_name,
+                description=tool_info.description,
+                arguments=arguments,
+            ))
             continue
 
         try:
@@ -457,7 +476,7 @@ def to_action_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }:
             continue
 
-        if item.get("requires_confirmation") and tool_name != "jarvis_task_plan_decompose":
+        if item.get("requires_confirmation"):
             output = item.get("output") if isinstance(item.get("output"), dict) else {}
             arguments = item.get("arguments", {})
             if output:
@@ -510,6 +529,7 @@ async def run_agent_turn(
     message: str,
     system_prompt: str,
     temperature: float = 0.7,
+    defer_confirmation_tools: set[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     toolkit_prompt = build_toolkit_prompt(agent_id)
     first_message = f"{message}\n\n{toolkit_prompt}" if toolkit_prompt else message
@@ -523,7 +543,11 @@ async def run_agent_turn(
     if not calls:
         return first_reply, []
 
-    tool_results = await execute_tool_calls(agent_id, calls)
+    tool_results = await execute_tool_calls(
+        agent_id,
+        calls,
+        defer_confirmation_tools=defer_confirmation_tools,
+    )
     followup_parts = [message]
     if draft_text:
         followup_parts.extend(["", "## 你的上一版草稿（可重写）", draft_text])
@@ -544,4 +568,3 @@ async def run_agent_turn(
     )
     clean_final, _ = strip_tool_like_blocks((final_reply or "").strip())
     return clean_final or draft_text or "", tool_results
-

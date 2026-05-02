@@ -246,6 +246,25 @@ jarvisPendingActionApi.cancelPendingAction(pendingId: string): Promise<PendingAc
 
 ---
 
+### 2.9 Roundtable / 圆桌 SSE
+
+文件：
+
+- `shadowlink-web/src/components/jarvis/RoundtableStage.tsx`
+- `shadowlink-web/src/components/jarvis/roundtableStageLogic.ts`
+- `shadowlink-web/src/services/jarvisApi.ts`
+
+前端开发注意：
+
+- 圆桌 start / continue 目前仍在 `RoundtableStage.tsx` 内直接消费 SSE；这是圆桌模块边界内的例外，不要扩散到普通组件。
+- 圆桌前端界面和功能逻辑的完整设计要求见 `docs/解耦接口说明/roundtable-frontend-design-guide.md`；这里不重复维护场景级 UI 细节。
+- 场景模式必须和后端一致：`schedule_coord`、`study_energy_decision` 是 decision，其余预设圆桌是 brainstorm。
+- `role_completed.action_results` 不是纯待确认数组；只有 `pending_confirmation === true` 的 action 才能显示为待确认数量。
+- `scenario_state.next_routes` 是后端给出的下一轮建议路线，前端可以渲染为按钮；点击按钮只把 `prompt` 填进输入框，由用户再发送 continue。
+- 圆桌相关纯展示/解析逻辑优先放到 `roundtableStageLogic.ts`，避免把 `RoundtableStage.tsx` 继续堆大。
+
+---
+
 ## 3. 前端开发人员可以改什么
 
 ### 3.1 可以直接改的 UI 文件
@@ -294,6 +313,7 @@ jarvisPendingActionApi.cancelPendingAction(pendingId: string): Promise<PendingAc
 | `shadowlink-web/src/components/jarvis/AgentChatPanel.tsx` | 私聊主链路，里面还有发送流、行为埋点、局部状态 |
 | `shadowlink-web/src/components/jarvis/CalendarPanel.tsx` | 日程大面板，状态和交互很多 |
 | `shadowlink-web/src/components/jarvis/RoundtableStage.tsx` | 圆桌内部业务，和 SSE 流式事件有关 |
+| `shadowlink-web/src/components/jarvis/roundtableStageLogic.ts` | 圆桌前端纯逻辑 helper，影响场景模式、pending 计数、next_routes 展示 |
 
 可以做：
 
@@ -391,6 +411,7 @@ shadowlink-web/src/stores/jarvisStore.ts
 
 ```text
 shadowlink-web/src/components/jarvis/RoundtableStage.tsx
+shadowlink-web/src/components/jarvis/roundtableStageLogic.ts
 ```
 
 可以改：
@@ -398,6 +419,7 @@ shadowlink-web/src/components/jarvis/RoundtableStage.tsx
 - 圆桌内部 UI。
 - 圆桌内部阶段展示。
 - 圆桌内部业务交互。
+- 圆桌 SSE payload 的纯解析和展示 helper。
 
 ### 5.2 圆桌开发人员不要改
 
@@ -413,6 +435,18 @@ shadowlink-web/src/components/jarvis/AgentChatPanel.tsx
 - 圆桌怎么返回私聊。
 - 历史对话怎么打开圆桌。
 - 主界面怎么切换圆桌/私聊。
+
+圆桌现在的后端行为边界是：
+
+- `start` / `continue` 会先复用共享意图识别，再把只读工具结果或缺槽信息注入圆桌上下文。
+- 六个预设圆桌场景的角色回合都经过共享 agent-turn 入口；Jarvis 角色可按自己的工具白名单动态判断是否用工具。
+- 六个预设圆桌场景会读取后端内部 `ScenarioProtocol`，因此每个场景现在有自己的阶段顺序和结果契约；这不要求前端新增请求字段。
+- `work_brainstorm` 和 `local_lifestyle` 现在会额外发 `scenario_stage` / `scenario_state`，前端可以在结果卡和完整记录里展示它们的专属中间产物。
+- `scenario_state.next_routes` 可以展示为下一轮路线按钮；按钮只能把后端 prompt 填进输入框，不能替用户直接执行。
+- 当前 `RoundtableStage.tsx` 已支持这些增强字段：进行中展示当前阶段和阶段轨迹；结果卡展示协议阶段；本地生活展示 `ranked_activities`；工作脑暴展示 `risks` / `minimum_validation_steps`；完整记录里展示每个角色的工具数量和 pending confirmation 数量。
+- `crossfire` 当前是轻量交叉质询阶段，表现为角色 prompt 约束和 final result 上下文追踪，不是新的必处理 SSE event。
+- 写操作仍只生成待确认动作，不直接改日历、计划或关怀数据；`jarvis_task_plan_decompose` 在圆桌中也按待确认动作处理，不能直接生成计划或日历投射。
+- 前端如果以后接圆桌的增强事件，也要按这个确认链路理解，不要把圆桌当成直接执行层。
 
 圆桌接口单独看：
 

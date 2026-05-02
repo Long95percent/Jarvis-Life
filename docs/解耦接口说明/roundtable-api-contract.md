@@ -10,6 +10,8 @@
 
 **路径前缀：** 当前 FastAPI 注册后实际路径为 `/api/v1/jarvis/...`。
 
+**前端设计指南：** 圆桌界面、交互、结果卡和场景专属 UI 要求见 `docs/解耦接口说明/roundtable-frontend-design-guide.md`。本文只维护接口契约和后端行为边界。
+
 ---
 
 ## 1. 边界规则
@@ -18,6 +20,10 @@
 - 主聊天只负责传入 `source_session_id`、`source_agent_id`、`scenario_id`、`user_input`，并接收 return 结果。
 - 圆桌接口路径保持稳定，内部拆文件不要求前端改 URL。
 - 圆桌产生的日程/计划/记忆写入必须通过 pending action 或明确用户点击，不直接悄悄改其它模块数据。
+- 圆桌 start / continue 会复用私聊同一套意图识别入口；只读工具可以直接注入圆桌上下文，写操作仍只生成待确认动作，不直接落日历或计划。
+- `jarvis_task_plan_decompose` 在私聊里可能直接生成 plan / plan_day / calendar projection；圆桌里必须作为 deferred confirmation tool 处理，只生成 `pending_confirmation`，不能直接执行。
+- 六个预设圆桌场景的角色发言都经过共享的 agent-turn 工具决策入口：Jarvis 角色可在自己的回合按白名单动态调用工具，`work_brainstorm` 角色没有 Jarvis 工具白名单时保持无工具发言。
+- 六个预设圆桌场景现在还会读取后端内部 `ScenarioProtocol`：每个场景有自己的阶段顺序、角色职责、工具策略、结果契约和写入边界。该协议是圆桌内部实现，不改变前端请求路径。
 
 ---
 
@@ -125,9 +131,68 @@
 
 前端要求：
 
-- 不要假设每次都有 `decision_result` 或 `brainstorm_result`，要按场景模式判断。
+- 不要假设每次都有 `decision_result` 或 `brainstorm_result`，要按场景模式判断：`schedule_coord`、`study_energy_decision` 是 decision，其余预设圆桌是 brainstorm。
+- `role_completed` 事件可能包含 `tool_results` 和 `action_results`；前端可以忽略这两个字段，但不能因为新增字段报错。
+- `role_completed.action_results` 不等于“待确认动作列表”；只有 `pending_confirmation === true` 的 action 才能显示为待确认数量。
 - 遇到 `agent_degraded` 不要白屏，继续展示 fallback 内容。
 - `done` 只代表本轮结束，不代表用户已经接受/保存/返回。
+
+### 4.1 圆桌意图注入
+
+圆桌在 `start` / `continue` 阶段会先跑共享意图识别，再把结果拼进本轮上下文：
+
+- `document_read`：读取本地文本类文档，注入临时文档上下文。
+- `call_tool`：执行只读或分析工具，把结果注入圆桌上下文。
+- `ask_missing_slots`：把缺少的信息写进上下文，让这一轮围绕补槽/澄清继续讨论。
+- `pending_confirmation`：生成待确认动作，不直接写日历、计划或关怀数据。
+- 特别规则：`jarvis_task_plan_decompose` 即使在工具 runtime 中不是通用 `requires_confirmation`，圆桌也必须把它转成 pending action，因为它的执行结果可能写入计划、计划日和日历投射。
+
+前端如果后续消费 SSE 增强事件，也要按这个边界理解：圆桌可以“智能执行”，但写操作仍然要走确认链路。
+
+角色发言阶段也会走共享 agent-turn 工具决策：
+
+- `schedule_coord`、`study_energy_decision`：使用决策型阶段协议和各自 `tool_whitelist` 动态判断是否需要工具。
+- `local_lifestyle`、`emotional_care`、`weekend_recharge`：使用脑暴型阶段协议和各自 `tool_whitelist` 动态判断是否需要工具。
+- `work_brainstorm`：使用 brainstorm 专用角色，没有 Jarvis 工具白名单，因此本阶段不开放 Jarvis 工具。
+- 角色回合中产生的写操作仍只会形成 pending action，结果通过 `role_completed.action_results` 暴露，不直接写入目标业务数据；前端展示“待确认”时必须过滤 `pending_confirmation === true`。
+
+### 4.1.1 文档读取候选规则
+
+`document_read` 只支持文本类文件。候选文件按以下规则排序：
+
+1. 文件名、stem、关键词 token 计算 score。
+2. score 高者优先。
+3. score 相同时路径更短者优先。
+4. 只有 score 和路径长度都相同的多个候选，才返回 `ambiguous`。
+5. 无候选返回 `not_found`。
+
+前端目前不需要单独处理 `not_found` / `ambiguous` SSE 事件，因为结果会进入圆桌上下文；后续如果增加可视化提示，必须保留上述候选语义。
+
+### 4.2 圆桌场景协议
+
+六个预设场景不再只共享一套通用顺序发言逻辑。后端在 `app/jarvis/roundtable_protocols.py` 中维护 `ScenarioProtocol`，executor 会把对应协议拼进 agent turn prompt：
+
+| 场景 | 模式 | 阶段协议 | 写入边界 |
+| --- | --- | --- | --- |
+| `schedule_coord` | decision | `context_scan -> conflict_check -> role_proposal -> crossfire -> alfred_decision` | `pending_confirmation_only` |
+| `study_energy_decision` | decision | `energy_gate -> task_value_check -> minimum_viable_study -> crossfire -> decision` | `pending_confirmation_only` |
+| `local_lifestyle` | brainstorm | `collect_constraints -> discover_candidates -> enrich_candidates -> feasibility_score -> energy_filter -> rank_options -> plan_candidate` | `optional_pending_confirmation` |
+| `emotional_care` | brainstorm | `safety_check -> emotional_validation -> body_support -> low_stimulation_options -> care_summary` | `no_direct_write` |
+| `weekend_recharge` | brainstorm | `recovery_goal -> available_blocks -> activity_rest_balance -> crossfire -> weekend_rhythm` | `optional_pending_confirmation` |
+| `work_brainstorm` | brainstorm | `frame_problem -> ingest_context -> divergent_ideas -> cluster_ideas -> critic_review -> synthesis -> validation_plan` | `no_direct_write` |
+
+说明：
+
+- `crossfire` 是当前 B 方案里的轻量交叉质询阶段：后发言角色必须回应前面至少一个共识、分歧、风险或约束；它还不是完整的多轮互相追问状态机。
+- `ScenarioProtocol` 只影响圆桌内部 prompt、总结和 final result 上下文，不新增必填请求字段。
+- 每个协议的 `result_contract` 同时记录对外通用字段和场景语义字段，例如 `schedule_coord.calendar_adjustment_candidates`、`study_energy_decision.minimum_study_block`、`work_brainstorm.minimum_validation_steps`。
+- final result 的 `context` 可能包含 `scenario_protocol_id`、`scenario_protocol_mode`、`scenario_protocol_phases` 等可选调试/追踪字段；前端可以忽略。
+- 圆桌流里现在还会发两个可选增强事件：
+  - `scenario_stage`：标记当前场景正处于哪个 C/B 阶段。
+  - `scenario_state`：在本轮收敛后给出场景专属中间产物，前端可选展示；payload 可带 `artifacts` 和 `next_routes`。
+- `scenario_state.next_routes` 是下一轮建议路线数组，每项可包含 `label`、`target_stage`、`prompt`。前端可以渲染为按钮，但点击后只能把 `prompt` 带入下一轮 `continue`，不能直接跳过用户确认。
+- `RoundtableStage.tsx` 目前已经支持这些增强事件：进行中会展示当前场景阶段、最近阶段轨迹和 C 方案中间产物；最终结果卡会展示协议阶段、`local_lifestyle.ranked_activities`、`work_brainstorm.risks`、`work_brainstorm.minimum_validation_steps` 和 `next_routes`。
+- `role_completed.tool_results` / `role_completed.action_results` 目前只作为前端可视化计数和待确认提示来源，不代表圆桌已经直接写入业务数据；待确认数量只统计 `pending_confirmation === true`。
 
 ---
 
@@ -304,7 +369,3 @@
 - **设置/记忆/历史：还没完成。**
 
 所以目前只能说：**已经具备并行开发的边界雏形，但不是每个模块都完成了解耦。** 最安全的并行方式仍然是：圆桌业务开发人员只推进圆桌内部业务逻辑；你维护入口/跳转和前端 service 解耦；后端其它 router 拆分等前端边界稳定后再推进。
-
-
-
-

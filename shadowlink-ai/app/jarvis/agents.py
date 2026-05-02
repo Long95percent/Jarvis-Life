@@ -224,6 +224,7 @@ JARVIS_AGENTS: dict[str, dict] = {
             "jarvis_task_prioritize",
             "jarvis_deadline_check",
             "jarvis_local_life_search",
+            "file_read",
         ],
         "proactive_triggers": ["deadline_approaching", "schedule_overload"],
         "interrupt_budget": 2,
