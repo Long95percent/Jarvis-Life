@@ -1,6 +1,10 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { jarvisScheduleApi } from "@/services/jarvisScheduleApi";
-import { jarvisSettingsApi, type JarvisTimeContext } from "@/services/jarvisSettingsApi";
+import {
+  jarvisSettingsApi,
+  type JarvisTimeContext,
+  type UserProfile,
+} from "@/services/jarvisSettingsApi";
 import { useJarvisStore } from "@/stores/jarvisStore";
 
 interface DashboardCardsProps {
@@ -16,207 +20,120 @@ interface WeatherSnapshot {
   error?: string;
 }
 
+export interface JarvisHeaderSnapshot {
+  displayName: string;
+  greeting: string;
+  subtitle: string;
+  timeLabel: string;
+  dateLabel: string;
+  weatherIcon: string;
+  weatherLabel: string;
+  temperatureLabel: string;
+  locationLabel: string;
+  loading: boolean;
+}
+
 const MOOD_EMOJI: Record<string, string> = {
   positive: "😊",
-  neutral: "😐",
+  neutral: "😌",
   negative: "😟",
-  unknown: "🤷",
+  unknown: "🤖",
 };
 
-function decodeWeather(code: number | undefined): { icon: string; label: string } {
-  if (code === undefined) return { icon: "🌤️", label: "未知" };
-  if (code === 0) return { icon: "☀️", label: "晴" };
-  if (code >= 1 && code <= 3) return { icon: "⛅", label: "多云" };
+export function decodeWeather(code: number | undefined): {
+  icon: string;
+  label: string;
+} {
+  if (code === undefined) return { icon: "🌙", label: "天气同步中" };
+  if (code === 0) return { icon: "☀️", label: "晴朗" };
+  if (code >= 1 && code <= 3) return { icon: "⛅", label: "晴间多云" };
   if (code === 45 || code === 48) return { icon: "🌫️", label: "雾" };
-  if ((code >= 51 && code <= 57) || (code >= 61 && code <= 67)) return { icon: "🌧️", label: "雨" };
-  if (code >= 71 && code <= 77) return { icon: "❄️", label: "雪" };
+  if ((code >= 51 && code <= 57) || (code >= 61 && code <= 67)) {
+    return { icon: "🌧️", label: "有雨" };
+  }
+  if (code >= 71 && code <= 77) return { icon: "❄️", label: "有雪" };
   if (code >= 80 && code <= 82) return { icon: "🌦️", label: "阵雨" };
   if (code >= 85 && code <= 86) return { icon: "🌨️", label: "阵雪" };
   if (code >= 95) return { icon: "⛈️", label: "雷雨" };
-  return { icon: "🌤️", label: "未知" };
+  return { icon: "🌤️", label: "天气同步中" };
 }
 
 function formatEventTime(iso: string): string {
   try {
-    return new Date(iso).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+    return new Date(iso).toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   } catch {
     return "";
   }
 }
 
-const ScheduleCard: React.FC<{ onOpenCalendar?: () => void }> = ({ onOpenCalendar }) => {
-  const context = useJarvisStore((s) => s.context);
-  const events = context?.active_events ?? [];
+function buildGreeting(date: Date, name: string): string {
+  const hour = date.getHours();
+  if (hour < 5) return `夜深了，${name}`;
+  if (hour < 11) return `早上好，${name}`;
+  if (hour < 14) return `中午好，${name}`;
+  if (hour < 18) return `下午好，${name}`;
+  return `晚上好，${name}`;
+}
 
-  return (
-    <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-semibold text-gray-700">📅 今日日程</h3>
-        <button
-          type="button"
-          className="text-[10px] text-[var(--color-primary)] hover:underline"
-          onClick={onOpenCalendar}
-        >
-          打开日历 · {events.length} 项
-        </button>
-      </div>
-      {events.length === 0 ? (
-        <p className="text-xs text-gray-400 py-3 text-center">今天暂无安排</p>
-      ) : (
-        <ul className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
-          {events.map((event, index) => (
-            <li key={event.id ?? index} className="flex items-center gap-2 text-xs text-gray-700">
-              <span className="w-1 h-1 rounded-full bg-[var(--color-primary)] flex-shrink-0" />
-              <span className="truncate flex-1">{event.title}</span>
-              <span className="text-gray-400 text-[10px] flex-shrink-0">
-                {formatEventTime(event.start)}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
-};
-
-const LifeStateCard: React.FC = () => {
-  const context = useJarvisStore((s) => s.context);
-
-  if (!context) {
-    return (
-      <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-        <h3 className="text-sm font-semibold text-gray-700 mb-2">💓 生活状态</h3>
-        <p className="text-xs text-gray-400 text-center py-3">加载中…</p>
-      </div>
-    );
+function buildSubtitle(
+  now: Date,
+  scheduleCount: number,
+  stressLevel: number | null,
+): string {
+  const hour = now.getHours();
+  if (stressLevel !== null && stressLevel >= 7) {
+    return "今天负荷有点高，我们可以先把最重要的一件事理顺。";
   }
+  if (scheduleCount >= 4) {
+    return "今天安排不少，优先把节奏和缓冲时间照顾好。";
+  }
+  if (hour < 11) {
+    return "适合先定下今天的节奏，再进入重点事项。";
+  }
+  if (hour < 18) {
+    return "状态正在推进中，适合把当下最重要的事往前推一步。";
+  }
+  return "今晚状态不错，适合规划明天或做一个轻松收尾。";
+}
 
-  const metrics: Array<{ label: string; value: number; color: string }> = [
-    { label: "压力", value: context.stress_level, color: context.stress_level > 7 ? "#EF4444" : "#6C63FF" },
-    { label: "日程", value: context.schedule_density, color: "#3B82F6" },
-    { label: "睡眠", value: context.sleep_quality, color: "#10B981" },
-  ];
-
-  return (
-    <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-sm font-semibold text-gray-700">💓 生活状态</h3>
-        <span className="text-xl" title={context.mood_trend}>
-          {MOOD_EMOJI[context.mood_trend] ?? "🤷"}
-        </span>
-      </div>
-      <div className="space-y-2">
-        {metrics.map((metric) => {
-          const percentage = Math.min(100, (metric.value / 10) * 100);
-          return (
-            <div key={metric.label}>
-              <div className="flex justify-between text-[10px] text-gray-500 mb-1">
-                <span>{metric.label}</span>
-                <span>{metric.value.toFixed(1)}</span>
-              </div>
-              <div className="h-1.5 rounded-full bg-gray-100 overflow-hidden">
-                <div
-                  className="h-full rounded-full transition-all duration-700"
-                  style={{ width: `${percentage}%`, backgroundColor: metric.color }}
-                />
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-};
-
-const WeatherCard: React.FC = () => {
-  const [weather, setWeather] = useState<WeatherSnapshot | null>(null);
-  const [locationLabel, setLocationLabel] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const loadWeather = async () => {
-      setLoading(true);
-      setErrorMsg(null);
-      try {
-        const [lifeData, profile] = await Promise.all([
-          jarvisScheduleApi.getLocalLife(),
-          jarvisSettingsApi.getProfile().catch(() => null),
-        ]);
-        if (!cancelled) {
-          setWeather(lifeData.weather ?? null);
-          setLocationLabel(profile?.location?.label ?? "");
-        }
-      } catch (err) {
-        if (!cancelled) setErrorMsg(String(err));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-    void loadWeather();
-    window.addEventListener("jarvis:profile-updated", loadWeather);
-    return () => {
-      cancelled = true;
-      window.removeEventListener("jarvis:profile-updated", loadWeather);
-    };
-  }, []);
-
-  const meta = decodeWeather(weather?.weather_code);
-  const hasData = weather != null && !weather.error && weather.temperature_c !== undefined;
-
-  return (
-    <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-      <h3 className="text-sm font-semibold text-gray-700 mb-2">🌤️ 天气</h3>
-      {loading ? (
-        <p className="text-xs text-gray-400 py-3 text-center">加载中…</p>
-      ) : errorMsg ? (
-        <p className="text-xs text-gray-400 py-3 text-center" title={errorMsg}>
-          天气获取失败
-        </p>
-      ) : !hasData ? (
-        <p className="text-xs text-gray-400 py-3 text-center">
-          {weather?.error ? "天气源暂不可用" : "天气接入中"}
-        </p>
-      ) : (
-        <div className="flex items-center gap-3">
-          <span className="text-3xl">{meta.icon}</span>
-          <div className="min-w-0">
-            <div className="text-sm font-semibold text-gray-800">
-              {weather!.temperature_c!.toFixed(0)}° · {meta.label}
-            </div>
-            <div className="text-[11px] text-gray-500 truncate">
-              {locationLabel || "位置未设置"}
-              {weather!.wind_kmh !== undefined ? ` · 风 ${weather!.wind_kmh.toFixed(0)}km/h` : ""}
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-const TimeCard: React.FC = () => {
+export function useJarvisHeaderSnapshot(): JarvisHeaderSnapshot {
+  const context = useJarvisStore((state) => state.context);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
   const [timeContext, setTimeContext] = useState<JarvisTimeContext | null>(null);
+  const [weather, setWeather] = useState<WeatherSnapshot | null>(null);
   const [now, setNow] = useState<Date>(new Date());
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
     const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    (async () => {
+
+    const loadHeader = async () => {
       try {
-        const data = await jarvisSettingsApi.getTimeContext(browserTimezone);
-        if (!cancelled) {
-          setTimeContext(data);
-          setNow(new Date(data.local_iso));
-        }
-      } catch (err) {
-        if (!cancelled) setErrorMsg(String(err));
+        const [timeData, lifeData, profileData] = await Promise.all([
+          jarvisSettingsApi.getTimeContext(browserTimezone),
+          jarvisScheduleApi.getLocalLife().catch(() => null),
+          jarvisSettingsApi.getProfile().catch(() => null),
+        ]);
+
+        if (cancelled) return;
+        setTimeContext(timeData);
+        setNow(new Date(timeData.local_iso));
+        setWeather(lifeData?.weather ?? null);
+        setProfile(profileData);
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-    })();
+    };
+
+    void loadHeader();
+    window.addEventListener("jarvis:profile-updated", loadHeader);
     return () => {
       cancelled = true;
+      window.removeEventListener("jarvis:profile-updated", loadHeader);
     };
   }, []);
 
@@ -227,52 +144,175 @@ const TimeCard: React.FC = () => {
     return () => window.clearInterval(timer);
   }, []);
 
-  const displayTime = timeContext
-    ? new Intl.DateTimeFormat("zh-CN", {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-        hour12: false,
-        timeZone: timeContext.timezone,
-      }).format(now)
-    : "--:--:--";
-  const displayDate = timeContext
-    ? new Intl.DateTimeFormat("zh-CN", {
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-        weekday: "short",
-        timeZone: timeContext.timezone,
-      }).format(now)
-    : "Loading local time";
+  const dateSource = timeContext ? now : new Date();
+  const displayName = profile?.name?.trim() || "朋友";
+  const activeEvents = context?.active_events ?? [];
+  const stressLevel =
+    typeof context?.stress_level === "number" ? context.stress_level : null;
+  const weatherMeta = decodeWeather(weather?.weather_code);
+  const timezone = timeContext?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  const timeLabel = new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: timezone,
+  }).format(dateSource);
+
+  const dateLabel = new Intl.DateTimeFormat("zh-CN", {
+    month: "long",
+    day: "numeric",
+    weekday: "short",
+    timeZone: timezone,
+  }).format(dateSource);
+
+  const temperatureLabel =
+    weather && weather.temperature_c !== undefined
+      ? `${weather.temperature_c.toFixed(0)}°`
+      : "--";
+
+  return {
+    displayName,
+    greeting: buildGreeting(dateSource, displayName),
+    subtitle: buildSubtitle(dateSource, activeEvents.length, stressLevel),
+    timeLabel,
+    dateLabel,
+    weatherIcon: weatherMeta.icon,
+    weatherLabel: weatherMeta.label,
+    temperatureLabel,
+    locationLabel:
+      timeContext?.location_label || profile?.location?.label || "位置未设置",
+    loading,
+  };
+}
+
+const LifePulseCard: React.FC = () => {
+  const context = useJarvisStore((state) => state.context);
+
+  if (!context) {
+    return (
+      <div className="rounded-[26px] border border-white/70 bg-white/90 p-5 shadow-sm">
+        <div className="text-sm font-semibold text-slate-700">生活状态</div>
+        <div className="mt-3 text-sm text-slate-400">同步中...</div>
+      </div>
+    );
+  }
 
   return (
-    <div className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
-      <h3 className="text-sm font-semibold text-gray-700 mb-2">Local Time</h3>
-      {errorMsg ? (
-        <p className="text-xs text-gray-400 py-3 text-center" title={errorMsg}>
-          Time unavailable
-        </p>
-      ) : (
+    <div className="rounded-[26px] border border-white/70 bg-white/90 p-5 shadow-sm">
+      <div className="flex items-center justify-between gap-3">
         <div>
-          <div className="text-2xl font-semibold tabular-nums text-gray-900">{displayTime}</div>
-          <div className="text-xs text-gray-500 mt-1">{displayDate}</div>
-          <div className="text-[11px] text-gray-400 mt-2 truncate">
-            {(timeContext?.location_label || "Auto detected") + " · "}
-            {timeContext?.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone}
-            {timeContext ? ` · UTC${timeContext.utc_offset}` : ""}
+          <div className="text-sm font-semibold text-slate-700">生活状态</div>
+          <div className="mt-1 text-xs text-slate-400">
+            压力 {context.stress_level.toFixed(1)} / 日程 {context.schedule_density.toFixed(1)}
           </div>
         </div>
-      )}
+        <div className="text-2xl">{MOOD_EMOJI[context.mood_trend] ?? MOOD_EMOJI.unknown}</div>
+      </div>
     </div>
   );
 };
 
-export const DashboardCards: React.FC<DashboardCardsProps> = ({ onOpenCalendar }) => (
-  <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-    <TimeCard />
-    <ScheduleCard onOpenCalendar={onOpenCalendar} />
-    <LifeStateCard />
-    <WeatherCard />
+const WeatherStatusCard: React.FC = () => {
+  const snapshot = useJarvisHeaderSnapshot();
+
+  return (
+    <div className="rounded-[26px] border border-white/70 bg-white/90 p-5 shadow-sm">
+      <div className="text-sm font-semibold text-slate-700">天气</div>
+      <div className="mt-3 flex items-center gap-3">
+        <span className="text-3xl">{snapshot.weatherIcon}</span>
+        <div className="min-w-0">
+          <div className="text-lg font-semibold text-slate-900">
+            {snapshot.temperatureLabel}
+          </div>
+          <div className="text-xs text-slate-500">{snapshot.weatherLabel}</div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const ClockStatusCard: React.FC = () => {
+  const snapshot = useJarvisHeaderSnapshot();
+
+  return (
+    <div className="rounded-[26px] border border-white/70 bg-white/90 p-5 shadow-sm">
+      <div className="text-sm font-semibold text-slate-700">本地时间</div>
+      <div className="mt-3 text-3xl font-semibold tracking-tight text-slate-950">
+        {snapshot.timeLabel}
+      </div>
+      <div className="mt-1 text-xs text-slate-500">{snapshot.dateLabel}</div>
+    </div>
+  );
+};
+
+export const TodayScheduleCard: React.FC<DashboardCardsProps> = ({
+  onOpenCalendar,
+}) => {
+  const context = useJarvisStore((state) => state.context);
+  const events = useMemo(
+    () => [...(context?.active_events ?? [])].sort((left, right) => {
+      return +new Date(left.start) - +new Date(right.start);
+    }),
+    [context?.active_events],
+  );
+
+  return (
+    <section className="rounded-[28px] border border-white/70 bg-white/95 p-5 shadow-sm shadow-slate-200/60">
+      <div className="flex items-start gap-3">
+        <div>
+          <div className="text-base font-semibold text-slate-800">今日安排</div>
+          <div className="mt-1 text-xs text-slate-400">
+            {events.length > 0 ? `已同步 ${events.length} 项安排` : "今天暂时还没有安排"}
+          </div>
+        </div>
+      </div>
+
+      {events.length === 0 ? (
+        <div className="mt-4 rounded-2xl border border-dashed border-slate-200 bg-slate-50 px-4 py-5 text-sm text-slate-400">
+          还没有已确认日程，可以让 Alfred 或 Maxwell 帮你安排一天。
+        </div>
+      ) : (
+        <div className="mt-4 space-y-3">
+          {events.slice(0, 5).map((event, index) => (
+            <div key={event.id ?? `${event.title}-${index}`} className="flex gap-3">
+              <span className="mt-2 h-2.5 w-2.5 rounded-full bg-indigo-400" />
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-sm font-medium text-slate-800">
+                    {formatEventTime(event.start)}
+                  </span>
+                  <span className="text-xs text-slate-400">
+                    {event.end ? formatEventTime(event.end) : ""}
+                  </span>
+                </div>
+                <div className="mt-1 truncate text-sm text-slate-600">
+                  {event.title}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <button
+        type="button"
+        onClick={onOpenCalendar}
+        className="mt-5 flex w-full items-center justify-center gap-2 rounded-2xl border border-indigo-100 bg-indigo-50 px-4 py-3 text-sm font-medium text-indigo-700 transition hover:bg-indigo-100"
+      >
+        查看日程
+      </button>
+    </section>
+  );
+};
+
+export const DashboardCards: React.FC<DashboardCardsProps> = ({
+  onOpenCalendar,
+}) => (
+  <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
+    <ClockStatusCard />
+    <TodayScheduleCard onOpenCalendar={onOpenCalendar} />
+    <LifePulseCard />
+    <WeatherStatusCard />
   </div>
 );

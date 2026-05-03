@@ -8,6 +8,8 @@ type MetricKey = "mood_score" | "stress_score" | "energy_score" | "sleep_risk_sc
 interface Props {
   recentCareMessages?: ProactiveMessage[];
   onOpenMira?: () => void;
+  onOpenDetails?: () => void;
+  variant?: "full" | "compact";
 }
 
 const METRICS: Array<{ key: MetricKey; label: string; color: string; bg: string }> = [
@@ -51,7 +53,12 @@ function careMessageMatches(message: ProactiveMessage): boolean {
   return message.agent_id === "mira" || trigger.startsWith("care") || trigger.includes("risk") || trigger.includes("overload") || trigger.includes("streak") || trigger.includes("planner_missed");
 }
 
-export const CareTrendsPanel: React.FC<Props> = ({ recentCareMessages = [], onOpenMira }) => {
+export const CareTrendsPanel: React.FC<Props> = ({
+  recentCareMessages = [],
+  onOpenMira,
+  onOpenDetails,
+  variant = "full",
+}) => {
   const [range, setRange] = useState<TrendRange>("week");
   const [metric, setMetric] = useState<MetricKey>("stress_score");
   const [data, setData] = useState<CareTrendsResponse | null>(null);
@@ -88,6 +95,13 @@ export const CareTrendsPanel: React.FC<Props> = ({ recentCareMessages = [], onOp
   const selectedDetail = dayDetail ?? (selectedDate && data ? data.details[selectedDate] : null);
   const selectedMetric = METRICS.find((item) => item.key === metric) ?? METRICS[1];
   const careMessages = useMemo(() => recentCareMessages.filter(careMessageMatches).slice(0, 3), [recentCareMessages]);
+  const compactStatus = useMemo(() => {
+    if (!latest) return "同步中";
+    if ((latest.stress_score ?? 0) >= 7 || (latest.energy_score ?? 10) <= 3) {
+      return "需关注";
+    }
+    return "正常";
+  }, [latest]);
 
   const selectDate = async (date: string) => {
     setSelectedDate(date);
@@ -128,6 +142,95 @@ export const CareTrendsPanel: React.FC<Props> = ({ recentCareMessages = [], onOp
       setSaving(false);
     }
   };
+
+  if (variant === "compact") {
+    return (
+      <section className="rounded-[28px] border border-emerald-100 bg-[linear-gradient(180deg,#ffffff,rgba(240,253,250,0.92))] p-5 shadow-sm shadow-emerald-100/70">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <span className="text-2xl">💗</span>
+            <div>
+              <h3 className="text-base font-semibold text-slate-800">心理中心</h3>
+              <p className="mt-1 text-xs text-slate-400">
+                今日状态与最近关怀
+              </p>
+            </div>
+          </div>
+          <span
+            className={`rounded-full px-2.5 py-1 text-xs font-medium ${
+              compactStatus === "正常"
+                ? "bg-emerald-100 text-emerald-700"
+                : "bg-amber-100 text-amber-700"
+            }`}
+          >
+            {compactStatus}
+          </span>
+        </div>
+
+        {error ? (
+          <div className="mt-4 rounded-2xl bg-red-50 px-3 py-2 text-xs text-red-700">
+            {error}
+          </div>
+        ) : null}
+
+        <div className="mt-4 grid grid-cols-3 gap-3">
+          {[
+            {
+              label: "心情",
+              value: scoreText(latest?.mood_score),
+              tone: "bg-emerald-50 text-emerald-700",
+            },
+            {
+              label: "压力",
+              value: scoreText(latest?.stress_score),
+              tone: "bg-amber-50 text-amber-700",
+            },
+            {
+              label: "能量",
+              value: scoreText(latest?.energy_score),
+              tone: "bg-sky-50 text-sky-700",
+            },
+          ].map((item) => (
+            <div key={item.label} className={`rounded-2xl p-3 ${item.tone}`}>
+              <div className="text-[11px] opacity-70">{item.label}</div>
+              <div className="mt-1 text-[1.7rem] font-semibold leading-none">
+                {item.value}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-4 rounded-2xl border border-emerald-100 bg-emerald-50/60 p-4 text-sm text-emerald-950">
+          <div className="mb-2 font-semibold">最近关怀</div>
+          {careMessages.length > 0 ? (
+            <div className="space-y-2">
+              {careMessages.slice(0, 1).map((message) => (
+                <div key={message.id} className="leading-7">
+                  • {message.content}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="text-sm text-emerald-700/75">
+              当前还没有新的关怀提醒，继续保持现在的节奏就很好。
+            </div>
+          )}
+        </div>
+
+        <div className="mt-4 flex items-center justify-center">
+          {onOpenDetails ? (
+            <button
+              type="button"
+              onClick={onOpenDetails}
+              className="flex w-full items-center justify-center rounded-2xl border border-indigo-100 bg-indigo-50 px-4 py-3 text-sm font-medium text-indigo-700 transition hover:bg-indigo-100"
+            >
+              查看详情
+            </button>
+          ) : null}
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="rounded-2xl border border-emerald-100 bg-white p-4 shadow-sm">

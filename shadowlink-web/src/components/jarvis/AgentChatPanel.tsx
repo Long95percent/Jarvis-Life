@@ -1,17 +1,18 @@
 ﻿import React, { useEffect, useRef, useState } from "react";
 import { useJarvisStore } from "@/stores/jarvisStore";
+import { SendHorizontal, Trash2 } from "lucide-react";
 import { jarvisApi, type ActionResult, type BehaviorEventType, type ChatExecutionStep, type EscalationHint } from "@/services/jarvisApi";
-import { jarvisConversationApi } from "@/services/jarvisConversationApi";
 import { jarvisPendingActionApi } from "@/services/jarvisPendingActionApi";
 import { jarvisScheduleApi } from "@/services/jarvisScheduleApi";
 import { jarvisCareApi } from "@/services/jarvisCareApi";
-import { JARVIS_CONVERSATION_HISTORY_CHANGED } from "./ConversationHistoryPanel";
 import { CareCard } from "./CareCard";
 
 interface Props {
   agentId: string;
   sessionId: string;
-  onClose: () => void;
+  onOpenMemory?: () => void;
+  onOpenHistory?: () => void;
+  activeUtilityView?: "history" | "memory" | null;
 }
 
 declare global {
@@ -94,7 +95,13 @@ function isHttpStatus(error: unknown, status: number): boolean {
   return typeof error === "object" && error !== null && "status" in error && (error as { status?: number }).status === status;
 }
 
-export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose }) => {
+export const AgentChatPanel: React.FC<Props> = ({
+  agentId,
+  sessionId,
+  onOpenMemory,
+  onOpenHistory,
+  activeUtilityView = null,
+}) => {
   const agents = useJarvisStore((s) => s.agents);
   const chatHistory = useJarvisStore((s) => s.chatHistory);
   const sendMessage = useJarvisStore((s) => s.sendMessage);
@@ -120,6 +127,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
   const openedAtRef = useRef(Date.now());
   const lastUserMessageRef = useRef("");
   const endRef = useRef<HTMLDivElement>(null);
+  const hasInput = input.trim().length > 0;
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -237,20 +245,6 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     startRoundtable(scenarioId, message, { sessionId, agentId });
   };
 
-  const saveAndClose = async () => {
-    if (agent) {
-      await jarvisConversationApi.saveConversationHistory({
-        conversation_id: `private:${sessionId}:${agentId}`,
-        conversation_type: "private_chat",
-        title: `${agent.name} 私聊`,
-        agent_id: agentId,
-        session_id: sessionId,
-        route_payload: { mode: "private_chat", agent_id: agentId },
-      }).catch(() => undefined);
-      window.dispatchEvent(new Event(JARVIS_CONVERSATION_HISTORY_CHANGED));
-    }
-    onClose();
-  };
   const handleSend = async () => {
     const message = input.trim();
     if (!message || sending) return;
@@ -659,145 +653,292 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
   const severityStyle = escalation ? SEVERITY_STYLES[escalation.severity] : null;
 
   return (
-    <div className="h-full flex flex-col bg-white">
+    <div className="flex h-full flex-col bg-[linear-gradient(180deg,rgba(255,255,255,0.96),rgba(248,250,252,0.92))]">
       <div
-        className="flex items-center justify-between px-5 py-3 border-b border-gray-200"
-        style={{ background: `linear-gradient(90deg, color-mix(in srgb, ${agent.color} 14%, white), transparent)` }}
+        className="border-b border-slate-200/80 px-6 py-5"
+        style={{
+          background: `linear-gradient(180deg, color-mix(in srgb, ${agent.color} 9%, white), rgba(255,255,255,0.95))`,
+        }}
       >
-        <div className="flex items-center gap-3">
-          <span className="w-10 h-10 rounded-full flex items-center justify-center text-xl" style={{ backgroundColor: `color-mix(in srgb, ${agent.color} 22%, white)` }}>
-            {agent.icon}
-          </span>
-          <div>
-            <div className="font-semibold text-gray-800" style={{ color: agent.color }}>{agent.name}</div>
-            <div className="text-[11px] text-gray-500">{agent.role}</div>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => {
-              if (confirm(`清除此会话中和 ${agent.name} 的聊天记录？`)) clearChatHistoryStore(agentId, sessionId);
-            }}
-            className="text-xs px-2.5 py-1.5 rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 transition-colors"
-          >
-            清空
-          </button>
-          <button onClick={saveAndClose} className="text-sm px-3 py-1.5 rounded-lg border border-gray-200 hover:bg-gray-50 transition-colors">
-            返回
-          </button>
-        </div>
-      </div>
-
-      <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
-        {loadingHistory && <p className="text-center text-xs text-gray-400 mt-4">加载历史中…</p>}
-        {!loadingHistory && history.length === 0 && <p className="text-center text-sm text-gray-400 mt-8">和 {agent.name} 开始对话…</p>}
-        {history.map((message, index) => (
-          <div key={index} className={`flex flex-col gap-1 ${message.role === "user" ? "items-end" : "items-start"}`}>
-            {message.role === "agent" && message.routing && (
-              <div className="max-w-[75%] rounded-2xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-900">
-                <div className="font-semibold">{routingTitle(message.routing)}</div>
-                <div className="mt-1">当前由秘书 Maxwell 接管安排，避免非秘书 Agent 直接写日程或长期计划。</div>
-              </div>
-            )}
-            <div
-              className="max-w-[75%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap"
-              style={
-                message.role === "user"
-                  ? { backgroundColor: agent.color, color: "white", borderBottomRightRadius: 4 }
-                  : {
-                      backgroundColor: `color-mix(in srgb, ${agent.color} 8%, white)`,
-                      border: `1px solid color-mix(in srgb, ${agent.color} 20%, transparent)`,
-                      color: "#1f2937",
-                      borderBottomLeftRadius: 4,
-                    }
-              }
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <span
+              className="flex h-14 w-14 items-center justify-center rounded-[20px] text-3xl shadow-sm"
+              style={{
+                backgroundColor: `color-mix(in srgb, ${agent.color} 18%, white)`,
+              }}
             >
-              {message.content}
-            </div>
-            {message.role === "agent" && message.actions && message.actions.length > 0 && (
-              <div className="flex w-full max-w-[75%] flex-col gap-1.5">
-                {message.actions.map((action, actionIndex) => renderAction(action, actionIndex))}
+              {agent.icon}
+            </span>
+            <div>
+              <div className="flex items-center gap-2">
+                <span
+                  className="text-[1.7rem] font-semibold tracking-tight text-slate-900"
+                  style={{ color: agent.color }}
+                >
+                  {agent.name}
+                </span>
+                <span className="rounded-full bg-indigo-50 px-3 py-1 text-xs font-medium text-indigo-600">
+                  {agent.role}
+                </span>
               </div>
-            )}
-          </div>
-        ))}
-        {sending && (
-          <div className="flex justify-start">
-            <div className="max-w-[75%] rounded-2xl px-4 py-3 text-sm" style={{ backgroundColor: `color-mix(in srgb, ${agent.color} 8%, white)`, border: `1px solid color-mix(in srgb, ${agent.color} 20%, transparent)` }}>
-              <div className="mb-2 flex items-center gap-2 font-medium text-gray-700">
-                <span className="h-2 w-2 animate-pulse rounded-full" style={{ backgroundColor: agent.color }} />
-                {executionSteps.length > 0 ? executionSteps[executionSteps.length - 1].label : "正在连接智能体…"}
-              </div>
-              <div className="space-y-1.5 text-xs text-gray-500">
-                {executionSteps.length === 0 && (
-                  <div className="flex items-center gap-2">
-                    <span
-                      className="flex h-4 w-4 items-center justify-center rounded-full text-[10px] text-white"
-                      style={{ backgroundColor: agent.color }}
-                    >
-                      …
-                    </span>
-                    <span>等待后端返回真实执行步骤</span>
-                  </div>
-                )}
-                {executionSteps.map((step) => (
-                  <div key={step.id} className="flex items-start gap-2">
-                    <span
-                      className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] text-white"
-                      style={{ backgroundColor: step.status === "error" ? "#EF4444" : agent.color }}
-                    >
-                      {step.status === "error" ? "!" : step.status === "done" ? "✓" : "…"}
-                    </span>
-                    <span className="min-w-0">
-                      <span className="text-gray-700">{step.label}</span>
-                      {typeof step.duration_ms === "number" && (
-                        <span className="ml-1 text-gray-400">· {Math.round(step.duration_ms)}ms</span>
-                      )}
-                      {step.detail && <span className="block truncate text-gray-400">{step.detail}</span>}
-                    </span>
-                  </div>
-                ))}
+              <div className="mt-1 text-sm text-slate-500">
+                正在陪你整理问题、建议和下一步动作
               </div>
             </div>
           </div>
-        )}
-        <div ref={endRef} />
+
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={onOpenHistory}
+                className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2.5 text-sm font-medium transition ${
+                  activeUtilityView === "history"
+                    ? "border-indigo-200 bg-indigo-50 text-indigo-700"
+                    : "border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:text-slate-900"
+                }`}
+              >
+                历史对话
+              </button>
+              <button
+                type="button"
+                onClick={onOpenMemory}
+                className={`inline-flex items-center gap-2 rounded-2xl border px-4 py-2.5 text-sm font-medium transition ${
+                  activeUtilityView === "memory"
+                    ? "border-indigo-200 bg-indigo-50 text-indigo-700"
+                    : "border-slate-200 bg-white text-slate-600 hover:border-slate-300 hover:text-slate-900"
+                }`}
+              >
+                长期记忆
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                if (confirm(`清除此会话中和 ${agent.name} 的聊天记录？`)) {
+                  clearChatHistoryStore(agentId, sessionId);
+                }
+              }}
+              className="inline-flex items-center gap-2 rounded-2xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-600 transition hover:border-slate-300 hover:text-slate-900"
+            >
+              <Trash2 size={16} />
+              清空
+            </button>
+          </div>
+        </div>
       </div>
 
-      {escalation && severityStyle && (
-        <div className="mx-5 mb-3 rounded-2xl border p-3 text-sm shadow-sm" style={{ backgroundColor: severityStyle.bg, borderColor: severityStyle.border, color: severityStyle.text }}>
+      <div className="flex-1 overflow-y-auto px-5 py-5">
+        <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col space-y-5">
+          <div className="self-center rounded-full bg-slate-100 px-4 py-1 text-xs font-medium text-slate-500">
+            今天
+          </div>
+
+          {loadingHistory ? (
+            <p className="mt-4 text-center text-xs text-gray-400">加载历史中…</p>
+          ) : null}
+
+          {!loadingHistory && history.length === 0 ? (
+            <div className="rounded-[28px] border border-dashed border-slate-200 bg-white/80 px-6 py-10 text-center text-sm text-slate-400">
+              和 {agent.name} 开始对话吧，我会在这里整理你的问题、建议和待确认动作。
+            </div>
+          ) : null}
+
+          {history.map((message, index) => (
+            <div
+              key={index}
+              className={`flex flex-col gap-2 ${
+                message.role === "user" ? "items-end" : "items-start"
+              }`}
+            >
+              {message.role === "agent" ? (
+                <div className="flex max-w-[88%] items-start gap-3">
+                  <span
+                    className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl text-xl"
+                    style={{
+                      backgroundColor: `color-mix(in srgb, ${agent.color} 14%, white)`,
+                    }}
+                  >
+                    {agent.icon}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    {message.routing ? (
+                      <div className="mb-2 rounded-2xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-xs text-indigo-900">
+                        <div className="font-semibold">
+                          {routingTitle(message.routing)}
+                        </div>
+                        <div className="mt-1">
+                          当前由秘书 Maxwell 接管安排，避免非秘书 Agent 直接写日程或长期计划。
+                        </div>
+                      </div>
+                    ) : null}
+                    <div
+                      className="rounded-[24px] border px-5 py-4 text-sm leading-8 text-slate-700"
+                      style={{
+                        backgroundColor: `color-mix(in srgb, ${agent.color} 8%, white)`,
+                        borderColor: `color-mix(in srgb, ${agent.color} 20%, transparent)`,
+                      }}
+                    >
+                      {message.content}
+                    </div>
+                    {message.actions && message.actions.length > 0 ? (
+                      <div className="mt-2 flex w-full flex-col gap-1.5">
+                        {message.actions.map((action, actionIndex) =>
+                          renderAction(action, actionIndex),
+                        )}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : (
+                <div className="max-w-[78%]">
+                  <div
+                    className="rounded-[24px] px-5 py-4 text-sm leading-8 text-white shadow-sm"
+                    style={{
+                      background: `linear-gradient(135deg, ${agent.color}, color-mix(in srgb, ${agent.color} 70%, #4338ca))`,
+                    }}
+                  >
+                    {message.content}
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+
+          {sending ? (
+            <div className="flex items-start gap-3">
+              <span
+                className="mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl text-xl"
+                style={{
+                  backgroundColor: `color-mix(in srgb, ${agent.color} 14%, white)`,
+                }}
+              >
+                {agent.icon}
+              </span>
+              <div
+                className="max-w-[88%] rounded-[24px] border px-5 py-4 text-sm"
+                style={{
+                  backgroundColor: `color-mix(in srgb, ${agent.color} 8%, white)`,
+                  borderColor: `color-mix(in srgb, ${agent.color} 20%, transparent)`,
+                }}
+              >
+                <div className="mb-2 flex items-center gap-2 font-medium text-slate-700">
+                  <span
+                    className="h-2 w-2 animate-pulse rounded-full"
+                    style={{ backgroundColor: agent.color }}
+                  />
+                  {executionSteps.length > 0
+                    ? executionSteps[executionSteps.length - 1].label
+                    : "正在连接智能体…"}
+                </div>
+                <div className="space-y-1.5 text-xs text-slate-500">
+                  {executionSteps.length === 0 ? (
+                    <div className="flex items-center gap-2">
+                      <span
+                        className="flex h-4 w-4 items-center justify-center rounded-full text-[10px] text-white"
+                        style={{ backgroundColor: agent.color }}
+                      >
+                        …
+                      </span>
+                      <span>等待后端返回真实执行步骤</span>
+                    </div>
+                  ) : null}
+                  {executionSteps.map((step) => (
+                    <div key={step.id} className="flex items-start gap-2">
+                      <span
+                        className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] text-white"
+                        style={{
+                          backgroundColor:
+                            step.status === "error" ? "#EF4444" : agent.color,
+                        }}
+                      >
+                        {step.status === "error"
+                          ? "!"
+                          : step.status === "done"
+                            ? "✓"
+                            : "…"}
+                      </span>
+                      <span className="min-w-0">
+                        <span className="text-slate-700">{step.label}</span>
+                        {typeof step.duration_ms === "number" ? (
+                          <span className="ml-1 text-slate-400">
+                            · {Math.round(step.duration_ms)}ms
+                          </span>
+                        ) : null}
+                        {step.detail ? (
+                          <span className="block truncate text-slate-400">
+                            {step.detail}
+                          </span>
+                        ) : null}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          ) : null}
+          <div ref={endRef} />
+        </div>
+      </div>
+
+      {escalation && severityStyle ? (
+        <div
+          className="mx-5 mb-3 rounded-[24px] border p-4 text-sm shadow-sm"
+          style={{
+            backgroundColor: severityStyle.bg,
+            borderColor: severityStyle.border,
+            color: severityStyle.text,
+          }}
+        >
           <div className="font-semibold">建议进入 Brainstorm / 团队协作模式</div>
           <div className="mt-1 text-xs opacity-90">{escalation.reason}</div>
           <div className="mt-3 flex items-center gap-2">
             <button
               onClick={launchEscalation}
-              className="px-3 py-1.5 rounded-lg text-xs font-medium text-white"
+              className="rounded-2xl px-4 py-2 text-xs font-medium text-white"
               style={{ backgroundColor: severityStyle.text }}
             >
               进入协作模式
             </button>
-            <button onClick={handleCancelEscalation} className="px-3 py-1.5 rounded-lg text-xs font-medium border bg-white hover:bg-gray-50" style={{ borderColor: severityStyle.border, color: severityStyle.text }}>
+            <button
+              onClick={handleCancelEscalation}
+              className="rounded-2xl border bg-white px-4 py-2 text-xs font-medium hover:bg-gray-50"
+              style={{
+                borderColor: severityStyle.border,
+                color: severityStyle.text,
+              }}
+            >
               暂不进入
             </button>
           </div>
         </div>
-      )}
-      <div className="px-5 py-4 border-t border-gray-200 bg-white flex gap-3">
-        <input
-          className="flex-1 rounded-xl border border-gray-200 px-4 py-2.5 text-sm focus:outline-none focus:ring-2"
-          placeholder={`发消息给 ${agent.name}…`}
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          onKeyDown={(event) => event.key === "Enter" && !event.shiftKey && handleSend()}
-        />
-        <button
-          onClick={handleSend}
-          disabled={!input.trim() || sending}
-          className="px-4 py-2.5 rounded-xl text-white text-sm font-medium disabled:opacity-50 hover:opacity-90 transition-opacity"
-          style={{ backgroundColor: agent.color }}
-        >
-          发送
-        </button>
+      ) : null}
+
+      <div className="border-t border-slate-200/80 bg-white px-5 py-4">
+        <div className="mx-auto flex w-full max-w-4xl items-center gap-3 rounded-[26px] border border-indigo-200 bg-white px-4 py-3 shadow-[0_16px_32px_-28px_rgba(99,102,241,0.6)] transition focus-within:border-indigo-300">
+          <input
+            className="flex-1 bg-transparent text-sm text-slate-700 outline-none placeholder:text-slate-400"
+            placeholder="输入消息，或使用 / 快捷指令"
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) =>
+              event.key === "Enter" && !event.shiftKey && handleSend()
+            }
+          />
+          <button
+            type="button"
+            onClick={handleSend}
+            disabled={!hasInput || sending}
+            className={`inline-flex h-12 w-12 items-center justify-center rounded-2xl shadow-sm transition ${
+              hasInput
+                ? "bg-indigo-600 text-white hover:bg-indigo-500"
+                : "bg-indigo-100 text-indigo-400 ring-1 ring-inset ring-indigo-200"
+            } ${sending ? "opacity-70" : ""}`}
+          >
+            <SendHorizontal size={18} />
+          </button>
+        </div>
       </div>
     </div>
   );

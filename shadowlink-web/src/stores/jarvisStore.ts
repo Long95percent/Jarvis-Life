@@ -18,22 +18,36 @@ interface PersistedUiState {
   sessionId?: string;
 }
 
-function readPersistedUiState(): PersistedUiState {
-  if (typeof window === "undefined") return {};
+function readPersistedUiState(): {
+  state: PersistedUiState;
+  hasStoredState: boolean;
+} {
+  if (typeof window === "undefined") {
+    return { state: {}, hasStoredState: false };
+  }
   try {
-    return JSON.parse(window.localStorage.getItem(UI_STATE_KEY) || "{}") as PersistedUiState;
+    const raw = window.localStorage.getItem(UI_STATE_KEY);
+    if (!raw) {
+      return { state: {}, hasStoredState: false };
+    }
+    return {
+      state: JSON.parse(raw) as PersistedUiState,
+      hasStoredState: true,
+    };
   } catch {
-    return {};
+    return { state: {}, hasStoredState: false };
   }
 }
 
 function writePersistedUiState(patch: PersistedUiState) {
   if (typeof window === "undefined") return;
-  const current = readPersistedUiState();
+  const current = readPersistedUiState().state;
   window.localStorage.setItem(UI_STATE_KEY, JSON.stringify({ ...current, ...patch }));
 }
 
-const persistedUiState = readPersistedUiState();
+const persistedUiStateResult = readPersistedUiState();
+const persistedUiState = persistedUiStateResult.state;
+const hasPersistedUiState = persistedUiStateResult.hasStoredState;
 
 interface LocalLifeSnapshot {
   weather: Record<string, any> | null;
@@ -133,12 +147,12 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
   isLoading: false,
   localLife: null,
 
-  interactionMode: persistedUiState.interactionMode ?? "scenario_grid",
+  interactionMode: persistedUiState.interactionMode ?? (hasPersistedUiState ? "scenario_grid" : "private_chat"),
   activeRoundtableScenario: persistedUiState.activeRoundtableScenario ?? null,
   activeRoundtableInput: persistedUiState.activeRoundtableInput ?? "",
   activeRoundtableSourceSessionId: persistedUiState.activeRoundtableSourceSessionId ?? null,
   activeRoundtableSourceAgentId: persistedUiState.activeRoundtableSourceAgentId ?? null,
-  sessionId: persistedUiState.sessionId ?? `jarvis-${Date.now()}`,
+  sessionId: persistedUiState.sessionId ?? (hasPersistedUiState ? `jarvis-${Date.now()}` : `private-alfred-${Date.now()}`),
 
   loadContext: async () => {
     const context = await jarvisApi.getContext();

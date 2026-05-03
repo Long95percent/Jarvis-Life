@@ -1,107 +1,78 @@
-// shadowlink-web/src/components/jarvis/JarvisTopBar.tsx
 import React from "react";
 import { Link } from "react-router-dom";
-import { Settings as SettingsIcon, BookOpen } from "lucide-react";
-import { useJarvisStore } from "@/stores/jarvisStore";
-
-const MOOD_EMOJI: Record<string, string> = {
-  positive: "😊",
-  neutral: "😐",
-  negative: "😔",
-  unknown: "🤷",
-};
+import { BookOpen, Settings } from "lucide-react";
+import { useJarvisHeaderSnapshot } from "./DashboardCards";
 
 export const JarvisTopBar: React.FC = () => {
-  const context = useJarvisStore((s) => s.context);
-  const proactiveMessages = useJarvisStore((s) => s.proactiveMessages);
-  const unreadCount = proactiveMessages.filter((m) => !m.read).length;
+  const snapshot = useJarvisHeaderSnapshot();
 
   return (
-    <header
-      className="flex items-center justify-between px-6 py-3 border-b"
-      style={{
-        borderColor: "var(--color-border, #e5e7eb)",
-        background:
-          "linear-gradient(90deg, color-mix(in srgb, var(--color-primary) 8%, white), white 55%)",
-      }}
-    >
-      {/* Logo */}
-      <div className="flex items-center gap-3">
-        <div
-          className="w-9 h-9 rounded-xl flex items-center justify-center text-lg shadow-sm"
-          style={{
-            backgroundColor: "var(--color-primary)",
-            color: "white",
-          }}
-        >
-          🎩
-        </div>
-        <div>
-          <div className="font-semibold text-[var(--color-text,#1f2937)] leading-none">
-            Jarvis
+    <header className="border-b border-slate-200/80 bg-white/90 backdrop-blur">
+      <div className="grid gap-4 px-5 py-4 lg:grid-cols-[220px_1px_minmax(240px,1fr)_140px_150px_auto] lg:items-center">
+        <div className="flex items-center gap-3">
+          <div className="flex h-14 w-14 items-center justify-center rounded-[20px] bg-[radial-gradient(circle_at_top,#8b5cf6,transparent_55%),linear-gradient(135deg,#eef2ff,#dbeafe)] text-3xl shadow-sm shadow-indigo-200/70">
+            🤖
           </div>
-          <div className="text-[11px] text-gray-500 leading-none mt-1">
-            · Be IronMan
-          </div>
-        </div>
-      </div>
-
-      {/* Tagline (centered) */}
-      <div className="flex-1 flex justify-center mx-6">
-        <span className="text-xs text-gray-500 italic">
-          你的多智能体生活管家 · 选一个场景，召唤专家圆桌
-        </span>
-      </div>
-
-      {/* Life status compact indicator */}
-      <div className="flex items-center gap-4 text-sm">
-        {context ? (
-          <>
-            <div className="flex items-center gap-1.5">
-              <span className="text-[11px] text-gray-500">压力</span>
-              <span
-                className="font-semibold text-sm"
-                style={{
-                  color: context.stress_level > 7 ? "#EF4444" : "#6C63FF",
-                }}
-              >
-                {context.stress_level.toFixed(1)}
-              </span>
+          <div className="min-w-0">
+            <div className="truncate text-[1.55rem] font-semibold tracking-tight text-slate-900">
+              Jarvis-Life
             </div>
-            <span className="text-xl" title={`Mood: ${context.mood_trend}`}>
-              {MOOD_EMOJI[context.mood_trend] ?? "🤷"}
-            </span>
-          </>
-        ) : (
-          <span className="text-xs text-gray-400">加载中…</span>
-        )}
-        <div className="relative">
-          <span className="text-xl">🔔</span>
-          {unreadCount > 0 && (
-            <span
-              className="absolute -top-1 -right-1 min-w-[16px] h-4 px-1 rounded-full text-[10px] font-semibold text-white flex items-center justify-center"
-              style={{ backgroundColor: "#EF4444" }}
-            >
-              {unreadCount}
-            </span>
-          )}
+            <div className="mt-0.5 text-sm text-slate-500">
+              你的智能生活管家
+            </div>
+          </div>
         </div>
 
-        {/* Knowledge + Settings quick access */}
-        <Link
-          to="/knowledge"
-          title="个人画像"
-          className="p-2 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-gray-800 transition-colors"
-        >
-          <BookOpen size={18} />
-        </Link>
-        <Link
-          to="/settings"
-          title="设置"
-          className="p-2 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-gray-800 transition-colors"
-        >
-          <SettingsIcon size={18} />
-        </Link>
+        <div className="hidden h-12 w-px justify-self-center rounded-full bg-slate-200 lg:block" />
+
+        <div className="min-w-0">
+          <div className="truncate text-[1.75rem] font-semibold tracking-tight text-slate-950">
+            {snapshot.greeting}
+          </div>
+          <div className="mt-1 truncate text-sm text-slate-500">
+            {snapshot.subtitle}
+          </div>
+        </div>
+
+        <div className="text-center lg:text-left">
+          <div className="text-[1.95rem] font-semibold tracking-tight text-slate-950">
+            {snapshot.timeLabel}
+          </div>
+          <div className="mt-1 text-[0.95rem] text-slate-500">{snapshot.dateLabel}</div>
+        </div>
+
+        <div className="flex items-center gap-2.5 px-1 py-1">
+          <span className="text-[2rem]">{snapshot.weatherIcon}</span>
+          <div className="min-w-0">
+            <div className="text-xl font-semibold text-slate-900">
+              {snapshot.temperatureLabel}
+            </div>
+            <div className="truncate text-xs text-slate-500">
+              {snapshot.weatherLabel}
+            </div>
+            <div className="truncate text-xs text-slate-400">
+              {snapshot.locationLabel}
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 lg:gap-3">
+          <Link
+            to="/knowledge"
+            className="inline-flex items-center gap-2.5 rounded-2xl border border-slate-200 bg-white px-5 py-3.5 text-base font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
+          >
+            <BookOpen size={19} />
+            知识库
+          </Link>
+
+          <Link
+            to="/settings"
+            className="inline-flex items-center gap-2.5 rounded-2xl border border-slate-200 bg-white px-5 py-3.5 text-base font-medium text-slate-700 transition hover:border-slate-300 hover:text-slate-900"
+          >
+            <Settings size={19} />
+            设置
+          </Link>
+        </div>
       </div>
     </header>
   );
