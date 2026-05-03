@@ -3,6 +3,11 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Send } from "lucide-react";
 import { JARVIS_AGENTS } from "./agentMeta";
+import {
+  initialRoundtableModeForScenario,
+  pendingActionCount,
+  routeButtonsFromScenarioState,
+} from "./roundtableStageLogic";
 import { jarvisApi } from "@/services/jarvisApi";
 import type { JarvisMemory, PendingAction, RoundtableBrainstormResult, RoundtableDecisionResult } from "@/services/jarvisApi";
 
@@ -27,6 +32,8 @@ interface TranscriptEntry {
   agentColor: string;
   agentIcon: string;
   content: string;
+  toolCount?: number;
+  actionCount?: number;
 }
 
 interface SpeakPayload {
@@ -61,6 +68,8 @@ interface RoleDeltaPayload {
 interface RoleCompletedPayload extends SpeakPayload {
   content: string;
   round_index: number;
+  tool_results?: Array<Record<string, unknown>>;
+  action_results?: Array<Record<string, unknown>>;
 }
 
 interface RoundSummaryPayload {
@@ -95,6 +104,27 @@ interface PhasePayload {
 interface TimingPayload {
   total_ms?: number;
   spans?: Array<Record<string, unknown>>;
+}
+
+interface ScenarioStagePayload {
+  scenario_id: string;
+  graph_executor?: string;
+  state_type?: string;
+  stage_id: string;
+  stage_title?: string;
+  owner_agent?: string;
+  round_index?: number;
+  objective?: string;
+  artifact_keys?: string[];
+}
+
+interface ScenarioStatePayload {
+  scenario_id: string;
+  graph_executor?: string;
+  state_type?: string;
+  round_index?: number;
+  artifacts?: Record<string, unknown>;
+  next_routes?: Array<{ label?: string; target_stage?: string; prompt?: string }>;
 }
 
 interface AgentMeta {
@@ -220,6 +250,23 @@ function contextExplanationItems(result: { context?: Record<string, unknown> } |
   });
 }
 
+function stringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function recordList(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item)) : [];
+}
+
+function protocolPhasesFromResult(result: { context?: Record<string, unknown> } | null): string[] {
+  return stringList(result?.context?.scenario_protocol_phases);
+}
+
+function titleOf(item: Record<string, unknown>, fallback: string): string {
+  const value = item.title ?? item.name ?? item.summary ?? item.id;
+  return typeof value === "string" && value.trim() ? value : fallback;
+}
+
 export const RoundtableStage: React.FC<Props> = ({
   scenarioId,
   userInput,
@@ -237,7 +284,7 @@ export const RoundtableStage: React.FC<Props> = ({
   const [phase, setPhase] = useState<string>("connecting");
   const [status, setStatus] = useState<"connecting" | "streaming" | "idle" | "error">("connecting");
   const [roundCount, setRoundCount] = useState<number>(0);
-  const [roundtableMode, setRoundtableMode] = useState<string>(scenarioId === "work_brainstorm" ? "brainstorm" : "decision");
+  const [roundtableMode, setRoundtableMode] = useState<string>(() => initialRoundtableModeForScenario(scenarioId));
   const [timing, setTiming] = useState<TimingPayload | null>(null);
   const [progress, setProgress] = useState<RoundtableProgress | null>(null);
   const [degradedMessages, setDegradedMessages] = useState<Array<{ agentId: string; agentName: string; message: string }>>([]);
@@ -245,6 +292,8 @@ export const RoundtableStage: React.FC<Props> = ({
   const [showTranscript, setShowTranscript] = useState(false);
   const [roundSummaries, setRoundSummaries] = useState<RoundSummaryPayload[]>([]);
   const [waitingForCheckpoint, setWaitingForCheckpoint] = useState(false);
+  const [scenarioStages, setScenarioStages] = useState<ScenarioStagePayload[]>([]);
+  const [scenarioState, setScenarioState] = useState<ScenarioStatePayload | null>(null);
 
   const [userDraft, setUserDraft] = useState<string>("");
   const [userBubble, setUserBubble] = useState<string | null>(null);
@@ -305,6 +354,8 @@ export const RoundtableStage: React.FC<Props> = ({
       setPhase("讨论进行中");
       setTiming(null);
       setProgress(null);
+      setScenarioState(null);
+      setScenarioStages([]);
       setErrorMsg(null);
       const res = await fetch(endpoint, {
         method: "POST",
@@ -394,7 +445,7 @@ export const RoundtableStage: React.FC<Props> = ({
         converge: "收敛总结",
         conclude: "最终结论",
         round_complete: "本轮结束",
-        complete: "缁撴潫",
+        complete: "结束",
       };
       setPhase(phaseMap[payload.phase] ?? payload.phase);
       if (payload.round_count) setRoundCount(payload.round_count);
@@ -416,6 +467,18 @@ export const RoundtableStage: React.FC<Props> = ({
         total: payload.participants?.length ?? participants.length,
         status: "speaking",
       });
+      return;
+    }
+
+    if (event === "scenario_stage") {
+      const payload = data as ScenarioStagePayload;
+      setScenarioStages((prev) => [...prev.filter((item) => item.round_index !== payload.round_index || item.stage_id !== payload.stage_id), payload].slice(-8));
+      setPhase(payload.stage_title || payload.stage_id);
+      return;
+    }
+
+    if (event === "scenario_state") {
+      setScenarioState(data as ScenarioStatePayload);
       return;
     }
 
@@ -453,6 +516,8 @@ export const RoundtableStage: React.FC<Props> = ({
           agentColor: payload.agent_color ?? meta?.color ?? "#6366F1",
           agentIcon: payload.agent_icon ?? meta?.icon ?? "🤖",
           content: normalizedContent,
+          toolCount: payload.tool_results?.length ?? 0,
+          actionCount: pendingActionCount(payload.action_results),
         },
       ]);
       setProgress((prev) => ({
@@ -671,6 +736,20 @@ export const RoundtableStage: React.FC<Props> = ({
       : `${modeTone.label} 圆桌进行中：${modeTone.hint}`;
   const decisionContextItems = contextExplanationItems(decisionResult);
   const latestRoundSummary = roundSummaries[roundSummaries.length - 1];
+  const resultForProtocol = decisionResult ?? brainstormResult;
+  const protocolPhases = protocolPhasesFromResult(resultForProtocol);
+  const activeScenarioStage = scenarioStages[scenarioStages.length - 1];
+  const scenarioArtifacts = scenarioState?.artifacts ?? (brainstormResult?.c_artifacts && typeof brainstormResult.c_artifacts === "object" ? brainstormResult.c_artifacts : null);
+  const localRankedActivities = recordList(
+    scenarioArtifacts?.ranked_activities ?? brainstormResult?.ranked_activities,
+  );
+  const workValidationSteps = stringList(
+    scenarioArtifacts?.validation_plan ?? brainstormResult?.minimum_validation_steps,
+  );
+  const workRisks = recordList(
+    scenarioArtifacts?.critique_matrix ?? brainstormResult?.risks,
+  );
+  const scenarioRouteButtons = routeButtonsFromScenarioState(scenarioState);
 
   return (
     <AnimatePresence>
@@ -769,6 +848,79 @@ export const RoundtableStage: React.FC<Props> = ({
         {returnNotice && (
           <div className="absolute left-1/2 top-24 z-30 max-w-md -translate-x-1/2 rounded-xl border border-white/15 bg-white/10 px-4 py-2 text-xs text-white/85 backdrop-blur-md">
             {returnNotice}
+          </div>
+        )}
+
+        {(activeScenarioStage || scenarioState || protocolPhases.length > 0) && !showTranscript && !decisionResult && !brainstormResult && (
+          <div className="absolute left-8 top-24 z-30 w-[360px] rounded-2xl border border-white/15 bg-slate-950/90 p-4 text-white shadow-2xl backdrop-blur-xl">
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.2em] text-white/45">Scenario Flow</p>
+                <h3 className="text-base font-semibold">
+                  {activeScenarioStage?.stage_title || activeScenarioStage?.stage_id || scenarioState?.state_type || "场景协议"}
+                </h3>
+              </div>
+              {scenarioState?.state_type && (
+                <span className="rounded-full bg-white/10 px-2 py-1 text-[11px] text-white/65">{scenarioState.state_type}</span>
+              )}
+            </div>
+            {activeScenarioStage?.objective && (
+              <p className="mb-3 text-xs leading-relaxed text-white/60">{activeScenarioStage.objective}</p>
+            )}
+            {scenarioStages.length > 0 ? (
+              <div className="mb-3 flex flex-wrap gap-1.5">
+                {scenarioStages.slice(-5).map((stage) => (
+                  <span
+                    key={`${stage.round_index}-${stage.stage_id}`}
+                    className={`rounded-full px-2 py-1 text-[11px] ${stage.stage_id === activeScenarioStage?.stage_id ? "bg-emerald-300 text-slate-950" : "bg-white/10 text-white/65"}`}
+                  >
+                    {stage.stage_id}
+                  </span>
+                ))}
+              </div>
+            ) : protocolPhases.length > 0 ? (
+              <div className="mb-3 flex flex-wrap gap-1.5">
+                {protocolPhases.slice(0, 6).map((stage) => (
+                  <span key={stage} className="rounded-full bg-white/10 px-2 py-1 text-[11px] text-white/65">{stage}</span>
+                ))}
+              </div>
+            ) : null}
+            {localRankedActivities.length > 0 && (
+              <div className="rounded-xl border border-emerald-300/20 bg-emerald-300/10 p-2 text-xs text-emerald-50">
+                <div className="mb-1 font-semibold">当前活动排序</div>
+                <ul className="space-y-1 text-emerald-50/75">
+                  {localRankedActivities.slice(0, 3).map((item, idx) => (
+                    <li key={`${item.id ?? idx}`}>• {titleOf(item, `候选 ${idx + 1}`)}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {workValidationSteps.length > 0 && (
+              <div className="rounded-xl border border-violet-300/20 bg-violet-300/10 p-2 text-xs text-violet-50">
+                <div className="mb-1 font-semibold">最小验证步骤</div>
+                <ul className="space-y-1 text-violet-50/75">
+                  {workValidationSteps.slice(0, 3).map((item, idx) => <li key={idx}>• {item}</li>)}
+                </ul>
+              </div>
+            )}
+            {scenarioRouteButtons.length > 0 && (
+              <div className="mt-3 border-t border-white/10 pt-3">
+                <div className="mb-2 text-xs font-semibold text-white/75">下一轮路线</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {scenarioRouteButtons.map((route) => (
+                    <button
+                      key={`${route.targetStage ?? route.label}-${route.prompt}`}
+                      type="button"
+                      onClick={() => setUserDraft(route.prompt)}
+                      disabled={status === "streaming"}
+                      className="rounded-lg bg-white/10 px-2 py-1 text-[11px] text-white/75 transition-colors hover:bg-white/15 disabled:opacity-45"
+                    >
+                      {route.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -1082,6 +1234,16 @@ export const RoundtableStage: React.FC<Props> = ({
                 </div>
               </div>
             ) : null}
+            {protocolPhases.length > 0 ? (
+              <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-2 text-xs text-white/65">
+                <div className="mb-1 font-semibold text-white/80">场景协议</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {protocolPhases.slice(0, 5).map((item) => (
+                    <span key={item} className="rounded-full bg-white/10 px-2 py-1 text-[11px]">{item}</span>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             <p className="mb-3 text-sm leading-relaxed text-white/75">{decisionResult.summary}</p>
             <div className="mb-3 space-y-2">
               {decisionResult.tradeoffs.slice(0, 2).map((item, idx) => (
@@ -1103,6 +1265,24 @@ export const RoundtableStage: React.FC<Props> = ({
             {acceptedPendingAction && (
               <div className="mb-3 rounded-xl border border-amber-300/25 bg-amber-300/10 p-2 text-xs text-amber-50">
                 已生成待确认卡：{acceptedPendingAction.title}。请到 Maxwell / 待确认动作中最终确认，不会直接改日程。
+              </div>
+            )}
+            {scenarioRouteButtons.length > 0 && (
+              <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-2 text-xs text-white/70">
+                <div className="mb-2 font-semibold text-white/80">下一轮路线</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {scenarioRouteButtons.map((route) => (
+                    <button
+                      key={`${route.targetStage ?? route.label}-${route.prompt}`}
+                      type="button"
+                      onClick={() => setUserDraft(route.prompt)}
+                      disabled={status === "streaming"}
+                      className="rounded-lg bg-white/10 px-2 py-1 text-[11px] text-white/75 transition-colors hover:bg-white/15 disabled:opacity-45"
+                    >
+                      {route.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
             <div className="grid grid-cols-3 gap-2 text-xs">
@@ -1143,6 +1323,49 @@ export const RoundtableStage: React.FC<Props> = ({
               </div>
             ) : null}
             <p className="mb-3 line-clamp-4 text-sm leading-relaxed text-white/75">{brainstormResult.summary}</p>
+            {protocolPhases.length > 0 ? (
+              <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-2 text-xs text-white/65">
+                <div className="mb-1 font-semibold text-white/80">场景协议</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {protocolPhases.slice(0, 6).map((item) => (
+                    <span key={item} className="rounded-full bg-white/10 px-2 py-1 text-[11px]">{item}</span>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {localRankedActivities.length > 0 && (
+              <div className="mb-3 space-y-2">
+                <div className="text-xs font-semibold text-emerald-100">本地活动排序</div>
+                {localRankedActivities.slice(0, 3).map((activity, idx) => (
+                  <div key={`${activity.id ?? idx}`} className="rounded-xl bg-emerald-300/10 p-2 text-xs text-emerald-50/75">
+                    <div className="font-medium text-emerald-50">{idx + 1}. {titleOf(activity, `候选活动 ${idx + 1}`)}</div>
+                    {typeof activity.reason === "string" && <div className="text-emerald-50/55">{activity.reason}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
+            {(workRisks.length > 0 || workValidationSteps.length > 0) && (
+              <div className="mb-3 space-y-2">
+                {workRisks.length > 0 && (
+                  <div>
+                    <div className="mb-1 text-xs font-semibold text-amber-100">关键风险</div>
+                    <ul className="space-y-1 text-xs text-amber-50/75">
+                      {workRisks.slice(0, 3).map((risk, idx) => (
+                        <li key={idx}>• {titleOf(risk, `风险 ${idx + 1}`)}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {workValidationSteps.length > 0 && (
+                  <div>
+                    <div className="mb-1 text-xs font-semibold text-violet-100">最小验证</div>
+                    <ul className="space-y-1 text-xs text-violet-50/75">
+                      {workValidationSteps.slice(0, 4).map((step, idx) => <li key={idx}>• {step}</li>)}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
             <div className="mb-3">
               <div className="mb-1 text-xs font-semibold text-white/80">主题</div>
               <div className="flex flex-wrap gap-1.5">
@@ -1173,6 +1396,24 @@ export const RoundtableStage: React.FC<Props> = ({
             {brainstormPendingAction && (
               <div className="mb-3 rounded-xl border border-amber-300/25 bg-amber-300/10 p-2 text-xs text-amber-50">
                 已生成 Maxwell 待确认计划卡：{brainstormPendingAction.title}
+              </div>
+            )}
+            {scenarioRouteButtons.length > 0 && (
+              <div className="mb-3 rounded-xl border border-white/10 bg-white/5 p-2 text-xs text-white/70">
+                <div className="mb-2 font-semibold text-white/80">下一轮路线</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {scenarioRouteButtons.map((route) => (
+                    <button
+                      key={`${route.targetStage ?? route.label}-${route.prompt}`}
+                      type="button"
+                      onClick={() => setUserDraft(route.prompt)}
+                      disabled={status === "streaming"}
+                      className="rounded-lg bg-white/10 px-2 py-1 text-[11px] text-white/75 transition-colors hover:bg-white/15 disabled:opacity-45"
+                    >
+                      {route.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
             <div className="grid grid-cols-2 gap-2 text-xs">
@@ -1341,6 +1582,20 @@ export const RoundtableStage: React.FC<Props> = ({
                         >
                           {entry.content}
                         </p>
+                        {(entry.toolCount || entry.actionCount) ? (
+                          <div className="mt-2 flex flex-wrap gap-1.5 text-[11px]">
+                            {entry.toolCount ? (
+                              <span className="rounded-full bg-sky-300/15 px-2 py-0.5 text-sky-100">
+                                工具 {entry.toolCount}
+                              </span>
+                            ) : null}
+                            {entry.actionCount ? (
+                              <span className="rounded-full bg-amber-300/15 px-2 py-0.5 text-amber-100">
+                                待确认 {entry.actionCount}
+                              </span>
+                            ) : null}
+                          </div>
+                        ) : null}
                       </div>
                     </motion.div>
                   ))}

@@ -1,0 +1,857 @@
+====================================================================
+    Jarvis · Be IronMan 项目 —— 2026-05-02 工作总结
+====================================================================
+
+日期：2026-05-02（周六）
+工作目录：/Users/ohmorimotoki/Downloads/Jarvis Life v3
+远端仓库：https://github.com/Long95percent/Jarvis-Life.git
+当前说明：本日志记录 5-2 对圆桌解耦、圆桌意图识别、文档读取、
+         agent 回合内工具决策、六个预设圆桌场景覆盖、ScenarioProtocol
+         中度特化和接口文档同步的本地优化工作。今天没有改动远端仓库。
+
+--------------------------------------------------------------------
+一、今日一句话总结
+--------------------------------------------------------------------
+
+今天的主线是把圆桌从“多角色轮流聊天 + router 预取少量工具上下文”
+推进到“圆桌 start / continue 复用私聊意图识别，且六个预设圆桌场景
+的每个角色回合都经过共享 agent-turn 工具决策入口”的版本。
+
+核心结果：
+
+1. 圆桌继续保持解耦边界：讨论层不直接改日历、计划或关怀数据。
+2. 圆桌 start / continue 复用私聊主链路的意图识别能力。
+3. 支持圆桌中途读取本地文本类文档，并把内容作为临时文档上下文注入。
+4. 支持圆桌识别私聊已有的工具意图：
+   - 只读工具直接执行并注入圆桌上下文。
+   - 缺槽位意图进入圆桌上下文，由后续讨论补齐。
+   - 写操作只生成 pending action，不直接落业务数据。
+5. 升级第 6 点问题：圆桌工具使用不再只依赖 router 前置预取，
+   六个预设场景都接入 agent-turn-centered tool reasoning。
+6. 五个 Jarvis 角色圆桌场景中，每个角色在自己的发言回合可按
+   自己的 tool_whitelist 动态判断是否调用工具。
+7. work_brainstorm 也走共享 agent-turn 入口，但因为 brainstorm 专用
+   角色没有 Jarvis 工具白名单，所以保持无工具发言。
+8. 同步更新解耦接口说明，记录新增行为边界和 SSE payload 新字段。
+9. 补齐单元测试和链路测试，覆盖六个预设圆桌场景。
+10. 新增 ScenarioProtocol，让六个圆桌不再只是同一套顺序发言逻辑，
+    而是拥有各自的阶段协议、工具策略、结果契约和写入边界。
+11. 将 work_brainstorm 和 local_lifestyle 从 B 方案进一步拉出为 C 方案，
+    增加场景专属阶段事件、状态产物和前端展示。
+12. 修复 graph finalize 调用 participants 参数不匹配问题，确保收敛链路
+    能按当前 executor 签名跑通。
+
+--------------------------------------------------------------------
+二、背景与问题判断
+--------------------------------------------------------------------
+
+本轮优化来自圆桌模块的几个核心问题：
+
+1. 私聊链路已经有一套比较成熟的意图识别和工具调用机制。
+   如果圆桌只靠角色 prompt 聊天，会出现“私聊智能，圆桌不智能”的
+   割裂感。
+
+2. 早期圆桌工具能力是 router-centered tool prefetch：
+   用户启动或继续圆桌时，router 统一识别一次意图、执行一次工具，
+   再把工具结果拼进所有角色共享上下文。
+
+3. 这种方式稳定、快、可控，但不够像真实 agent：
+   Athena 不是自己判断要读文件，Nora 不是自己判断要 meal_plan，
+   而是 router 先帮她们取好结果。
+
+4. 用户明确希望优化第 6 点：
+   圆桌工具决策应该升级为 agent-turn-centered tool reasoning。
+
+5. 用户同时要求六个预设圆桌场景全覆盖，不能只优化某一个场景。
+
+本轮设计边界：
+
+1. 保留圆桌解耦：圆桌负责讨论、判断、总结和生成待确认动作。
+2. 不把圆桌变成直接执行层。
+3. 写操作仍走 pending action。
+4. 工具能力复用私聊工具运行时，不另写一套平行工具系统。
+5. 六个预设场景全部走同一套共享 agent-turn 工具决策入口。
+
+--------------------------------------------------------------------
+三、圆桌复用私聊意图识别
+--------------------------------------------------------------------
+
+新增/扩展文件：
+
+1. shadowlink-ai/app/jarvis/intent_router.py
+2. shadowlink-ai/app/api/v1/jarvis_router.py
+3. shadowlink-ai/tests/unit/jarvis/test_intent_router.py
+4. shadowlink-ai/tests/unit/jarvis/test_roundtable_decision.py
+
+核心实现：
+
+1. 在 intent_router 中新增 plan_roundtable_intent。
+   - 圆桌不另造一套意图识别规则。
+   - 内部复用已有 plan_agent_intent。
+   - 按参与角色扫描意图。
+   - 支持 document_read 特殊意图。
+
+2. 圆桌 start / continue 都会跑共享意图识别。
+
+3. intent 结果被转换成圆桌可消费的上下文：
+   - document_read -> 文档读取上下文。
+   - call_tool -> 工具结果上下文。
+   - ask_missing_slots -> 缺槽位上下文。
+   - pending_confirmation -> 待确认动作上下文。
+
+4. 写操作不会直接执行最终业务写入。
+   - calendar add / update / delete 等仍生成 pending action。
+   - context update、mood journal 等写操作同样不直接落业务数据。
+
+行为示例：
+
+1. 圆桌中用户说：
+   “今晚很累，吃什么比较撑得住？”
+
+   系统会识别 Nora 的 meal_plan 意图，执行只读/分析型工具，把结果
+   作为“圆桌意图识别与工具结果”拼进上下文。
+
+2. 圆桌中用户说：
+   “明天下午 3 点提醒我复习英语 1 小时”
+
+   系统会识别 Maxwell 的 calendar_create 意图，但只生成 pending action，
+   不直接写入日历。
+
+3. 圆桌中用户说：
+   “帮我安排复习英语”
+
+   系统会识别 calendar_create，但发现缺少 start/end，后续圆桌会围绕
+   缺少槽位继续讨论，而不是静默丢掉。
+
+--------------------------------------------------------------------
+四、本地文本类文档读取支持
+--------------------------------------------------------------------
+
+相关文件：
+
+1. shadowlink-ai/app/jarvis/agents.py
+2. shadowlink-ai/app/jarvis/intent_router.py
+3. shadowlink-ai/app/api/v1/jarvis_router.py
+4. shadowlink-ai/tests/unit/jarvis/test_roundtable_decision.py
+5. shadowlink-ai/tests/unit/jarvis/test_intent_router.py
+
+能力范围：
+
+1. 当前只支持文本类文档。
+2. 支持扩展名：
+   - .txt
+   - .md / .markdown
+   - .py
+   - .json
+   - .csv
+   - .log
+   - .yaml / .yml
+   - .ts / .tsx
+   - .js / .jsx
+   - .java
+
+3. 默认搜索目录：
+   - settings.data_dir
+   - settings.file_processing.upload_dir
+   - repo_root / docs
+
+4. 文件定位策略：
+   - 从用户消息中提取 filename_query。
+   - 对文件名、stem 和关键词 token 做 score。
+   - 单一最佳匹配则读取。
+   - 多个同分最佳匹配则返回 ambiguous。
+   - 未找到则返回 not_found。
+
+5. 读取结果拼进圆桌 prompt：
+   “## 临时文档上下文”
+
+6. Athena 已加入 file_read 工具白名单。
+
+设计边界：
+
+1. 目前不处理 PDF / docx / pptx 等复杂格式。
+2. 不做大文件完整 RAG。
+3. 默认截断 max_chars，避免圆桌 prompt 膨胀。
+4. 圆桌只声明读取了注入的文件，不允许声称读取其它未提供文件。
+
+--------------------------------------------------------------------
+五、从 router-centered prefetch 到 agent-turn-centered tool reasoning
+--------------------------------------------------------------------
+
+这是今天最关键的结构性优化。
+
+优化前：
+
+用户启动/继续圆桌
+-> roundtable router 识别意图
+-> router 执行工具
+-> 工具结果拼进圆桌上下文
+-> 各 agent 被动消费上下文发言
+
+问题：
+
+1. 工具调用责任在 router，不在 agent。
+2. agent 不够“活”，不像自己具备工具能力。
+3. Nora、Athena、Maxwell 等角色的工具判断被前置集中处理。
+4. 和私聊的 run_agent_turn 动态工具能力不一致。
+
+优化后：
+
+轮到某个 agent 发言
+-> 进入共享 run_roundtable_agent_turn
+-> Jarvis 角色使用自己的 tool_whitelist
+-> 模型可输出工具调用
+-> 工具执行
+-> 工具结果回喂给 agent
+-> agent 基于结果产出最终发言
+-> 写操作生成 pending action
+
+新增共享能力：
+
+文件：
+shadowlink-ai/app/jarvis/roundtable_graph.py
+
+新增结构和函数：
+
+1. RoundtableAgentTurnResult
+   - content
+   - tool_results
+   - action_results
+
+2. run_roundtable_agent_turn
+   - 统一圆桌角色回合执行入口。
+   - Jarvis 角色可启用工具。
+   - 非 Jarvis / brainstorm 角色可禁用工具。
+   - 内部复用私聊 tool_runtime.run_agent_turn。
+
+3. _persist_roundtable_agent_actions
+   - 将角色回合中产生的 pending_confirmation action 保存到 pending_actions。
+   - 不直接写日历、计划或关怀数据。
+
+4. roundtable_content_deltas
+   - 保持前端仍能收到 role_delta。
+   - 因 run_agent_turn 返回完整内容，为了不破坏圆桌舞台流式事件，
+     将最终内容切成至少两个 delta 发出。
+
+--------------------------------------------------------------------
+六、六个预设圆桌场景全覆盖
+--------------------------------------------------------------------
+
+用户明确要求六个场景全覆盖，本轮已全部覆盖。
+
+1. schedule_coord
+   文件：
+   shadowlink-ai/app/jarvis/schedule_coord_graph.py
+
+   参与角色：
+   - maxwell
+   - nora
+   - mira
+   - alfred
+
+   变化：
+   - _run_role 改为调用 run_roundtable_agent_turn。
+   - 每个 Jarvis 角色可按自己的白名单动态判断工具。
+   - role_completed 附带 tool_results / action_results。
+
+2. local_lifestyle
+   文件：
+   shadowlink-ai/app/jarvis/local_lifestyle_graph.py
+
+   参与角色：
+   - leo
+   - maxwell
+   - nora
+   - alfred
+
+   变化：
+   - Leo / Maxwell / Nora / Alfred 都走共享 agent-turn 工具决策。
+   - 本地生活、日程可行性、体力饮食建议都可更自然地接工具。
+
+3. emotional_care
+   文件：
+   shadowlink-ai/app/jarvis/emotional_care_graph.py
+
+   参与角色：
+   - mira
+   - nora
+   - leo
+   - alfred
+
+   变化：
+   - Mira 可在自己回合判断是否需要呼吸、回访、关怀相关工具。
+   - 写操作仍不会直接落库。
+
+4. study_energy_decision
+   文件：
+   shadowlink-ai/app/jarvis/study_energy_decision_graph.py
+
+   参与角色：
+   - mira
+   - maxwell
+   - athena
+   - alfred
+
+   变化：
+   - Athena 可在自己回合使用学习策略/截止风险/文件读取相关能力。
+   - Maxwell 可在自己回合生成待确认日程动作。
+
+5. weekend_recharge
+   文件：
+   shadowlink-ai/app/jarvis/weekend_recharge_graph.py
+
+   参与角色：
+   - leo
+   - nora
+   - mira
+   - alfred
+
+   变化：
+   - 周末恢复规划中，每个 Jarvis 角色都可在自己发言时判断工具。
+
+6. work_brainstorm
+   文件：
+   shadowlink-ai/app/jarvis/work_brainstorm_graph.py
+
+   参与角色：
+   - moderator
+   - explorer
+   - critic
+   - synthesizer
+
+   特殊说明：
+   - 该场景使用 app.agent.brainstorm.agents 中的 brainstorm 专用角色。
+   - 这些角色没有 Jarvis tool_whitelist。
+   - 因此本场景同样走共享 agent-turn 入口，但 enable_tools=False。
+   - 这样接口结构统一，同时不强行给 brainstorm 角色挂不属于它们的工具。
+
+--------------------------------------------------------------------
+七、六个场景的特化协议与两个 C 方案
+--------------------------------------------------------------------
+
+在用户确认 B 方案后，本轮新增：
+
+1. shadowlink-ai/app/jarvis/roundtable_protocols.py
+2. shadowlink-ai/tests/unit/jarvis/test_roundtable_protocols.py
+
+新增核心结构：
+
+1. RoundtableProtocolPhase
+   - id
+   - title
+   - owner_agent
+   - objective
+   - role_instructions
+
+2. ScenarioProtocol
+   - scenario_id
+   - mode
+   - phases
+   - tool_policy
+   - result_contract
+   - safety_rules
+   - handoff_target
+
+六个场景协议：
+
+1. schedule_coord
+   context_scan -> conflict_check -> role_proposal -> crossfire -> alfred_decision
+
+2. study_energy_decision
+   energy_gate -> task_value_check -> minimum_viable_study -> crossfire -> decision
+
+3. local_lifestyle
+   collect_constraints -> discover_candidates -> enrich_candidates -> feasibility_score
+   -> energy_filter -> rank_options -> plan_candidate
+
+4. emotional_care
+   safety_check -> emotional_validation -> body_support -> low_stimulation_options -> care_summary
+
+5. weekend_recharge
+   recovery_goal -> available_blocks -> activity_rest_balance -> crossfire -> weekend_rhythm
+
+6. work_brainstorm
+   frame_problem -> ingest_context -> divergent_ideas -> cluster_ideas
+   -> critic_review -> synthesis -> validation_plan
+
+实现方式：
+
+1. 六个 graph executor 仍保留各自文件和现有 SSE 事件。
+2. 每个 agent turn prompt 会拼入对应 ScenarioProtocol。
+3. prompt 中会明确：
+   - protocol_id
+   - protocol_mode
+   - phase_sequence
+   - current_phase
+   - current_role_instruction
+   - tool_policy
+   - safety_rules
+   - result_contract
+4. summarize / finalize 也会读取协议的最终阶段和结果契约。
+   result_contract 同时包含对外通用字段和场景语义字段，例如：
+   - schedule_coord.calendar_adjustment_candidates
+   - study_energy_decision.minimum_study_block
+   - local_lifestyle.ranked_activities
+   - emotional_care.low_barrier_actions
+   - weekend_recharge.weekend_rhythm
+   - work_brainstorm.minimum_validation_steps
+5. final result context 现在会带可选追踪字段：
+   - scenario_protocol_id
+   - scenario_protocol_mode
+   - scenario_protocol_phases
+   - scenario_protocol_handoff_target
+   - scenario_protocol_result_contract
+
+边界说明：
+
+1. schedule_coord、study_energy_decision、emotional_care、weekend_recharge
+   当前是中度特化 B，不是四套完全独立状态机。
+2. local_lifestyle 和 work_brainstorm 已升级为 C 方案：
+   - local_lifestyle 会显式产生 collect_constraints / discover_candidates /
+     enrich_candidates / feasibility_score / energy_filter / rank_options /
+     plan_candidate 阶段事件。
+   - work_brainstorm 会显式产生 frame_problem / ingest_context /
+     divergent_ideas / cluster_ideas / critic_review / synthesis /
+     validation_plan 阶段事件。
+   - 两个 C 方案都会在本轮收敛后发 scenario_state，暴露场景专属中间产物。
+3. C 方案仍不改变圆桌 URL、请求模型和确认边界；它只是让两个重点场景
+   拥有更明确的内部状态和可展示产物。
+4. crossfire 当前是轻量阶段约束：后发言角色必须回应前面至少一个
+   共识、分歧、风险或约束。
+5. crossfire 还不是完整多轮互相追问状态机。
+6. 圆桌接口 URL、请求模型、SSE 事件名保持兼容；scenario_stage /
+   scenario_state 是可选增强事件。
+7. 写操作仍只走 pending action，不直接写业务数据。
+
+--------------------------------------------------------------------
+八、SSE 与前端兼容边界
+--------------------------------------------------------------------
+
+本轮保持原有圆桌舞台事件结构：
+
+1. role_started
+2. role_delta
+3. role_completed
+4. round_summary
+5. user_checkpoint
+6. decision_result / brainstorm_result
+7. roundtable_timing
+8. done
+
+新增字段：
+
+role_completed payload 现在可能包含：
+
+1. tool_results
+2. action_results
+
+前端兼容规则：
+
+1. 前端可以暂时忽略这两个字段。
+2. 不应因为新增字段报错。
+3. 如果后续要展示“某角色使用了工具”，可以基于这两个字段做可视化。
+4. action_results 中的 pending_confirmation 代表待确认，不代表已执行。
+
+为了兼容旧舞台动画，本轮没有取消 role_delta。因为 run_agent_turn 返回的是
+最终内容，所以后端用 roundtable_content_deltas 将内容拆成 delta 发给前端。
+
+本轮前端已同步支持：
+
+1. shadowlink-web/src/services/jarvisApi.ts
+   - RoundtableBrainstormResult 增加可选字段：
+     c_artifacts、ranked_activities、risks、minimum_validation_steps。
+
+2. shadowlink-web/src/components/jarvis/RoundtableStage.tsx
+   - 监听 scenario_stage / scenario_state。
+   - 进行中展示当前场景阶段、最近阶段轨迹和 C 方案中间产物。
+   - 最终结果卡展示场景协议阶段。
+   - local_lifestyle 结果卡展示 ranked_activities。
+   - work_brainstorm 结果卡展示 risks 和 minimum_validation_steps。
+   - 完整记录展示每个角色 tool_results / action_results 数量。
+   - 修复 complete 状态文案乱码，恢复为“结束”。
+
+--------------------------------------------------------------------
+九、接口文档同步
+--------------------------------------------------------------------
+
+用户要求所有圆桌接口改动同步到解耦接口设计说明。本轮已更新：
+
+1. docs/解耦接口说明/roundtable-api-contract.md
+
+   新增说明：
+   - 圆桌 start / continue 复用私聊同一套意图识别入口。
+   - 只读工具可以注入圆桌上下文。
+   - 写操作只生成待确认动作。
+   - 六个预设圆桌场景都经过共享 agent-turn 工具决策入口。
+   - Jarvis 场景启用 tool_whitelist 动态工具判断。
+   - work_brainstorm 保持无工具发言。
+   - role_completed 可能包含 tool_results / action_results。
+   - 新增 ScenarioProtocol 说明：六个场景拥有各自阶段协议和写入边界。
+   - 记录 crossfire 是轻量交叉质询阶段，不是新的必处理 SSE event。
+
+2. docs/解耦接口说明/frontend-decoupling-developer-guide.md
+
+   新增说明：
+   - 圆桌 start / continue 会先复用共享意图识别。
+   - 六个预设圆桌场景的角色回合都经过共享 agent-turn 入口。
+   - 六个预设场景会读取后端内部 ScenarioProtocol，但不要求前端新增请求字段。
+   - crossfire 当前只是 prompt 约束和上下文追踪，不是新的前端事件。
+   - 写操作仍只生成待确认动作，不直接改日历、计划或关怀数据。
+   - 前端不要把圆桌当成直接执行层。
+
+--------------------------------------------------------------------
+十、测试覆盖与验证结果
+--------------------------------------------------------------------
+
+新增/扩展测试文件：
+
+1. shadowlink-ai/tests/unit/jarvis/test_intent_router.py
+2. shadowlink-ai/tests/unit/jarvis/test_roundtable_decision.py
+3. shadowlink-ai/tests/unit/jarvis/test_roundtable_protocols.py
+4. 六个 graph executor 单测文件
+
+重点测试场景：
+
+1. roundtable document_read intent 复用 shared router。
+2. 文档读取能按文件名关键词找到文本文件。
+3. 文档内容能注入 continue 圆桌上下文。
+4. 圆桌只读工具意图会执行并注入上下文。
+5. 圆桌写工具意图会生成 pending action。
+6. 圆桌缺槽位意图会注入 missing_slots。
+7. agent-turn 工具决策产生写工具时会保存 pending action。
+8. 六个预设 graph executor 都调用共享 run_roundtable_agent_turn。
+9. role_completed payload 带 tool_results。
+10. 旧的 role_delta / role_completed / checkpoint 事件仍保持。
+11. 六个场景都有自己的 ScenarioProtocol。
+12. 六个场景的阶段顺序、mode、handoff_target、write_mode 都被测试锁定。
+13. schedule_coord / work_brainstorm 的 agent prompt 会包含协议阶段。
+
+实际验证命令：
+
+1. 后端完整圆桌回归：
+
+   .venv311/bin/python -m pytest \
+     tests/unit/jarvis/test_roundtable_protocols.py \
+     tests/unit/jarvis/test_schedule_coord_graph.py \
+     tests/unit/jarvis/test_study_energy_decision_graph.py \
+     tests/unit/jarvis/test_local_lifestyle_graph.py \
+     tests/unit/jarvis/test_emotional_care_graph.py \
+     tests/unit/jarvis/test_weekend_recharge_graph.py \
+     tests/unit/jarvis/test_work_brainstorm_graph.py \
+     tests/unit/jarvis/test_roundtable_decision.py \
+     tests/unit/jarvis/test_intent_router.py \
+     tests/unit/jarvis/test_roundtable_brainstorm.py -q
+
+   结果：
+   71 passed in 0.41s
+
+2. 语法检查：
+
+   .venv311/bin/python -m py_compile \
+     app/jarvis/roundtable_protocols.py \
+     app/jarvis/roundtable_graph.py \
+     app/jarvis/schedule_coord_graph.py \
+     app/jarvis/study_energy_decision_graph.py \
+     app/jarvis/local_lifestyle_graph.py \
+     app/jarvis/emotional_care_graph.py \
+     app/jarvis/weekend_recharge_graph.py \
+     app/jarvis/work_brainstorm_graph.py \
+     app/api/v1/jarvis_router.py \
+     tests/unit/jarvis/test_roundtable_protocols.py \
+     tests/unit/jarvis/test_schedule_coord_graph.py \
+     tests/unit/jarvis/test_study_energy_decision_graph.py \
+     tests/unit/jarvis/test_local_lifestyle_graph.py \
+     tests/unit/jarvis/test_emotional_care_graph.py \
+     tests/unit/jarvis/test_weekend_recharge_graph.py \
+     tests/unit/jarvis/test_work_brainstorm_graph.py \
+     tests/unit/jarvis/test_roundtable_decision.py \
+     tests/unit/jarvis/test_intent_router.py \
+     tests/unit/jarvis/test_roundtable_brainstorm.py
+
+   结果：
+   passed
+
+3. 前端类型检查：
+
+   npm run type-check
+
+   结果：
+   passed
+
+--------------------------------------------------------------------
+十一、主要改动文件清单
+--------------------------------------------------------------------
+
+后端核心：
+
+1. shadowlink-ai/app/api/v1/jarvis_router.py
+   - 圆桌 start / continue 接入 roundtable intent。
+   - 新增 roundtable intent context 解析和注入。
+   - 写操作 pending action 落库。
+   - 文档上下文注入。
+
+2. shadowlink-ai/app/jarvis/intent_router.py
+   - 新增 plan_roundtable_intent。
+   - 复用 plan_agent_intent。
+   - 增加 document_read 识别。
+
+3. shadowlink-ai/app/jarvis/roundtable_graph.py
+   - 新增 RoundtableAgentTurnResult。
+   - 新增 run_roundtable_agent_turn。
+   - 新增 pending action 保存 helper。
+   - 新增 roundtable_content_deltas。
+
+4. shadowlink-ai/app/jarvis/roundtable_protocols.py
+   - 新增 ScenarioProtocol。
+   - 新增六个场景的阶段协议、工具策略、结果契约和写入边界。
+   - 新增协议 prompt block 和 final result context helper。
+
+5. shadowlink-ai/app/jarvis/agents.py
+   - Athena 加入 file_read 白名单。
+
+六个 graph executor：
+
+1. shadowlink-ai/app/jarvis/schedule_coord_graph.py
+2. shadowlink-ai/app/jarvis/study_energy_decision_graph.py
+3. shadowlink-ai/app/jarvis/local_lifestyle_graph.py
+4. shadowlink-ai/app/jarvis/emotional_care_graph.py
+5. shadowlink-ai/app/jarvis/weekend_recharge_graph.py
+6. shadowlink-ai/app/jarvis/work_brainstorm_graph.py
+
+前端：
+
+1. shadowlink-web/src/components/jarvis/RoundtableStage.tsx
+   - 支持 scenario_stage / scenario_state。
+   - 展示 C 方案中间产物、协议阶段和工具/待确认动作计数。
+
+2. shadowlink-web/src/services/jarvisApi.ts
+   - 补齐 RoundtableBrainstormResult 的 C 方案可选字段。
+
+测试：
+
+1. shadowlink-ai/tests/unit/jarvis/test_intent_router.py
+2. shadowlink-ai/tests/unit/jarvis/test_roundtable_decision.py
+3. shadowlink-ai/tests/unit/jarvis/test_roundtable_protocols.py
+4. 六个 graph executor 单测文件均有回归覆盖。
+
+文档：
+
+1. docs/解耦接口说明/roundtable-api-contract.md
+2. docs/解耦接口说明/frontend-decoupling-developer-guide.md
+3. docs/ohmori-worklog/2026-05-02-daily-summary.txt
+
+--------------------------------------------------------------------
+十二、当前仍然不完善的圆桌能力
+--------------------------------------------------------------------
+
+今天优化的是第 6 点：工具使用从 router 预取升级为 agent 回合内工具判断；
+并完成了六个场景的 B 方案协议覆盖，同时把 local_lifestyle 和
+work_brainstorm 进一步升级为 C 方案。
+
+仍未完成的重点：
+
+1. crossfire 目前是轻量阶段约束，不是完整 C 方案状态机。
+   当前做到了后发角色必须回应前面至少一个共识、分歧、风险或约束；
+   但还没有让前发角色再回来对后续质疑做短回应。
+
+2. 用户反馈还没有结构化成强约束。
+   目前用户反馈进入 transcript 和 feedback_history，但没有稳定拆成：
+   - constraints
+   - preferences
+   - rejected_options
+   - selected_direction
+
+3. finalize 链路仍建议补端到端测试。
+   本轮已经修复 router 调 executor.finalize 时多传 participants 的参数
+   不匹配问题，并用 graph 回归测试覆盖 finalize。
+   后续仍建议继续补端到端 SSE 场景测试，验证用户点击“收敛/给我结论”
+   时前后端体验是否一致。
+
+4. 六个 graph executor 仍有明显重复。
+   目前为保证稳定和覆盖，先在六个文件中同步接入共享 helper。
+   后续可以进一步抽象出通用 RoundtableScenarioExecutor，减少重复维护。
+
+5. 性能策略需要重新评估。
+   agent-turn 工具决策比单纯 chat_stream 更像真实 agent，但可能多一次 LLM。
+   后续需要按场景测量耗时，必要时做开关或低成本路径。
+
+--------------------------------------------------------------------
+十三、Git 与本地状态注意事项
+--------------------------------------------------------------------
+
+本轮没有 push 远端。
+
+本地工作区除本轮修改外，还存在测试运行产生的未跟踪文件：
+
+shadowlink-ai/data/test_dbs/settings-*.json
+
+这些文件本轮没有手动修改，也没有纳入日志正文的实现范围。后续提交前应：
+
+1. 确认是否需要加入 .gitignore。
+2. 或清理测试临时 settings 文件。
+3. 不要把这些临时文件误提交。
+
+--------------------------------------------------------------------
+十四、下一步建议
+--------------------------------------------------------------------
+
+优先级建议：
+
+1. 将轻量 crossfire 升级为完整 C 方案状态机，让前后角色能互相追问和回应。
+2. 将用户反馈结构化，确保后续轮次真正遵守用户限制。
+3. 抽出通用圆桌 scenario executor，降低六个 graph executor 重复维护成本。
+4. 观察 agent-turn 工具决策的性能成本，必要时做场景级开关。
+5. 补一组真正跑 SSE 的前后端链路测试，覆盖 scenario_stage /
+   scenario_state / role_completed 工具计数在浏览器侧的展示。
+
+--------------------------------------------------------------------
+十五、结论
+--------------------------------------------------------------------
+
+今天圆桌模块从“可用 MVP”向“更像真实多 Agent 协作”的方向推进了一步：
+
+1. 圆桌不再只靠 router 前置识别工具。
+2. 每个 Jarvis agent 的工具能力开始进入自己的发言回合。
+3. 六个预设场景全部覆盖，并通过 ScenarioProtocol 拥有各自阶段协议。
+4. work_brainstorm 和 local_lifestyle 已先行升级为 C 方案，并有前端同步展示。
+5. 写操作仍保持 pending confirmation，符合解耦和安全边界。
+6. 解耦接口说明已同步，后续前端或圆桌业务开发人员可以按文档理解新边界。
+
+这次优化没有把圆桌变成复杂后台多 Agent 系统，而是在保持产品化舞台和
+确认机制的前提下，让每个角色更接近“自己判断、自己使用工具、自己基于
+结果发言”的体验。
+
+--------------------------------------------------------------------
+附录：2026-05-03 对 5-2 圆桌改动的补充修正
+--------------------------------------------------------------------
+
+本附录记录对 5-2 圆桌前后端改动的审查后修复。修复目标是把前端展示、
+SSE payload 消费方式和后端写入边界重新对齐，避免“界面接了字段，但
+语义不符合后端设计”的问题。
+
+一、修复内容
+
+1. 圆桌 task plan 写入边界收紧。
+   - 问题：`jarvis_task_plan_decompose` 在私聊链路中可能直接生成 plan /
+     plan_day / calendar projection，不适合在圆桌讨论阶段直接执行。
+   - 修复：圆桌 start / continue 识别到该工具时，只合成
+     `pending_confirmation` action，并保存到 pending_actions。
+   - 修复：角色回合内 agent-turn tool reasoning 也把
+     `jarvis_task_plan_decompose` 作为 deferred confirmation tool 处理，
+     不直接执行业务写入。
+
+2. 文档读取候选仲裁修正。
+   - 问题：文件候选先按 score 和路径长度排序，但 ambiguous 判断只看 score，
+     导致本可用路径长度打破的同分候选仍被判为 ambiguous。
+   - 修复：只有 score 和路径长度都相同的候选才算真正 ambiguous；否则选
+     排序后的最优候选。
+
+3. 圆桌前端初始模式修正。
+   - 问题：前端只把 `work_brainstorm` 识别为 brainstorm，导致
+     `local_lifestyle`、`emotional_care`、`weekend_recharge` 首屏按
+     decision 视觉和文案渲染。
+   - 修复：新增 `initialRoundtableModeForScenario`，与后端模式规则对齐：
+     `schedule_coord`、`study_energy_decision` 为 decision，其余预设圆桌
+     为 brainstorm。
+
+4. `role_completed.action_results` 展示语义修正。
+   - 问题：前端把 `action_results.length` 直接显示为“待确认”数量，但
+     action_results 中也可能包含非 pending 的成功结果。
+   - 修复：新增 `pendingActionCount`，只统计
+     `pending_confirmation === true` 的动作。
+
+5. `scenario_state.next_routes` 前端消费补齐。
+   - 问题：后端已经在 `scenario_state` 中发出下一轮路线建议，但前端只保存
+     payload，没有可点击入口。
+   - 修复：新增 `routeButtonsFromScenarioState`，把 `next_routes` 渲染为
+     “下一轮路线”按钮；点击后把后端提供的 prompt 填入用户输入框。
+
+二、相关新增/修改文件
+
+后端：
+
+1. shadowlink-ai/app/api/v1/jarvis_router.py
+   - 增加圆桌 deferred confirmation 工具集合。
+   - 增加 `_roundtable_deferred_action_result`。
+   - 修复文档候选 ambiguous 判断。
+
+2. shadowlink-ai/app/jarvis/tool_runtime.py
+   - `execute_tool_calls` 支持 `defer_confirmation_tools`。
+   - `run_agent_turn` 支持把指定工具转成待确认结果。
+   - `to_action_results` 对 requires_confirmation 工具统一生成 pending action。
+
+3. shadowlink-ai/app/jarvis/roundtable_graph.py
+   - 圆桌角色回合调用 `run_agent_turn` 时传入
+     `defer_confirmation_tools={"jarvis_task_plan_decompose"}`。
+
+前端：
+
+1. shadowlink-web/src/components/jarvis/RoundtableStage.tsx
+   - 使用后端一致的初始模式判断。
+   - 待确认动作计数只统计 pending confirmation。
+   - 展示并消费 `scenario_state.next_routes`。
+
+2. shadowlink-web/src/components/jarvis/roundtableStageLogic.ts
+   - 新增圆桌前端纯逻辑 helper：
+     `initialRoundtableModeForScenario`、`pendingActionCount`、
+     `routeButtonsFromScenarioState`。
+
+3. shadowlink-web/src/components/jarvis/roundtableStageLogic.test.ts
+   - 新增前端 helper 的轻量回归断言。
+
+测试：
+
+1. shadowlink-ai/tests/unit/jarvis/test_roundtable_decision.py
+   - 增加 task plan 不直接执行、文档候选排序、角色回合 deferred tool 的回归测试。
+
+三、验证结果
+
+1. 后端圆桌相关测试：
+
+   '/Users/ohmorimotoki/Downloads/Jarvis Life v3/shadowlink-ai/.venv311/bin/python' -m pytest \
+     tests/unit/jarvis/test_roundtable_decision.py \
+     tests/unit/jarvis/test_roundtable_protocols.py \
+     tests/unit/jarvis/test_local_lifestyle_graph.py \
+     tests/unit/jarvis/test_work_brainstorm_graph.py
+
+   结果：
+   38 passed
+
+2. 前端类型检查：
+
+   npm run type-check
+
+   结果：
+   passed
+
+3. 前端 helper 运行时断言：
+
+   ./node_modules/.bin/tsc --target ES2020 --module commonjs --moduleResolution node \
+     --rootDir shadowlink-web/src --outDir /tmp/roundtable-stage-test \
+     shadowlink-web/src/components/jarvis/roundtableStageLogic.ts \
+     shadowlink-web/src/components/jarvis/roundtableStageLogic.test.ts
+
+   node /tmp/roundtable-stage-test/components/jarvis/roundtableStageLogic.test.js
+
+   结果：
+   passed
+
+--------------------------------------------------------------------
+补充：圆桌前端设计指南
+--------------------------------------------------------------------
+
+本次在解耦说明目录新增：
+
+1. docs/解耦接口说明/roundtable-frontend-design-guide.md
+
+补充目的：
+
+1. 让前端开发人员不用通读后端代码，也能知道圆桌后端已经实现了哪些能力。
+2. 把六个预设圆桌场景逐一映射到前端必须设计的界面和交互逻辑。
+3. 明确 start / continue SSE、scenario_stage、scenario_state、round_summary、
+   decision_result、brainstorm_result、accept/save/plan/return、历史恢复和返回私聊
+   对应的前端责任。
+4. 明确圆桌写入边界：接受决策、脑暴转计划、工具写意图都只能生成待确认动作，
+   前端不能写成“已直接修改日程/计划”。
+5. 在 frontend-decoupling-developer-guide.md 和 roundtable-api-contract.md 中补充该指南入口，
+   让圆桌接口契约和前端设计说明互相可追踪。

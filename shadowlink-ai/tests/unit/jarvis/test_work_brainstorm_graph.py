@@ -7,6 +7,9 @@ from app.jarvis.work_brainstorm_graph import WorkBrainstormGraphExecutor
 
 
 class FakeWorkBrainstormLLM:
+    def __init__(self):
+        self.messages: list[str] = []
+
     async def chat_stream(self, message: str, *, system_prompt: str | None = None, temperature: float | None = None, **kwargs):
         if "Moderator" in (system_prompt or ""):
             chunks = ["先把问题拆成体验、技术和叙事三条线，", "再让团队分别发散。"]
@@ -20,6 +23,7 @@ class FakeWorkBrainstormLLM:
             yield chunk
 
     async def chat(self, message: str, *, system_prompt: str | None = None, temperature: float | None = None, **kwargs):
+        self.messages.append(message)
         if "minutes, consensus" in message:
             return json.dumps(
                 {
@@ -72,6 +76,57 @@ async def test_work_brainstorm_graph_streams_roles_then_checkpoint():
 
 
 @pytest.mark.asyncio
+async def test_work_brainstorm_c_state_emits_workshop_artifacts():
+    executor = WorkBrainstormGraphExecutor(llm_client=FakeWorkBrainstormLLM())
+    events = []
+
+    async for event in executor.start_round(
+        session_id="rt-work-c",
+        user_goal="帮我头脑风暴一个 Jarvis demo",
+        context={"previous_discussion": ""},
+    ):
+        events.append(event)
+
+    names = [event["event"] for event in events]
+    stage_payloads = [json.loads(event["data"]) for event in events if event["event"] == "scenario_stage"]
+    state_payload = json.loads(next(event["data"] for event in events if event["event"] == "scenario_state"))
+
+    assert names.count("scenario_stage") == 7
+    assert [payload["stage_id"] for payload in stage_payloads] == [
+        "frame_problem",
+        "ingest_context",
+        "divergent_ideas",
+        "cluster_ideas",
+        "critic_review",
+        "synthesis",
+        "validation_plan",
+    ]
+    assert state_payload["state_type"] == "work_brainstorm_c"
+    assert state_payload["graph_executor"] == "work_brainstorm_c_v1"
+    assert "problem_frame" in state_payload["artifacts"]
+    assert "idea_pool" in state_payload["artifacts"]
+    assert "critique_matrix" in state_payload["artifacts"]
+    assert "validation_plan" in state_payload["artifacts"]
+
+
+@pytest.mark.asyncio
+async def test_work_brainstorm_prompt_uses_workshop_protocol_phases():
+    llm = FakeWorkBrainstormLLM()
+    executor = WorkBrainstormGraphExecutor(llm_client=llm)
+
+    async for _event in executor.start_round(
+        session_id="rt-work-protocol",
+        user_goal="帮我头脑风暴一个 Jarvis demo",
+        context={"previous_discussion": ""},
+    ):
+        pass
+
+    assert any("frame_problem" in message for message in llm.messages)
+    assert any("critic_review" in message for message in llm.messages)
+    assert any("validation_plan" in message for message in llm.messages)
+
+
+@pytest.mark.asyncio
 async def test_work_brainstorm_finalize_emits_brainstorm_result_and_done():
     executor = WorkBrainstormGraphExecutor(llm_client=FakeWorkBrainstormLLM())
     events = []
@@ -90,7 +145,9 @@ async def test_work_brainstorm_finalize_emits_brainstorm_result_and_done():
     assert names == ["final_result", "brainstorm_result", "done"]
     assert result["mode"] == "brainstorm"
     assert result["handoff_target"] == "maxwell"
-    assert result["context"]["graph_executor"] == "work_brainstorm_langgraph_v1"
+    assert result["context"]["graph_executor"] == "work_brainstorm_c_v1"
+    assert result["context"]["c_artifacts"]["state_type"] == "work_brainstorm_c"
+    assert "minimum_validation_steps" in result["context"]
 
 
 def test_graph_round_dispatch_includes_work_brainstorm():

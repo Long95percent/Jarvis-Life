@@ -625,6 +625,10 @@ export interface RoundtableBrainstormResult {
   ideas: Array<{ id?: string; title?: string; source_agent?: string; round?: number }>;
   tensions: Array<{ title?: string; description?: string }>;
   followup_questions: string[];
+  c_artifacts?: Record<string, unknown> | null;
+  ranked_activities?: Array<Record<string, unknown>>;
+  risks?: Array<Record<string, unknown>>;
+  minimum_validation_steps?: string[];
   context?: Record<string, unknown>;
   save_as_memory: boolean;
   handoff_target: string;

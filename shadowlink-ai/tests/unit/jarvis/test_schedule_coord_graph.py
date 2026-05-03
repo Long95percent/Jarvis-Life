@@ -8,6 +8,9 @@ from app.jarvis.schedule_coord_graph import ScheduleCoordGraphExecutor
 
 
 class FakeStreamingLLM:
+    def __init__(self):
+        self.messages: list[str] = []
+
     async def chat_stream(self, message: str, *, system_prompt: str | None = None, temperature: float | None = None, **kwargs):
         if "Maxwell" in (system_prompt or ""):
             chunks = ["先保护上午深度工作，", "再处理会议准备。"]
@@ -21,6 +24,7 @@ class FakeStreamingLLM:
             yield chunk
 
     async def chat(self, message: str, *, system_prompt: str | None = None, temperature: float | None = None, **kwargs):
+        self.messages.append(message)
         if "严格 JSON" in message:
             return json.dumps(
                 {
@@ -114,6 +118,23 @@ async def test_schedule_coord_graph_respects_filtered_participants():
     completed_payloads = [json.loads(event["data"]) for event in events if event["event"] == "role_completed"]
 
     assert [payload["agent_id"] for payload in completed_payloads] == ["maxwell", "alfred"]
+
+
+@pytest.mark.asyncio
+async def test_schedule_coord_prompt_uses_protocol_phase_context():
+    llm = FakeStreamingLLM()
+    executor = ScheduleCoordGraphExecutor(llm_client=llm)
+
+    async for _event in executor.start_round(
+        session_id="rt-schedule-protocol",
+        user_goal="帮我协调今天日程",
+        context={"calendar_events": [], "today_tasks": []},
+    ):
+        pass
+
+    assert any("context_scan" in message for message in llm.messages)
+    assert any("conflict_check" in message for message in llm.messages)
+    assert any("alfred_decision" in message for message in llm.messages)
 
 
 @pytest.mark.asyncio

@@ -2,9 +2,12 @@
 
 import asyncio
 import json
+import re
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -33,7 +36,7 @@ def _raise_planner_guard_violation(exc: ValueError) -> None:
     ) from exc
 from app.jarvis.memory_recall import build_bounded_memory_recall_prefix
 from app.jarvis.preference_learner import build_preference_profile_prefix
-from app.jarvis.intent_router import plan_agent_intent
+from app.jarvis.intent_router import plan_agent_intent, plan_roundtable_intent
 from app.jarvis.tool_runtime import execute_tool_calls, format_tool_results, run_agent_turn, to_action_results
 from app.llm.background_client import get_background_llm_client
 
@@ -2874,6 +2877,323 @@ def _roundtable_mode_for_scenario(scenario_id: str) -> str:
     return "decision" if scenario_id in {"study_energy_decision", "schedule_coord"} else "brainstorm"
 
 
+_ROUNDTABLE_TEXT_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".markdown",
+    ".py",
+    ".json",
+    ".csv",
+    ".log",
+    ".yaml",
+    ".yml",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".java",
+}
+
+_ROUNDTABLE_DEFER_CONFIRMATION_TOOLS = {"jarvis_task_plan_decompose"}
+
+def _roundtable_document_search_dirs(search_dirs: list[str | Path] | None = None) -> list[Path]:
+    if search_dirs is not None:
+        raw_dirs = [Path(item) for item in search_dirs]
+    else:
+        from app.config import settings
+
+        repo_root = Path(__file__).resolve().parents[3].parent
+        raw_dirs = [
+            Path(settings.data_dir),
+            Path(settings.file_processing.upload_dir),
+            repo_root / "docs",
+        ]
+
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    for raw_dir in raw_dirs:
+        try:
+            resolved = raw_dir.expanduser().resolve()
+        except Exception:
+            continue
+        key = str(resolved)
+        if key not in seen and resolved.exists() and resolved.is_dir():
+            dirs.append(resolved)
+            seen.add(key)
+    return dirs
+
+
+def _normalize_roundtable_filename_text(value: str) -> str:
+    return re.sub(r"[\s_/\\]+", "", value.casefold())
+
+
+def _roundtable_document_query_tokens(message: str) -> list[str]:
+    raw_tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.-]{1,}|[\u4e00-\u9fff]{2,}", message.casefold())
+    tokens: list[str] = []
+    for token in raw_tokens:
+        normalized = _normalize_roundtable_filename_text(token)
+        if not normalized:
+            continue
+        tokens.append(normalized)
+    return tokens
+
+
+def _score_roundtable_document_candidate(path: Path, message: str, tokens: list[str]) -> int:
+    query = _normalize_roundtable_filename_text(message)
+    name = _normalize_roundtable_filename_text(path.name)
+    stem = _normalize_roundtable_filename_text(path.stem)
+    score = 0
+    if name and name in query:
+        score += 120
+    if stem and stem in query:
+        score += 100
+    for token in tokens:
+        if token and token in name:
+            score += max(8, len(token))
+        elif token and token in stem:
+            score += max(6, len(token))
+    return score
+
+
+async def _resolve_roundtable_document_context(
+    message: str,
+    *,
+    search_dirs: list[str | Path] | None = None,
+    max_chars: int = 12000,
+    participants: list[str] | None = None,
+    intent_decision: Any | None = None,
+) -> dict[str, Any]:
+    decision = intent_decision or plan_roundtable_intent(participants or [], message)
+    if decision.intent != "document_read" or decision.tool_name != "file_read":
+        return {"status": "none"}
+
+    roots = _roundtable_document_search_dirs(search_dirs)
+    if not roots:
+        return {"status": "not_found", "reason": "no_search_dirs"}
+
+    filename_query = str(decision.slots.get("filename_query") or message)
+    max_chars = int(decision.slots.get("max_chars") or max_chars)
+    tokens = _roundtable_document_query_tokens(filename_query)
+    candidates: list[tuple[int, Path]] = []
+    for root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.casefold() not in _ROUNDTABLE_TEXT_EXTENSIONS:
+                continue
+            score = _score_roundtable_document_candidate(path, filename_query, tokens)
+            if score > 0:
+                candidates.append((score, path))
+
+    if not candidates:
+        return {"status": "not_found", "searched_dirs": [str(item) for item in roots]}
+
+    candidates.sort(key=lambda item: (-item[0], len(str(item[1]))))
+    top_score = candidates[0][0]
+    top_path_len = len(str(candidates[0][1]))
+    top_matches = [path for score, path in candidates if score == top_score and len(str(path)) == top_path_len][:5]
+    if len(top_matches) > 1:
+        return {
+            "status": "ambiguous",
+            "matches": [str(path) for path in top_matches],
+            "searched_dirs": [str(item) for item in roots],
+        }
+
+    selected = top_matches[0]
+    from app.tools.file_ops import FileReadTool
+
+    reader = FileReadTool(allowed_dirs=[str(item) for item in roots])
+    content = await reader.safe_arun(path=str(selected), max_lines=1000)
+    truncated = len(content) > max_chars
+    if truncated:
+        content = content[:max_chars].rstrip()
+
+    return {
+        "status": "attached",
+        "file_path": str(selected),
+        "file_name": selected.name,
+        "content": content,
+        "truncated": truncated,
+        "chars": len(content),
+        "intent": decision.intent,
+        "intent_agent_id": decision.agent_id,
+        "intent_confidence": decision.confidence,
+    }
+
+
+def _append_roundtable_document_context(context_prefix: str, document_context: dict[str, Any] | None) -> str:
+    if not document_context or document_context.get("status") != "attached":
+        return context_prefix
+    file_name = str(document_context.get("file_name") or "unknown")
+    file_path = str(document_context.get("file_path") or "")
+    content = str(document_context.get("content") or "").strip()
+    if not content:
+        return context_prefix
+    truncated_note = "\n（内容已按上下文长度截断。）" if document_context.get("truncated") else ""
+    block = (
+        "\n\n## 临时文档上下文\n"
+        f"来源文件: {file_name}\n"
+        f"路径: {file_path}\n"
+        f"{truncated_note}\n"
+        "```text\n"
+        f"{content}\n"
+        "```\n"
+        "请后续圆桌发言基于这份临时文档上下文进行总结、引用和讨论；不要声称已经读取其它未提供的文件。\n"
+    )
+    return f"{context_prefix}{block}"
+
+
+def _roundtable_deferred_action_result(decision: Any) -> dict[str, Any]:
+    tool_name = str(decision.tool_name or "")
+    arguments = dict(decision.slots or {})
+    title = str(arguments.get("title") or arguments.get("user_request") or decision.intent or "圆桌待确认操作")[:80]
+    return {
+        "type": "task.plan" if tool_name == "jarvis_task_plan_decompose" else tool_name,
+        "ok": True,
+        "pending_confirmation": True,
+        "confirmation_id": f"rt_defer_{uuid4().hex}",
+        "tool_name": tool_name,
+        "title": title,
+        "arguments": arguments,
+        "description": "圆桌中识别到写入型工具意图，已改为待确认动作，未直接执行。",
+    }
+
+
+async def _persist_roundtable_intent_pending_actions(
+    *,
+    session_id: str | None,
+    agent_id: str,
+    action_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not session_id:
+        return action_results
+    persisted: list[dict[str, Any]] = []
+    for action in action_results:
+        if not action.get("pending_confirmation"):
+            persisted.append(action)
+            continue
+        try:
+            from app.jarvis.persistence import save_pending_action
+
+            arguments = action.get("arguments") if isinstance(action.get("arguments"), dict) else {}
+            plan = arguments.get("plan") if isinstance(arguments.get("plan"), dict) else {}
+            title = str(arguments.get("title") or plan.get("title") or action.get("title") or action.get("type") or "圆桌待确认操作")
+            saved = await save_pending_action(
+                pending_id=str(action.get("confirmation_id")),
+                action_type=str(action.get("type")),
+                tool_name=str(action.get("tool_name") or ""),
+                agent_id=agent_id,
+                session_id=session_id,
+                title=title,
+                arguments=arguments,
+            )
+            enriched = {**action, "pending_action_id": saved.get("id")}
+            persisted.append(enriched)
+        except Exception as exc:
+            logger.warning(
+                "jarvis.roundtable.intent_pending_action_save_failed",
+                agent_id=agent_id,
+                session_id=session_id,
+                action_type=action.get("type"),
+                error=str(exc),
+            )
+            persisted.append({**action, "ok": False, "error": f"圆桌待确认动作保存失败：{exc}"})
+    return persisted
+
+
+async def _resolve_roundtable_intent_context(
+    message: str,
+    *,
+    participants: list[str],
+    session_id: str | None = None,
+    intent_decision: Any | None = None,
+) -> dict[str, Any]:
+    decision = intent_decision or plan_roundtable_intent(participants, message)
+    intent_payload = {
+        "agent_id": decision.agent_id,
+        "intent": decision.intent,
+        "tool_name": decision.tool_name,
+        "confidence": decision.confidence,
+        "next_action": decision.next_action,
+        "reason": decision.reason,
+        "slots": decision.slots,
+    }
+    if decision.intent == "chat_only":
+        return {"status": "none", "intent": intent_payload}
+    if decision.intent == "document_read":
+        return {"status": "document_read", "intent": intent_payload}
+    if decision.next_action == "ask_missing_slots":
+        return {
+            "status": "missing_slots",
+            "intent": intent_payload,
+            "missing_slots": list(decision.missing_slots),
+            "direct_mutation": False,
+        }
+    if decision.next_action not in {"call_tool", "pending_confirmation"} or not decision.tool_name:
+        return {"status": "none", "intent": intent_payload}
+
+    if decision.tool_name in _ROUNDTABLE_DEFER_CONFIRMATION_TOOLS:
+        action_results = await _persist_roundtable_intent_pending_actions(
+            session_id=session_id,
+            agent_id=decision.agent_id,
+            action_results=[_roundtable_deferred_action_result(decision)],
+        )
+        return {
+            "status": "pending_confirmation",
+            "intent": intent_payload,
+            "tool_results": [],
+            "action_results": action_results,
+            "direct_mutation": False,
+        }
+
+    tool_results = await execute_tool_calls(
+        decision.agent_id,
+        [{"tool_name": decision.tool_name, "arguments": decision.slots}],
+    )
+    action_results = await _persist_roundtable_intent_pending_actions(
+        session_id=session_id,
+        agent_id=decision.agent_id,
+        action_results=to_action_results(tool_results),
+    )
+    has_pending = any(action.get("pending_confirmation") for action in action_results)
+    return {
+        "status": "pending_confirmation" if has_pending else "tool_executed",
+        "intent": intent_payload,
+        "tool_results": tool_results,
+        "action_results": action_results,
+        "direct_mutation": False,
+    }
+
+
+def _append_roundtable_intent_context(context_prefix: str, intent_context: dict[str, Any] | None) -> str:
+    if not intent_context:
+        return context_prefix
+    status = intent_context.get("status")
+    if status in {None, "none", "document_read"}:
+        return context_prefix
+
+    intent = intent_context.get("intent") if isinstance(intent_context.get("intent"), dict) else {}
+    lines = [
+        "\n\n## 圆桌意图识别与工具结果",
+        f"识别角色: {intent.get('agent_id')}",
+        f"识别意图: {intent.get('intent')}",
+        f"计划工具: {intent.get('tool_name')}",
+        f"下一步: {intent.get('next_action')}",
+        f"原因: {intent.get('reason')}",
+        "圆桌必须基于下面结果继续讨论；写操作只生成待确认动作，不要声称已经修改日程、计划或生活状态。",
+    ]
+    if status == "missing_slots":
+        lines.append(f"缺少槽位: {', '.join(str(item) for item in intent_context.get('missing_slots') or [])}")
+        lines.append(f"已提取槽位: {json.dumps(intent.get('slots') or {}, ensure_ascii=False, default=str)}")
+        lines.append("请本轮圆桌围绕如何补齐这些信息继续讨论，必要时由 Alfred/Maxwell 向用户澄清。")
+    else:
+        tool_results = intent_context.get("tool_results") if isinstance(intent_context.get("tool_results"), list) else []
+        action_results = intent_context.get("action_results") if isinstance(intent_context.get("action_results"), list) else []
+        lines.append(format_tool_results(tool_results))
+        if action_results:
+            lines.append("## 圆桌待确认动作")
+            lines.append(json.dumps(action_results, ensure_ascii=False, indent=2, default=str))
+    return f"{context_prefix}" + "\n".join(lines) + "\n"
+
+
 def _build_brainstorm_result(session_id: str, scenario_id: str, topic: str, synthesis: str, ideas: list[dict[str, Any]]) -> dict[str, Any]:
     cleaned_ideas = []
     for idx, idea in enumerate(ideas[:8], start=1):
@@ -3081,6 +3401,28 @@ async def start_roundtable(
     context_prefix += await _build_local_life_context_prefix(limit=5)
     if decision_context is not None:
         context_prefix += _build_decision_context_prefix(decision_context)
+    roundtable_extra_context: dict[str, Any] = {}
+    if req.user_input:
+        roundtable_intent = plan_roundtable_intent(list(scenario.agents), req.user_input)
+        document_context = await _resolve_roundtable_document_context(
+            req.user_input,
+            participants=list(scenario.agents),
+            intent_decision=roundtable_intent,
+        )
+        intent_context = await _resolve_roundtable_intent_context(
+            req.user_input,
+            participants=list(scenario.agents),
+            session_id=req.session_id,
+            intent_decision=roundtable_intent,
+        )
+        context_prefix = _append_roundtable_document_context(context_prefix, document_context)
+        context_prefix = _append_roundtable_intent_context(context_prefix, intent_context)
+        if document_context.get("status") == "attached":
+            roundtable_extra_context["document_context"] = document_context
+        if intent_context.get("status") not in {"none", "document_read"}:
+            roundtable_extra_context["intent_context"] = intent_context
+        if decision_context is not None and roundtable_extra_context:
+            decision_context = {**decision_context, **roundtable_extra_context}
     user_ask = req.user_input or "(用户未具体说明,请根据当前状态主动展开)"
     composed_message = (
         f"{profile_prefix}{context_prefix}{scenario.opening_prompt}\n\n用户诉求: {user_ask}"
@@ -3134,7 +3476,7 @@ async def start_roundtable(
                 phase_label="open",
                 mode="brainstorm",
                 initial_user_input=req.user_input,
-                decision_context=None,
+                decision_context=roundtable_extra_context or None,
             )
         )
 
@@ -3194,7 +3536,7 @@ async def start_roundtable(
             phase_label="open",
             mode=roundtable_mode,
             initial_user_input=req.user_input,
-            decision_context=decision_context,
+            decision_context=decision_context or roundtable_extra_context or None,
         )
     )
 
@@ -3271,6 +3613,26 @@ async def continue_roundtable(
         f"心情{ctx.mood_trend}]\n\n"
     )
     context_prefix += await _build_local_life_context_prefix(limit=5)
+    roundtable_intent = plan_roundtable_intent(session.participants, req.user_message)
+    document_context = await _resolve_roundtable_document_context(
+        req.user_message,
+        participants=session.participants,
+        intent_decision=roundtable_intent,
+    )
+    intent_context = await _resolve_roundtable_intent_context(
+        req.user_message,
+        participants=session.participants,
+        session_id=req.session_id,
+        intent_decision=roundtable_intent,
+    )
+    context_prefix = _append_roundtable_document_context(context_prefix, document_context)
+    context_prefix = _append_roundtable_intent_context(context_prefix, intent_context)
+    roundtable_mode = _roundtable_mode_for_scenario(session.scenario_id)
+    round_context = await _prepare_decision_context() if roundtable_mode == "decision" else {}
+    if document_context.get("status") == "attached":
+        round_context = {**(round_context or {}), "document_context": document_context}
+    if intent_context.get("status") not in {"none", "document_read"}:
+        round_context = {**(round_context or {}), "intent_context": intent_context}
 
     return EventSourceResponse(
         _run_graph_or_legacy_round(
@@ -3284,9 +3646,9 @@ async def continue_roundtable(
             profile_prefix=profile_prefix,
             context_prefix=context_prefix,
             phase_label="user_turn",
-            mode=_roundtable_mode_for_scenario(session.scenario_id),
+            mode=roundtable_mode,
             initial_user_input=req.user_message,
-            decision_context=await _prepare_decision_context() if _roundtable_mode_for_scenario(session.scenario_id) == "decision" else None,
+            decision_context=round_context or None,
         )
     )
 
@@ -3302,12 +3664,17 @@ async def get_roundtable_decision_result(session_id: str) -> dict[str, Any]:
 
 def _public_brainstorm_result(result: dict[str, Any]) -> dict[str, Any]:
     context = result.get("context") if isinstance(result.get("context"), dict) else {}
+    result_json = result.get("result_json") if isinstance(result.get("result_json"), dict) else {}
     return {
         **result,
         "themes": context.get("themes") if isinstance(context.get("themes"), list) else result.get("options", []),
         "ideas": context.get("ideas") if isinstance(context.get("ideas"), list) else [],
         "tensions": context.get("tensions") if isinstance(context.get("tensions"), list) else result.get("tradeoffs", []),
         "followup_questions": context.get("followup_questions") if isinstance(context.get("followup_questions"), list) else [],
+        "c_artifacts": context.get("c_artifacts") if isinstance(context.get("c_artifacts"), dict) else result_json.get("c_artifacts"),
+        "ranked_activities": context.get("ranked_activities") if isinstance(context.get("ranked_activities"), list) else result_json.get("ranked_activities", []),
+        "risks": context.get("risks") if isinstance(context.get("risks"), list) else result_json.get("risks", []),
+        "minimum_validation_steps": context.get("minimum_validation_steps") if isinstance(context.get("minimum_validation_steps"), list) else result_json.get("minimum_validation_steps", []),
         "save_as_memory": bool(context.get("save_as_memory")),
     }
 
@@ -3698,7 +4065,6 @@ async def _run_decision_graph_round(
             user_goal=original_goal,
             context=context,
             feedback_history=feedback_history,
-            participants=participants,
         )
     elif phase_label == "user_turn":
         event_iter = executor.continue_round(
@@ -3911,7 +4277,6 @@ async def _run_brainstorm_graph_round(
             user_goal=original_goal,
             context=context,
             feedback_history=feedback_history,
-            participants=participants,
         )
     elif phase_label == "user_turn":
         event_iter = executor.continue_round(
@@ -4360,4 +4725,3 @@ async def get_past_session_turns(session_id: str) -> list[dict[str, Any]]:
     """Return the full transcript for a past session (oldest turn first)."""
     from app.jarvis.persistence import get_session_turns
     return await get_session_turns(session_id)
-

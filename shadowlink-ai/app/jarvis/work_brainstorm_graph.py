@@ -12,12 +12,35 @@ from app.jarvis.roundtable_graph import (
     RoundtableGraphState,
     RoundtableRoleOutput,
     RoundtableRoundSummary,
+    roundtable_content_deltas,
     round_event,
+    run_roundtable_agent_turn,
+)
+from app.jarvis.roundtable_protocols import (
+    final_roundtable_phase,
+    format_roundtable_protocol_block,
+    get_roundtable_protocol,
+    protocol_context,
 )
 
 
 WORK_BRAINSTORM_PARTICIPANTS = ["moderator", "explorer", "critic", "synthesizer"]
-GRAPH_EXECUTOR_ID = "work_brainstorm_langgraph_v1"
+GRAPH_EXECUTOR_ID = "work_brainstorm_c_v1"
+WORK_BRAINSTORM_STAGE_BY_AGENT = {
+    "moderator": "frame_problem",
+    "explorer": "divergent_ideas",
+    "critic": "critic_review",
+    "synthesizer": "synthesis",
+}
+WORK_BRAINSTORM_C_STAGE_TITLES = {
+    "frame_problem": "框定问题",
+    "ingest_context": "吸收上下文",
+    "divergent_ideas": "发散想法",
+    "cluster_ideas": "想法分组",
+    "critic_review": "批判审视",
+    "synthesis": "合并收敛",
+    "validation_plan": "验证计划",
+}
 
 
 class WorkBrainstormState(TypedDict, total=False):
@@ -98,6 +121,8 @@ class WorkBrainstormGraphExecutor:
         summary = await self._summarize_round(state)
         state.round_summaries.append(summary)
         state.status = "waiting_for_user"
+        yield round_event("scenario_stage", self._build_stage_payload(state, "synthesizer", stage_id="validation_plan"))
+        yield round_event("scenario_state", self._build_c_state_payload(state))
         yield round_event("round_summary", summary.to_dict())
         yield round_event(
             "user_checkpoint",
@@ -149,7 +174,7 @@ class WorkBrainstormGraphExecutor:
 
     async def _run_role(self, state: RoundtableGraphState, agent_id: str) -> AsyncIterator[dict[str, str]]:
         agent = AGENTS[agent_id]
-        content_parts: list[str] = []
+        yield round_event("scenario_stage", self._build_stage_payload(state, agent_id))
         yield round_event(
             "role_started",
             {
@@ -161,21 +186,24 @@ class WorkBrainstormGraphExecutor:
                 "round_index": state.round_index,
             },
         )
-        async for delta in self.llm_client.chat_stream(
+        turn_result = await run_roundtable_agent_turn(
+            agent_id=agent_id,
+            llm_client=self.llm_client,
             message=self._role_prompt(state, agent_id),
             system_prompt=agent["system_prompt"],
             temperature=agent.get("temperature", 0.7),
-        ):
-            content_parts.append(delta)
+            session_id=state.session_id,
+            enable_tools=False,
+        )
+        for delta in roundtable_content_deltas(turn_result.content):
             yield round_event("role_delta", {"agent_id": agent_id, "delta": delta, "round_index": state.round_index})
 
-        content = "".join(content_parts).strip()
         state.role_outputs.append(
             RoundtableRoleOutput(
                 agent_id=agent_id,
                 agent_name=agent["name_zh"],
                 role=agent["name"],
-                content=content,
+                content=turn_result.content,
                 round_index=state.round_index,
             )
         )
@@ -187,12 +215,113 @@ class WorkBrainstormGraphExecutor:
                 "agent_role": agent["name"],
                 "agent_icon": agent.get("icon"),
                 "agent_color": agent.get("color"),
-                "content": content,
+                "content": turn_result.content,
+                "tool_results": turn_result.tool_results,
+                "action_results": turn_result.action_results,
                 "round_index": state.round_index,
             },
         )
+        if agent_id == "moderator":
+            yield round_event("scenario_stage", self._build_stage_payload(state, agent_id, stage_id="ingest_context"))
+        if agent_id == "explorer":
+            yield round_event("scenario_stage", self._build_stage_payload(state, agent_id, stage_id="cluster_ideas"))
+
+    def _build_stage_payload(self, state: RoundtableGraphState, agent_id: str, *, stage_id: str | None = None) -> dict[str, Any]:
+        protocol = get_roundtable_protocol("work_brainstorm")
+        stage_id = stage_id or WORK_BRAINSTORM_STAGE_BY_AGENT.get(agent_id, "synthesis")
+        phase = next((item for item in protocol.phases if item.id == stage_id), protocol.phases[0])
+        title = WORK_BRAINSTORM_C_STAGE_TITLES.get(stage_id, phase.title)
+        objective_by_stage = {
+            "ingest_context": "吸收用户文档、历史讨论和当前限制，决定本轮发散边界。",
+            "cluster_ideas": "把发散想法分组，避免后续批判阶段只看到散点。",
+            "validation_plan": "把保留下来的想法压缩成最小验证步骤。",
+        }
+        return {
+            "scenario_id": state.scenario_id,
+            "graph_executor": GRAPH_EXECUTOR_ID,
+            "state_type": "work_brainstorm_c",
+            "stage_id": stage_id,
+            "stage_title": title,
+            "owner_agent": agent_id,
+            "round_index": state.round_index,
+            "objective": objective_by_stage.get(stage_id, phase.objective),
+            "artifact_keys": ["problem_frame", "idea_pool", "clusters", "critique_matrix", "selected_concepts", "validation_plan"],
+        }
+
+    def _build_c_artifacts(
+        self,
+        *,
+        user_goal: str,
+        context: dict[str, Any],
+        feedback_history: list[str],
+        role_outputs: list[RoundtableRoleOutput],
+        data: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        data = data or {}
+        output_by_agent = {item.agent_id: item.content for item in role_outputs}
+        ideas = data.get("ideas") if isinstance(data.get("ideas"), list) else self._ideas_from_context(
+            user_goal,
+            feedback_history + [output_by_agent.get("explorer", "")],
+        )
+        themes = data.get("themes") if isinstance(data.get("themes"), list) else [
+            {"title": "最小可验证主线", "summary": "先把最强想法压缩成可演示或可验证的版本。"}
+        ]
+        risks = data.get("risks") if isinstance(data.get("risks"), list) else [
+            {"title": "范围过散", "description": output_by_agent.get("critic", "需要控制范围并先验证核心假设。")}
+        ]
+        validation_steps = data.get("minimum_validation_steps") if isinstance(data.get("minimum_validation_steps"), list) else [
+            "明确目标用户和成功标准",
+            "选择一个主想法做最小 demo",
+            "用一次短评审验证风险是否可控",
+        ]
+        selected_concepts = data.get("selected_concepts") if isinstance(data.get("selected_concepts"), list) else ideas[:2]
+        clusters = data.get("clusters") if isinstance(data.get("clusters"), list) else [
+            {"title": str(theme.get("title") or "候选方向"), "ideas": [idea.get("title") for idea in ideas[:3] if isinstance(idea, dict)]}
+            for theme in themes[:3]
+            if isinstance(theme, dict)
+        ]
+        return {
+            "state_type": "work_brainstorm_c",
+            "problem_frame": data.get("problem_frame") if isinstance(data.get("problem_frame"), dict) else {
+                "goal": user_goal,
+                "constraints": feedback_history[-3:],
+                "context_available": bool(context.get("document_context") or context.get("previous_discussion")),
+            },
+            "idea_pool": ideas,
+            "clusters": clusters,
+            "critique_matrix": risks,
+            "selected_concepts": selected_concepts,
+            "validation_plan": validation_steps,
+        }
+
+    def _build_c_state_payload(self, state: RoundtableGraphState) -> dict[str, Any]:
+        artifacts = self._build_c_artifacts(
+            user_goal=state.user_goal,
+            context=state.context,
+            feedback_history=state.user_feedback_history,
+            role_outputs=state.role_outputs,
+        )
+        return {
+            "scenario_id": state.scenario_id,
+            "graph_executor": GRAPH_EXECUTOR_ID,
+            "state_type": "work_brainstorm_c",
+            "round_index": state.round_index,
+            "artifacts": artifacts,
+            "next_routes": [
+                {"label": "继续发散", "target_stage": "divergent_ideas", "prompt": "再大胆一点，继续发散。"},
+                {"label": "压缩范围", "target_stage": "critic_review", "prompt": "这个太大了，帮我压缩范围。"},
+                {"label": "形成验证", "target_stage": "validation_plan", "prompt": "选一个方向，给我最小验证步骤。"},
+            ],
+        }
 
     def _role_prompt(self, state: RoundtableGraphState, agent_id: str) -> str:
+        protocol = get_roundtable_protocol("work_brainstorm")
+        protocol_block = format_roundtable_protocol_block(
+            protocol,
+            turn_index=len(state.role_outputs),
+            agent_id=agent_id,
+            stage_id=WORK_BRAINSTORM_STAGE_BY_AGENT.get(agent_id),
+        )
         feedback = "\n".join(f"- {item}" for item in state.user_feedback_history) or "无"
         previous = "\n\n".join(f"{item.agent_name}: {item.content}" for item in state.role_outputs) or "无"
         role_tasks = {
@@ -204,18 +333,24 @@ class WorkBrainstormGraphExecutor:
         return (
             "## 工作难题头脑风暴工作坊\n"
             f"用户主题: {state.user_goal}\n\n"
+            f"{protocol_block}\n\n"
             f"结构化上下文: {json.dumps(state.context, ensure_ascii=False, default=str)[:5000]}\n\n"
             f"用户上一轮反馈:\n{feedback}\n\n"
             f"前面角色公开发言:\n{previous}\n\n"
-            f"你的职责: {role_tasks.get(agent_id, '从你的角色视角给出建议。')}\n"
+            f"你的基础职责: {role_tasks.get(agent_id, '从你的角色视角给出建议。')}\n"
+            "请优先遵守场景协议里的 current_phase 和 current_role_instruction。\n"
             "请输出面向用户公开展示的会议发言，保持具体、可讨论。不要展示隐藏思维链。"
         )
 
     async def _summarize_round(self, state: RoundtableGraphState) -> RoundtableRoundSummary:
+        protocol = get_roundtable_protocol("work_brainstorm")
+        final_phase = final_roundtable_phase(protocol)
         prompt = (
             "请把工作头脑风暴本轮讨论整理成严格 JSON。"
             "字段必须为 minutes, consensus, disagreements, questions_for_user, next_round_focus。"
             "minutes 是对象数组，每项至少包含 agent_id 和 summary。不要输出 Markdown。\n\n"
+            f"场景协议阶段: {', '.join(phase.id for phase in protocol.phases)}\n"
+            f"最终收敛阶段: {final_phase.id} - {final_phase.objective}\n\n"
             + "\n\n".join(f"{item.agent_id}: {item.content}" for item in state.role_outputs)
         )
         raw = await self.llm_client.chat(message=prompt, system_prompt=AGENTS["moderator"]["system_prompt"], temperature=0.2)
@@ -239,9 +374,15 @@ class WorkBrainstormGraphExecutor:
         feedback_history: list[str],
         round_summaries: list[RoundtableRoundSummary],
     ) -> dict[str, Any]:
+        protocol = get_roundtable_protocol("work_brainstorm")
+        final_phase = final_roundtable_phase(protocol)
         prompt = (
-            "请基于工作头脑风暴工作坊，输出严格 JSON，字段为 summary, themes, ideas, tensions, followup_questions。"
+            "请基于工作头脑风暴工作坊，输出严格 JSON，字段为 summary, themes, ideas, tensions, followup_questions, "
+            "problem_frame, clusters, risks, selected_concepts, minimum_validation_steps。"
             "ideas 是候选想法数组，每项包含 id, title, source_agent。不要输出 Markdown。\n\n"
+            f"场景协议: {protocol.scenario_id}\n"
+            f"最终阶段: {final_phase.id} - {final_phase.objective}\n"
+            f"结果契约: {json.dumps(protocol.result_contract, ensure_ascii=False, default=str)}\n"
             f"用户主题: {user_goal}\n"
             f"用户反馈: {json.dumps(feedback_history, ensure_ascii=False)}\n"
             f"上下文: {json.dumps(context, ensure_ascii=False, default=str)[:5000]}"
@@ -259,6 +400,19 @@ class WorkBrainstormGraphExecutor:
         followup_questions = data.get("followup_questions") if isinstance(data.get("followup_questions"), list) else [
             "你想先验证哪一个方向？"
         ]
+        c_artifacts = self._build_c_artifacts(
+            user_goal=user_goal,
+            context=context,
+            feedback_history=feedback_history,
+            role_outputs=[],
+            data={
+                **data,
+                "ideas": ideas,
+                "themes": themes,
+            },
+        )
+        risks = c_artifacts["critique_matrix"]
+        minimum_validation_steps = c_artifacts["validation_plan"]
         return {
             "id": f"rt_result_{session_id}",
             "session_id": session_id,
@@ -269,13 +423,19 @@ class WorkBrainstormGraphExecutor:
             "ideas": ideas,
             "tensions": tensions,
             "followup_questions": followup_questions,
+            "risks": risks,
+            "minimum_validation_steps": minimum_validation_steps,
             "save_as_memory": False,
             "handoff_target": "maxwell",
             "context": {
                 **context,
+                **protocol_context(protocol),
                 "topic": user_goal,
                 "scenario_id": "work_brainstorm",
                 "graph_executor": GRAPH_EXECUTOR_ID,
+                "c_artifacts": c_artifacts,
+                "risks": risks,
+                "minimum_validation_steps": minimum_validation_steps,
                 "user_feedback_history": feedback_history,
                 "round_summaries": [summary_item.to_dict() for summary_item in round_summaries],
                 "themes": themes,
