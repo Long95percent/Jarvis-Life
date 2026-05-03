@@ -490,6 +490,7 @@ CREATE TABLE IF NOT EXISTS maxwell_workbench_items (
     description TEXT,
     due_at      TEXT,
     status      TEXT NOT NULL DEFAULT 'todo',
+    work_logs_json TEXT NOT NULL DEFAULT '[]',
     pushed_at   REAL,
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL,
@@ -705,6 +706,8 @@ def _ensure_initialized() -> None:
         workbench_columns = {row[1] for row in con.execute("PRAGMA table_info(maxwell_workbench_items)").fetchall()}
         if workbench_columns and "plan_day_id" not in workbench_columns:
             con.execute("ALTER TABLE maxwell_workbench_items ADD COLUMN plan_day_id TEXT")
+        if workbench_columns and "work_logs_json" not in workbench_columns:
+            con.execute("ALTER TABLE maxwell_workbench_items ADD COLUMN work_logs_json TEXT NOT NULL DEFAULT '[]'")
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_maxwell_workbench_plan_day ON maxwell_workbench_items(plan_day_id) WHERE plan_day_id IS NOT NULL")
         con.commit()
     _initialized = True
@@ -4427,6 +4430,62 @@ async def update_jarvis_plan_day(day_id: str, patch: dict[str, Any], event_type:
     return await asyncio.to_thread(_update_jarvis_plan_day_sync, day_id, patch, event_type)
 
 
+def _sync_plan_day_from_calendar_event_sync(event: dict[str, Any]) -> dict[str, Any] | None:
+    event_id = event.get("id")
+    if not isinstance(event_id, str) or not event_id:
+        return None
+    patch: dict[str, Any] = {}
+    if isinstance(event.get("title"), str):
+        patch["title"] = event["title"]
+    if isinstance(event.get("notes"), str) or event.get("notes") is None:
+        patch["description"] = event.get("notes")
+    if isinstance(event.get("status"), str):
+        patch["status"] = "completed" if event["status"] == "completed" else "scheduled"
+    start_value = event.get("start")
+    end_value = event.get("end")
+    if isinstance(start_value, datetime):
+        patch["plan_date"] = start_value.date().isoformat()
+        patch["start_time"] = start_value.time().isoformat(timespec="minutes")
+    elif isinstance(start_value, str):
+        try:
+            start_dt = datetime.fromisoformat(start_value)
+            patch["plan_date"] = start_dt.date().isoformat()
+            patch["start_time"] = start_dt.time().isoformat(timespec="minutes")
+        except ValueError:
+            pass
+    if isinstance(end_value, datetime):
+        patch["end_time"] = end_value.time().isoformat(timespec="minutes")
+    elif isinstance(end_value, str):
+        try:
+            end_dt = datetime.fromisoformat(end_value)
+            patch["end_time"] = end_dt.time().isoformat(timespec="minutes")
+        except ValueError:
+            pass
+    if not patch:
+        return None
+    patch["updated_at"] = time.time()
+    assignments = ", ".join(f"{key} = ?" for key in patch)
+    with _conn() as con:
+        row = con.execute("SELECT * FROM jarvis_plan_days WHERE calendar_event_id = ?", (event_id,)).fetchone()
+        if not row:
+            return None
+        day_id = str(row["id"])
+        con.execute(f"UPDATE jarvis_plan_days SET {assignments} WHERE id = ?", (*patch.values(), day_id))
+        updated_row = con.execute("SELECT * FROM jarvis_plan_days WHERE id = ?", (day_id,)).fetchone()
+        if updated_row:
+            item = _row_to_jarvis_plan_day(updated_row)
+            con.execute(
+                "INSERT INTO jarvis_agent_events (id, event_type, plan_id, plan_day_id, payload_json, created_at) VALUES (?, 'calendar.event.updated', ?, ?, ?, ?)",
+                (f"event_{uuid4().hex}", item["plan_id"], day_id, json.dumps({"calendar_event_id": event_id, "patch": patch}, ensure_ascii=False, default=str), time.time()),
+            )
+        con.commit()
+    return _row_to_jarvis_plan_day(updated_row) if updated_row else None
+
+
+async def sync_plan_day_from_calendar_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_sync_plan_day_from_calendar_event_sync, event)
+
+
 def _cancel_jarvis_plan_sync(plan_id: str) -> dict[str, Any] | None:
     now = time.time()
     with _conn() as con:
@@ -4463,8 +4522,91 @@ async def delete_jarvis_plan(plan_id: str) -> dict[str, Any] | None:
     return await asyncio.to_thread(_delete_jarvis_plan_sync, plan_id)
 
 
-def _row_to_maxwell_workbench_item(row: sqlite3.Row) -> dict[str, Any]:
-    return dict(row)
+def _iso_now_from_ts(value: float | None = None) -> str:
+    return datetime.fromtimestamp(value or time.time()).isoformat(timespec="seconds")
+
+
+def _parse_workbench_logs(value: Any) -> list[dict[str, Any]]:
+    logs = _json_load(value or "[]", [])
+    if not isinstance(logs, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    for item in logs[-50:]:
+        if not isinstance(item, dict):
+            continue
+        event = str(item.get("event") or "").strip()
+        if not event:
+            continue
+        cleaned.append({
+            "at": str(item.get("at") or _iso_now_from_ts()),
+            "actor": str(item.get("actor") or "maxwell"),
+            "event": event[:80],
+            "detail": str(item.get("detail") or "")[:240] or None,
+        })
+    return cleaned
+
+
+def _append_workbench_log_json(existing: Any, *, event: str, detail: str | None = None, actor: str = "maxwell", at: float | None = None) -> str:
+    logs = _parse_workbench_logs(existing)
+    logs.append({
+        "at": _iso_now_from_ts(at),
+        "actor": actor,
+        "event": event[:80],
+        "detail": (detail or "")[:240] or None,
+    })
+    return json.dumps(logs[-50:], ensure_ascii=False)
+
+
+def _workbench_live_state(con: sqlite3.Connection, item: dict[str, Any]) -> dict[str, Any]:
+    now = time.time()
+    basis = "workbench_only"
+    source_status = None
+    source_title = None
+    if item.get("plan_day_id"):
+        basis = "jarvis_plan_days"
+        row = con.execute("SELECT status, title FROM jarvis_plan_days WHERE id = ?", (item.get("plan_day_id"),)).fetchone()
+        if row is not None:
+            source_status = row["status"]
+            source_title = row["title"]
+    elif item.get("task_day_id"):
+        basis = "background_task_days"
+        row = con.execute("SELECT status, title FROM background_task_days WHERE id = ?", (item.get("task_day_id"),)).fetchone()
+        if row is not None:
+            source_status = row["status"]
+            source_title = row["title"]
+
+    due_ts = None
+    due_at = str(item.get("due_at") or "").strip()
+    if due_at:
+        try:
+            due_ts = datetime.fromisoformat(due_at).timestamp()
+        except ValueError:
+            due_ts = None
+    completed_statuses = {"completed", "done"}
+    cancelled_statuses = {"cancelled", "deleted", "archived"}
+    is_completed = str(item.get("status") or "") in completed_statuses or str(source_status or "") in completed_statuses
+    is_cancelled = str(item.get("status") or "") in cancelled_statuses or str(source_status or "") in cancelled_statuses
+    minutes_until_due = int((due_ts - now) / 60) if due_ts is not None else None
+    is_overdue = bool(due_ts is not None and due_ts < now and not is_completed and not is_cancelled)
+    return {
+        "source_status": source_status,
+        "source_title": source_title,
+        "workbench_status": item.get("status"),
+        "is_completed": is_completed,
+        "is_cancelled": is_cancelled,
+        "is_overdue": is_overdue,
+        "minutes_until_due": minutes_until_due,
+        "basis": basis,
+        "checked_at": _iso_now_from_ts(now),
+    }
+
+
+def _row_to_maxwell_workbench_item(row: sqlite3.Row, con: sqlite3.Connection | None = None) -> dict[str, Any]:
+    item = dict(row)
+    item["work_logs"] = _parse_workbench_logs(item.pop("work_logs_json", "[]"))
+    if con is not None:
+        item["live_state"] = _workbench_live_state(con, item)
+    return item
 
 
 def _list_maxwell_workbench_items_sync(
@@ -4496,7 +4638,7 @@ def _list_maxwell_workbench_items_sync(
             """,
             (*params, limit),
         ).fetchall()
-    return [_row_to_maxwell_workbench_item(row) for row in rows]
+    return [_row_to_maxwell_workbench_item(row, con) for row in rows]
 
 
 async def list_maxwell_workbench_items(
@@ -4510,6 +4652,66 @@ async def list_maxwell_workbench_items(
         status=status,
         plan_date=plan_date,
         limit=limit,
+    )
+
+
+def _append_maxwell_workbench_log_sync(
+    *,
+    workbench_item_id: str | None = None,
+    plan_day_id: str | None = None,
+    task_day_id: str | None = None,
+    event: str,
+    detail: str | None = None,
+    actor: str = "maxwell",
+) -> dict[str, Any] | None:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if workbench_item_id:
+        clauses.append("id = ?")
+        params.append(workbench_item_id)
+    if plan_day_id:
+        clauses.append("plan_day_id = ?")
+        params.append(plan_day_id)
+    if task_day_id:
+        clauses.append("task_day_id = ?")
+        params.append(task_day_id)
+    if not clauses:
+        return None
+    now = time.time()
+    with _conn() as con:
+        row = con.execute(
+            f"SELECT * FROM maxwell_workbench_items WHERE {' OR '.join(clauses)} LIMIT 1",
+            tuple(params),
+        ).fetchone()
+        if row is None:
+            return None
+        logs_json = _append_workbench_log_json(row["work_logs_json"], event=event, detail=detail, actor=actor, at=now)
+        con.execute(
+            "UPDATE maxwell_workbench_items SET work_logs_json = ?, updated_at = ? WHERE id = ?",
+            (logs_json, now, row["id"]),
+        )
+        con.commit()
+        updated = con.execute("SELECT * FROM maxwell_workbench_items WHERE id = ?", (row["id"],)).fetchone()
+        return _row_to_maxwell_workbench_item(updated, con) if updated is not None else None
+
+
+async def append_maxwell_workbench_log(
+    *,
+    workbench_item_id: str | None = None,
+    plan_day_id: str | None = None,
+    task_day_id: str | None = None,
+    event: str,
+    detail: str | None = None,
+    actor: str = "maxwell",
+) -> dict[str, Any] | None:
+    return await asyncio.to_thread(
+        _append_maxwell_workbench_log_sync,
+        workbench_item_id=workbench_item_id,
+        plan_day_id=plan_day_id,
+        task_day_id=task_day_id,
+        event=event,
+        detail=detail,
+        actor=actor,
     )
 
 
@@ -4546,10 +4748,20 @@ def _push_background_task_days_to_workbench_sync(plan_date: str) -> list[dict[st
                     """
                     INSERT INTO maxwell_workbench_items
                       (id, task_day_id, plan_day_id, agent_id, title, description, due_at,
-                       status, pushed_at, created_at, updated_at)
-                    VALUES (?, ?, NULL, 'maxwell', ?, ?, ?, 'todo', ?, ?, ?)
+                       status, work_logs_json, pushed_at, created_at, updated_at)
+                    VALUES (?, ?, NULL, 'maxwell', ?, ?, ?, 'todo', ?, ?, ?, ?)
                     """,
-                    (item_id, day["id"], day["title"], day["description"], _due_at_for_task_day(day), now, now, now),
+                    (
+                        item_id,
+                        day["id"],
+                        day["title"],
+                        day["description"],
+                        _due_at_for_task_day(day),
+                        _append_workbench_log_json([], event="接收今日执行项", detail=f"从长期任务日推送：{day['title']}", at=now),
+                        now,
+                        now,
+                        now,
+                    ),
                 )
             except sqlite3.IntegrityError:
                 continue
@@ -4563,7 +4775,7 @@ def _push_background_task_days_to_workbench_sync(plan_date: str) -> list[dict[st
             )
             pushed_row = con.execute("SELECT * FROM maxwell_workbench_items WHERE id = ?", (item_id,)).fetchone()
             if pushed_row is not None:
-                pushed.append(_row_to_maxwell_workbench_item(pushed_row))
+                pushed.append(_row_to_maxwell_workbench_item(pushed_row, con))
         con.commit()
     return pushed
 
@@ -4595,10 +4807,20 @@ def _push_jarvis_plan_days_to_workbench_sync(plan_date: str) -> list[dict[str, A
                     """
                     INSERT INTO maxwell_workbench_items
                       (id, task_day_id, plan_day_id, agent_id, title, description, due_at,
-                       status, pushed_at, created_at, updated_at)
-                    VALUES (?, NULL, ?, 'maxwell', ?, ?, ?, 'todo', ?, ?, ?)
+                       status, work_logs_json, pushed_at, created_at, updated_at)
+                    VALUES (?, NULL, ?, 'maxwell', ?, ?, ?, 'todo', ?, ?, ?, ?)
                     """,
-                    (item_id, day["id"], day["title"], day["description"], _due_at_for_task_day(day), now, now, now),
+                    (
+                        item_id,
+                        day["id"],
+                        day["title"],
+                        day["description"],
+                        _due_at_for_task_day(day),
+                        _append_workbench_log_json([], event="接收今日执行项", detail=f"从计划日推送：{day['title']}", at=now),
+                        now,
+                        now,
+                        now,
+                    ),
                 )
             except sqlite3.IntegrityError:
                 continue
@@ -4616,7 +4838,7 @@ def _push_jarvis_plan_days_to_workbench_sync(plan_date: str) -> list[dict[str, A
             )
             pushed_row = con.execute("SELECT * FROM maxwell_workbench_items WHERE id = ?", (item_id,)).fetchone()
             if pushed_row is not None:
-                pushed.append(_row_to_maxwell_workbench_item(pushed_row))
+                pushed.append(_row_to_maxwell_workbench_item(pushed_row, con))
         con.commit()
     return pushed
 

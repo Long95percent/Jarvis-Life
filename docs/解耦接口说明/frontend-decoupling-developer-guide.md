@@ -1,4 +1,4 @@
-# 前端解耦接口说明与可改文件清单
+﻿# 前端解耦接口说明与可改文件清单
 
 本文只给前端开发人员看，目的有两个：
 
@@ -45,6 +45,33 @@ Push-Location shadowlink-web
 npm.cmd run type-check
 Pop-Location
 ```
+
+### 1.3 前后端同步开发期间的接口变更要求
+
+现在前端正在并行开发，所以原则是：**能不改接口就不改接口，能新增字段就不要破坏旧字段，能新增接口就不要随意改旧接口语义。**
+
+如果新功能确实需要改接口，必须同时在本文档写清楚：
+
+1. **改了哪个接口**：写明后端路径，例如 `GET /api/v1/jarvis/care/trends`。
+2. **前端从哪里调用**：写明 service 文件和方法，例如 `shadowlink-web/src/services/jarvisCareApi.ts` 的 `getCareTrends()`。
+3. **请求字段变化**：新增、删除、改名的字段都要列出来。
+4. **返回字段变化**：新增、删除、改名的字段都要列出来。
+5. **兼容性说明**：旧前端还能不能用；如果不能，要说明前端必须改哪里。
+6. **新功能怎么用**：给前端开发人员一个最小调用示例。
+7. **相关组件**：写明哪些组件会用到这个接口。
+
+推荐写法：
+
+```text
+接口：GET /api/v1/jarvis/xxx
+前端 service：shadowlink-web/src/services/xxxApi.ts -> xxxApi.methodName()
+是否破坏旧接口：否 / 是
+新增字段：xxx, yyy
+前端使用方式：组件只调用 service，不直接 fetch 后端路径
+影响组件：xxx.tsx, yyy.tsx
+```
+
+特别注意：心理关怀、日程、RAG、圆桌这些模块如果新增接口，都要先放进对应的 `services/*Api.ts`，再让组件使用。不要在组件里临时写 `fetch('/api/...')`。
 
 ---
 
@@ -140,6 +167,61 @@ jarvisScheduleApi.pushDailyTasksToMaxwellWorkbench(planDate?)
 
 - 日程、计划、后台任务、Maxwell 工作台都走 `jarvisScheduleApi`。
 - `CalendarPanel.tsx` 可以改 UI，但不要把 API 路径写回组件里。
+
+#### Maxwell 工作台新增返回字段（2026-05-03）
+
+接口：`GET /api/v1/jarvis/maxwell/workbench-items`
+
+前端 service：`shadowlink-web/src/services/jarvisScheduleApi.ts` -> `jarvisScheduleApi.listMaxwellWorkbenchItems()`
+
+是否破坏旧接口：否。只是给每个 `MaxwellWorkbenchItem` 新增可选字段，旧前端不使用这些字段也能继续运行。
+
+新增字段：
+
+```ts
+work_logs?: Array<{
+  at: string
+  actor: string
+  event: string
+  detail?: string | null
+}>
+
+live_state?: {
+  source_status?: string | null
+  source_title?: string | null
+  workbench_status?: string | null
+  is_completed: boolean
+  is_cancelled: boolean
+  is_overdue: boolean
+  minutes_until_due?: number | null
+  basis: 'jarvis_plan_days' | 'background_task_days' | 'workbench_only' | string
+  checked_at: string
+}
+```
+
+字段含义：
+
+- `work_logs`：后端真实记录的 Maxwell 工作过程，例如“接收今日执行项”“完成延期重排”“逾期后自动重排”“移动到新时间”。前端只负责展示，不要自己编造日志。
+- `live_state`：后端实时查询关联任务得到的状态。前端展示“仍未完成 / 已超时 / 已完成”等文案时，必须依据这个字段，不要只靠前端时间判断。
+- `live_state.basis`：说明实时状态来自哪里，可能是 `jarvis_plan_days`、`background_task_days` 或仅工作台自身记录。
+
+前端使用方式：
+
+```ts
+const items = await jarvisScheduleApi.listMaxwellWorkbenchItems({ limit: 200 })
+for (const item of items) {
+  if (item.live_state?.is_overdue && !item.live_state.is_completed) {
+    // 可以展示“已超时仍未完成”
+  }
+  // item.work_logs 可以渲染为 Maxwell 工作记录时间线
+}
+```
+
+影响组件：
+
+- `shadowlink-web/src/components/jarvis/CalendarPanel.tsx`：Maxwell 工作台卡片会展示实时状态和工作记录。
+
+注意：如果后续还要新增“更新工作台状态”“追加工作台日志”等写接口，必须继续写在 `jarvisScheduleApi`，不要让组件直接 `fetch('/api/v1/jarvis/maxwell/...')`。
 
 ---
 

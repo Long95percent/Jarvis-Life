@@ -8,6 +8,7 @@ import pytest
 
 from app.api.v1.jarvis_router import (
     CalendarEventRequest,
+    CalendarEventUpdate,
     PendingActionConfirmRequest,
     PlanDayMoveRequest,
     PlanDayBulkUpdateRequest,
@@ -30,6 +31,7 @@ from app.api.v1.jarvis_router import (
     list_maxwell_workbench_items,
     create_plan_item,
     update_plan_item,
+    update_calendar_event,
     PlanCreateRequest,
     PlanUpdateRequest,
     merge_plan_items,
@@ -634,6 +636,46 @@ def test_manual_calendar_event_creates_short_term_plan_day_but_calendar_items_ar
     assert plan_day["title"] == "??????"
     assert plan_day["calendar_event_id"] == result["event_id"]
     assert [item["item_type"] for item in items["items"]] == ["calendar_event"]
+
+
+def test_manual_calendar_event_update_syncs_backing_plan_day_and_calendar_projection():
+    async def scenario():
+        created = await add_calendar_event(CalendarEventRequest(
+            title="Original calendar task",
+            start=datetime.fromisoformat("2026-05-03T15:00:00"),
+            end=datetime.fromisoformat("2026-05-03T16:00:00"),
+            source="user_ui",
+            created_reason="manual create",
+        ))
+        event_id = created["event_id"]
+        day_id = created["plan_day"]["id"]
+
+        updated = await update_calendar_event(event_id, CalendarEventUpdate(
+            title="Updated calendar task",
+            start=datetime.fromisoformat("2026-05-04T09:30:00"),
+            end=datetime.fromisoformat("2026-05-04T10:15:00"),
+            notes="updated notes",
+            status="confirmed",
+        ))
+        days = await persistence.list_jarvis_plan_days(plan_id=created["plan_day"]["plan_id"], limit=10)
+        items = await list_planner_calendar_items(
+            start=datetime.fromisoformat("2026-05-04T00:00:00"),
+            end=datetime.fromisoformat("2026-05-05T00:00:00"),
+        )
+        return event_id, day_id, updated, days, items
+
+    event_id, day_id, updated, days, items = asyncio.run(scenario())
+    synced_day = next(day for day in days if day["id"] == day_id)
+    assert updated["event"]["title"] == "Updated calendar task"
+    assert synced_day["title"] == "Updated calendar task"
+    assert synced_day["description"] == "updated notes"
+    assert synced_day["plan_date"] == "2026-05-04"
+    assert synced_day["start_time"] == "09:30"
+    assert synced_day["end_time"] == "10:15"
+    assert synced_day["calendar_event_id"] == event_id
+    assert [(item["item_type"], item["id"], item["title"]) for item in items["items"]] == [
+        ("calendar_event", event_id, "Updated calendar task")
+    ]
 
 
 def test_plan_day_move_complete_and_cancel_sync_calendar_event():

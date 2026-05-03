@@ -9,6 +9,7 @@ import structlog
 
 from app.jarvis.models import ProactiveMessage
 from app.jarvis.persistence import (
+    append_maxwell_workbench_log,
     get_jarvis_plan,
     has_proactive_routine_run,
     list_jarvis_plan_days,
@@ -200,6 +201,11 @@ async def reschedule_plan_after_missed(plan_id: str, missed_days: list[dict[str,
             continue
         calendar_event = _sync_calendar_for_day(updated, patch)
         changed.append({"before": original, "after": updated, "calendar_event": calendar_event})
+        await append_maxwell_workbench_log(
+            plan_day_id=updated.get("id"),
+            event="逾期后自动重排",
+            detail=f"{original.get('plan_date')} 调整到 {updated.get('plan_date')}；原因：{patch.get('reschedule_reason')}",
+        )
     await record_agent_event(
         event_type="plan.rescheduled",
         agent_id="maxwell",

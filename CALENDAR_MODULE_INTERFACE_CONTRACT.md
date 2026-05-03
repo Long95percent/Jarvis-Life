@@ -484,6 +484,22 @@ Contract:
 - Must sync projected calendar events.
 - Must record audit event.
 
+### 9.2.1 Calendar Event Update Sync
+
+When the frontend edits an existing calendar event through `PUT /api/v1/jarvis/calendar/events/{event_id}`:
+- The persisted calendar event record must be updated in the database.
+- If the event is backed by a `jarvis_plan_day` via `calendar_event_id`, the backing plan day must be updated in the database in the same request flow.
+- Calendar projections must be refreshed from the updated database state, not from stale in-memory state.
+- This update path must not depend on LLM output.
+- The response may include the synced `plan_day` for frontend refresh purposes, but the write authority remains the backend database.
+
+Frontend handoff notes:
+- Current `CalendarPanel.tsx` changes are only for local/demo display. The production frontend may be replaced by another developer's implementation.
+- The replacement frontend should call the existing update endpoint directly through the calendar service boundary; it must not call LLM or simulate writes locally.
+- After a successful update, the frontend should re-query calendar/planner items from the backend instead of mutating only local state.
+- Day, week, and month views should use the same selected-event detail/edit flow so all edits go through the same backend write path.
+- The frontend should not show unrelated pending actions automatically when opening the calendar; pending actions belong in an explicit confirmation surface.
+
 ### 9.4 Project Plan to Calendar
 
 ```http

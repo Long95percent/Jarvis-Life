@@ -177,6 +177,18 @@ export interface MaxwellWorkbenchItem {
   plan_date?: string | null;
   due_at?: string | null;
   status: "todo" | "doing" | "done" | "cancelled" | string;
+  work_logs?: Array<{ at: string; actor: string; event: string; detail?: string | null }>;
+  live_state?: {
+    source_status?: string | null;
+    source_title?: string | null;
+    workbench_status?: string | null;
+    is_completed: boolean;
+    is_cancelled: boolean;
+    is_overdue: boolean;
+    minutes_until_due?: number | null;
+    basis: "jarvis_plan_days" | "background_task_days" | "workbench_only" | string;
+    checked_at: string;
+  };
   pushed_at?: number | null;
   created_at: number;
   updated_at: number;
@@ -1037,7 +1049,7 @@ export const jarvisApi = {
       status: string;
       route_required: boolean;
     }>
-  ): Promise<{ event: CalendarEvent; new_schedule_density: number }> {
+  ): Promise<{ event: CalendarEvent; new_schedule_density: number; plan_day?: JarvisPlanDay | null }> {
     const res = await fetch(`${BASE}/calendar/events/${eventId}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },

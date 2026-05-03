@@ -1,6 +1,6 @@
 ﻿import React, { useEffect, useMemo, useState } from "react";
 import { useJarvisStore } from "@/stores/jarvisStore";
-import { jarvisScheduleApi, type BackgroundTask, type BackgroundTaskDay, type CalendarEvent, type JarvisPlan, type JarvisPlanDay, type MaxwellWorkbenchItem, type PendingAction, type PlannerCalendarItem, type PlannerConflict, type PlannerFreeWindow, type PlannerDailyMaintenanceResult, type PlannerOverdueMissedResult, type PlannerTaskCleanupResult, type PlannerTaskItem, type AgentEvent } from "@/services/jarvisScheduleApi";
+import { jarvisScheduleApi, type BackgroundTask, type BackgroundTaskDay, type CalendarEvent, type JarvisPlan, type JarvisPlanDay, type MaxwellWorkbenchItem, type PlannerCalendarItem, type PlannerConflict, type PlannerFreeWindow, type PlannerDailyMaintenanceResult, type PlannerOverdueMissedResult, type PlannerTaskCleanupResult, type PlannerTaskItem, type AgentEvent } from "@/services/jarvisScheduleApi";
 
 interface Props { open: boolean; onClose: () => void }
 type ViewMode = "day" | "week" | "month";
@@ -35,7 +35,6 @@ const endOfMonthGrid = (date: Date) => addDays(startOfWeek(new Date(date.getFull
 const toDateInput = (date: Date) => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 const toTimeInput = (date: Date) => `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 const isoFromLocal = (date: string, time: string) => new Date(`${date}T${time}:00`).toISOString();
-const textArg = (value: unknown, fallback = "") => typeof value === "string" ? value : fallback;
 const sameDay = (a: Date, b: Date) => startOfDay(a).getTime() === startOfDay(b).getTime();
 const localDateFromKey = (value: string) => {
   const [year, month, day] = value.slice(0, 10).split("-").map(Number);
@@ -121,23 +120,6 @@ function formFromEvent(event: CalendarEvent): EventForm {
   };
 }
 
-function formFromPending(item: PendingAction): EventForm {
-  const args = item.arguments ?? {};
-  const start = textArg(args.start) ? new Date(textArg(args.start)) : new Date();
-  const end = textArg(args.end) ? new Date(textArg(args.end)) : new Date(start);
-  if (!textArg(args.end)) end.setHours(start.getHours() + 1);
-  return {
-    title: textArg(args.title, item.title),
-    date: toDateInput(start),
-    startTime: toTimeInput(start),
-    endTime: toTimeInput(end),
-    location: textArg(args.location),
-    notes: textArg(args.notes),
-    stress_weight: Number(args.stress_weight ?? 1),
-    route_required: Boolean(args.route_required),
-  };
-}
-
 function eventSource(event: CalendarEvent): string {
   if (event.source_agent) return `来自 ${event.source_agent}`;
   if (event.source === "agent_pending_confirmation") return "Agent 建议，用户确认";
@@ -181,6 +163,22 @@ function taskDayStatusLabel(status: string): string {
   if (status === "rescheduled") return "已重排";
   if (status === "cancelled") return "已取消";
   return status;
+}
+
+function workbenchLiveStateLabel(item: MaxwellWorkbenchItem): string {
+  const state = item.live_state;
+  if (!state) return "实时状态：未返回";
+  if (state.is_completed) return "实时状态：来源任务已完成";
+  if (state.is_cancelled) return "实时状态：来源任务已取消";
+  if (state.is_overdue) return "实时状态：已超时仍未完成";
+  if (typeof state.minutes_until_due === "number" && state.minutes_until_due >= 0) return `实时状态：距截止约 ${state.minutes_until_due} 分钟`;
+  return `实时状态：${taskDayStatusLabel(state.source_status || state.workbench_status || item.status)}`;
+}
+
+function workbenchBasisLabel(value?: string | null): string {
+  if (value === "jarvis_plan_days") return "计划日实时查询";
+  if (value === "background_task_days") return "长期任务日实时查询";
+  return "仅工作台记录";
 }
 
 function taskDayDate(day: BackgroundTaskDay): Date {
@@ -252,7 +250,6 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
   const [mode, setMode] = useState<ViewMode>("day");
   const [currentDate, setCurrentDate] = useState(() => startOfDay(new Date()));
   const [events, setEvents] = useState<CalendarEvent[]>([]);
-  const [pendingActions, setPendingActions] = useState<PendingAction[]>([]);
   const [tasks, setTasks] = useState<BackgroundTask[]>([]);
   const [taskDays, setTaskDays] = useState<BackgroundTaskDay[]>([]);
   const [plans, setPlans] = useState<JarvisPlan[]>([]);
@@ -302,7 +299,6 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
   const [backgroundTaskActionLoading, setBackgroundTaskActionLoading] = useState<string | null>(null);
   const [backgroundTaskMessage, setBackgroundTaskMessage] = useState<string | null>(null);
   const [editing, setEditing] = useState<CalendarEvent | null>(null);
-  const [editingPending, setEditingPending] = useState<PendingAction | null>(null);
   const [form, setForm] = useState<EventForm>(() => emptyForm(new Date()));
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -323,9 +319,8 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setLoading(true);
     setLoadError(null);
     try {
-      const [calendarItems, pending, plannerTaskItems, backgroundTasks, backgroundTaskDays, jarvisPlans, jarvisPlanDays, maxwellWorkbenchItems] = await Promise.all([
+      const [calendarItems, plannerTaskItems, backgroundTasks, backgroundTaskDays, jarvisPlans, jarvisPlanDays, maxwellWorkbenchItems] = await Promise.all([
         loadStep("日历项", () => jarvisScheduleApi.getPlannerCalendar({ start: range.start.toISOString(), end: range.end.toISOString() })),
-        loadStep("待确认安排", () => jarvisScheduleApi.listPendingActions()),
         loadStep("统一任务清单", () => jarvisScheduleApi.listPlannerTasks()),
         loadStep("后台任务", () => jarvisScheduleApi.listBackgroundTasks()),
         loadStep("后台任务日", () => jarvisScheduleApi.listBackgroundTaskDays({ limit: 1000 })),
@@ -337,7 +332,6 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
       setEvents(plannerItems.map(eventFromPlannerItem).filter((item): item is CalendarEvent => Boolean(item)));
       setPlannerConflicts(calendarItems.conflicts);
       setFreeWindows(calendarItems.free_windows);
-      setPendingActions(pending);
       setPlannerTasks(plannerTaskItems);
       setTasks(backgroundTasks);
       setWorkbenchItems(maxwellWorkbenchItems);
@@ -361,7 +355,6 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     setSelectedTaskDay(null);
     setSelectedPlanDay(null);
     setEditing(null);
-    setEditingPending(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, range.start.getTime(), range.end.getTime()]);
 
@@ -384,10 +377,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
   const saveForm = async () => {
     const payload = payloadFromForm();
     if (!payload.title) return;
-    if (editingPending) {
-      await jarvisScheduleApi.updatePendingAction(editingPending.id, { title: payload.title, arguments: { ...editingPending.arguments, ...payload } });
-      setEditingPending(null);
-    } else if (editing?.id) {
+    if (editing?.id) {
       await updateCalendarEvent(editing.id, { ...payload, source: "user_ui", source_agent: null, created_reason: "用户手动修改日程", status: editing.status ?? "confirmed" });
       setEditing(null);
       setSelected(null);
@@ -398,10 +388,8 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     await loadAll();
   };
 
-  const confirmPending = async (item: PendingAction) => { await jarvisScheduleApi.confirmPendingAction(item.id); await loadAll(); };
-  const cancelPending = async (item: PendingAction) => { await jarvisScheduleApi.cancelPendingAction(item.id); await loadAll(); };
-  const editPending = (item: PendingAction) => { setEditingPending(item); setEditing(null); setSelected(null); setForm(formFromPending(item)); setTab("calendar"); };
-  const startEdit = (event: CalendarEvent) => { setEditing(event); setEditingPending(null); setSelected(event); setForm(formFromEvent(event)); };
+  const startEdit = (event: CalendarEvent) => { setEditing(event); setSelected(event); setForm(formFromEvent(event)); };
+  const selectEventForDetail = (event: CalendarEvent) => { setSelected(event); setSelectedTaskDay(null); setSelectedPlanDay(null); setEditing(null); };
   const markCompleted = async (event: CalendarEvent) => { if (!event.id) return; await updateCalendarEvent(event.id, { status: event.status === "completed" ? "confirmed" : "completed" }); await loadAll(); setSelected(null); };
   const removeEvent = async (event: CalendarEvent) => { if (!event.id || !confirm(`删除日程「${event.title}」？`)) return; await deleteCalendarEvent(event.id); await loadAll(); setSelected(null); setEditing(null); };
   const completeTaskDay = async (day: BackgroundTaskDay) => { await jarvisScheduleApi.completeBackgroundTaskDay(day.id); await loadAll(); setSelectedTaskDay(null); };
@@ -770,7 +758,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
       onKeyDown={(keyEvent) => handleDeleteKey(keyEvent, () => removeEvent(event))}
       onContextMenu={(mouseEvent) => handleContextDelete(mouseEvent, () => removeEvent(event))}
     >
-      <button type="button" className="min-w-0 flex-1 text-left" onClick={() => setSelected(event)}>
+      <button type="button" className="min-w-0 flex-1 text-left" onClick={() => selectEventForDetail(event)}>
         <span className="block truncate font-medium">{compact ? event.title : `${formatTime(event.start)} ${event.title}`}</span>
         {!compact ? <span className="text-[10px] opacity-60">右键/Delete 删除</span> : null}
       </button>
@@ -930,13 +918,7 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
                 )}
               </main>
               <aside className="border-l border-gray-100 p-4 overflow-y-auto">
-                {pendingActions.length > 0 && (
-                  <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 p-3">
-                    <h3 className="text-sm font-semibold text-amber-900 mb-2">待确认安排</h3>
-                    <div className="space-y-2">{pendingActions.map((item) => <div key={item.id} className="rounded-xl bg-white/80 p-2 text-xs text-amber-900"><div className="font-medium truncate">{textArg(item.arguments.title, item.title)}</div><div className="text-amber-700 mt-0.5">{textArg(item.arguments.start) ? formatTime(textArg(item.arguments.start)) : "未设置"} - {textArg(item.arguments.end) ? formatTime(textArg(item.arguments.end)) : "未设置"}</div><div className="mt-2 grid grid-cols-3 gap-1"><button className="rounded-lg bg-amber-600 px-2 py-1 text-white" onClick={() => confirmPending(item)}>确认</button><button className="rounded-lg border border-amber-200 px-2 py-1" onClick={() => editPending(item)}>修改</button><button className="rounded-lg border border-amber-200 px-2 py-1" onClick={() => cancelPending(item)}>取消</button></div></div>)}</div>
-                  </div>
-                )}
-                <h3 className="text-sm font-semibold text-gray-800 mb-3">{editingPending ? "修改待确认" : editing ? "修改日程" : "新增日程"}</h3>
+                <h3 className="text-sm font-semibold text-gray-800 mb-3">{editing ? "修改日程" : "新增日程"}</h3>
                 <div className="space-y-2 text-xs">
                   <input className="w-full rounded-lg border border-gray-200 px-3 py-2" placeholder="日程标题" value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} />
                   <input className="w-full rounded-lg border border-gray-200 px-3 py-2" type="date" value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} />
@@ -944,10 +926,10 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
                   <input className="w-full rounded-lg border border-gray-200 px-3 py-2" placeholder="地点（可选）" value={form.location} onChange={(event) => setForm({ ...form, location: event.target.value })} />
                   <textarea className="w-full rounded-lg border border-gray-200 px-3 py-2 min-h-16" placeholder="备注（可选）" value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} />
                   <label className="flex items-center gap-2 text-gray-600"><input type="checkbox" checked={form.route_required} onChange={(event) => setForm({ ...form, route_required: event.target.checked })} />需要路线规划</label>
-                  <button className="w-full rounded-lg bg-[var(--color-primary)] px-3 py-2 text-white font-medium" onClick={saveForm}>{editingPending ? "保存待确认修改" : editing ? "保存修改" : "添加日程"}</button>
-                  {(editing || editingPending) && <button className="w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-600" onClick={() => { setEditing(null); setEditingPending(null); setForm(emptyForm(currentDate)); }}>取消修改</button>}
+                  <button className="w-full rounded-lg bg-[var(--color-primary)] px-3 py-2 text-white font-medium" onClick={saveForm}>{editing ? "保存修改" : "添加日程"}</button>
+                  {editing && <button className="w-full rounded-lg border border-gray-200 px-3 py-2 text-gray-600" onClick={() => { setEditing(null); setForm(emptyForm(currentDate)); }}>取消修改</button>}
                 </div>
-                {selected && <div className="mt-5 border-t border-gray-100 pt-4 text-xs text-gray-600"><h3 className={`text-sm font-semibold text-gray-900 ${selected.status === "completed" ? "line-through text-gray-400" : ""}`}>{selected.title}</h3><p className="mt-1">{formatTime(selected.start)} - {formatTime(selected.end)} · {selected.status ?? "confirmed"}</p><p className="mt-1">来源：{eventSource(selected)}</p>{selected.created_reason && <p className="mt-1">原因：{selected.created_reason}</p>}{selected.location && <p className="mt-1">地点：{selected.location}</p>}{selected.notes && <p className="mt-1">备注：{selected.notes}</p>}<div className="mt-3 grid grid-cols-3 gap-2"><button className="rounded-lg border border-gray-200 px-2 py-1.5" onClick={() => startEdit(selected)}>修改</button><button className="rounded-lg border border-gray-200 px-2 py-1.5" onClick={() => markCompleted(selected)}>{selected.status === "completed" ? "恢复" : "划掉"}</button><button className="rounded-lg border border-red-200 px-2 py-1.5 text-red-600" onClick={() => removeEvent(selected)}>删除</button></div></div>}
+                {selected && <section className="mt-5 rounded-2xl border border-blue-100 bg-blue-50/40 p-3 text-xs text-gray-700"><div className="flex items-start justify-between gap-3"><div><h3 className={`text-sm font-semibold text-gray-900 ${selected.status === "completed" ? "line-through text-gray-400" : ""}`}>{selected.title}</h3><p className="mt-1">{formatTime(selected.start)} - {formatTime(selected.end)} · {selected.status ?? "confirmed"}</p><p className="mt-1">来源：{eventSource(selected)}</p></div><button className="rounded-lg border border-blue-200 bg-white px-2 py-1 text-xs text-blue-700" onClick={() => startEdit(selected)}>编辑</button></div>{selected.created_reason && <p className="mt-2">原因：{selected.created_reason}</p>}{selected.location && <p className="mt-1">地点：{selected.location}</p>}{selected.notes && <p className="mt-1">备注：{selected.notes}</p>}<div className="mt-3 grid grid-cols-2 gap-2"><button className="rounded-lg border border-gray-200 px-2 py-1.5" onClick={() => markCompleted(selected)}>{selected.status === "completed" ? "恢复" : "划掉"}</button><button className="rounded-lg border border-red-200 px-2 py-1.5 text-red-600" onClick={() => removeEvent(selected)}>删除</button></div></section>}
                 {selectedPlanDay && <div className="mt-5 border-t border-gray-100 pt-4 text-xs text-gray-600"><h3 className={`text-sm font-semibold text-gray-900 ${selectedPlanDay.status === "completed" ? "line-through text-gray-400" : ""}`}>{selectedPlanDay.title}</h3><p className="mt-1">{formatDate(selectedPlanDay.plan_date)} · {selectedPlanDay.start_time ? selectedPlanDay.start_time.slice(0, 5) : "未设时间"} · {taskDayStatusLabel(selectedPlanDay.status)}</p>{selectedPlanDay.description && <p className="mt-2">{selectedPlanDay.description}</p>}<div className="mt-3 grid grid-cols-3 gap-2"><button className="rounded-lg border border-purple-200 px-2 py-1.5 text-purple-700 disabled:text-gray-400 disabled:border-gray-200" disabled={selectedPlanDay.status === "completed"} onClick={() => completePlanDay(selectedPlanDay)}>标记完成</button><button className="rounded-lg border border-gray-200 px-2 py-1.5 text-gray-700" onClick={() => selectedPlan && void requestSecretaryReschedule(selectedPlan, [selectedPlanDay.id])}>让秘书重排</button><button className="rounded-lg border border-red-200 px-2 py-1.5 text-red-600" onClick={() => removePlanDay(selectedPlanDay)}>删除</button></div></div>}
                 {selectedPlanDay && <button className="mt-2 w-full rounded-lg border border-gray-200 px-2 py-1.5 text-xs text-gray-700" onClick={() => startEditPlanDay(selectedPlanDay)}>Edit selected plan day</button>}
                 {selectedTaskDay && <div className="mt-5 border-t border-gray-100 pt-4 text-xs text-gray-600"><h3 className={`text-sm font-semibold text-gray-900 ${selectedTaskDay.status === "completed" ? "line-through text-gray-400" : ""}`}>{selectedTaskDay.title}</h3><p className="mt-1">{formatDate(selectedTaskDay.plan_date)} · {selectedTaskDay.start_time ? selectedTaskDay.start_time.slice(0, 5) : "未设时间"} · {taskDayStatusLabel(selectedTaskDay.status)}</p>{selectedTaskDay.description && <p className="mt-2">{selectedTaskDay.description}</p>}<div className="mt-3 grid grid-cols-2 gap-2"><button className="rounded-lg border border-emerald-200 px-2 py-1.5 text-emerald-700 disabled:text-gray-400 disabled:border-gray-200" disabled={selectedTaskDay.status === "completed"} onClick={() => completeTaskDay(selectedTaskDay)}>标记完成</button><button className="rounded-lg border border-red-200 px-2 py-1.5 text-red-600" onClick={() => removeTaskDay(selectedTaskDay)}>删除</button></div></div>}
@@ -973,12 +955,26 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
               {workbenchItems.map((item) => <article key={item.id} className="rounded-2xl border border-gray-200 bg-white p-4 text-sm">
                 <div className="flex items-start justify-between gap-3"><h4 className="font-medium text-gray-900">{item.title}</h4><span className="shrink-0 rounded-full bg-purple-50 px-2 py-0.5 text-xs text-purple-600">{taskDayStatusLabel(item.status)}</span></div>
                 {item.description ? <p className="mt-2 text-xs text-gray-500">{item.description}</p> : null}
+                <div className={`mt-3 rounded-xl p-2 text-xs ${item.live_state?.is_overdue ? "bg-amber-50 text-amber-700" : "bg-blue-50 text-blue-700"}`}>
+                  <div className="font-medium">{workbenchLiveStateLabel(item)}</div>
+                  <div className="mt-1 opacity-80">依据：{workbenchBasisLabel(item.live_state?.basis)}{item.live_state?.checked_at ? ` · ${formatDateTime(item.live_state.checked_at)}` : ""}</div>
+                </div>
                 <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-gray-500">
                   <div className="rounded-xl bg-gray-50 p-2"><div className="text-gray-400">计划日期</div><div className="mt-1 text-gray-700">{formatDate(item.plan_date ?? item.due_at)}</div></div>
                   <div className="rounded-xl bg-gray-50 p-2"><div className="text-gray-400">截止时间</div><div className="mt-1 text-gray-700">{formatDateTime(item.due_at)}</div></div>
                   <div className="rounded-xl bg-gray-50 p-2"><div className="text-gray-400">来源</div><div className="mt-1 text-gray-700">{item.plan_day_id ? "计划日" : item.task_day_id ? "长期任务日" : "未记录"}</div></div>
                   <div className="rounded-xl bg-gray-50 p-2"><div className="text-gray-400">Agent</div><div className="mt-1 text-gray-700">{item.agent_id || "maxwell"}</div></div>
                 </div>
+                {item.work_logs?.length ? <div className="mt-3 rounded-xl border border-gray-100 bg-gray-50 p-3 text-xs">
+                  <div className="font-medium text-gray-700">Maxwell 工作记录</div>
+                  <div className="mt-2 space-y-2">
+                    {item.work_logs.slice(-4).map((log, index) => <div key={`${log.at}-${index}`} className="border-l-2 border-purple-200 pl-2">
+                      <div className="text-gray-700">{log.event}</div>
+                      {log.detail ? <div className="mt-0.5 text-gray-500">{log.detail}</div> : null}
+                      <div className="mt-0.5 text-[10px] text-gray-400">{formatDateTime(log.at)} · {log.actor || "maxwell"}</div>
+                    </div>)}
+                  </div>
+                </div> : null}
               </article>)}
             </div>
           </div>
@@ -1114,6 +1110,3 @@ export const CalendarPanel: React.FC<Props> = ({ open, onClose }) => {
     </div>
   );
 };
-
-
-

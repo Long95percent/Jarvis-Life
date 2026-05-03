@@ -6,6 +6,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.jarvis.persistence import (
+    append_maxwell_workbench_log,
     get_jarvis_plan,
     hard_delete_jarvis_plan,
     list_jarvis_plans,
@@ -199,6 +200,11 @@ async def _run_reschedule(*, parsed: dict[str, Any], message: str, today: str, p
             if auto_project_calendar:
                 sync_plan_day_calendar_event(updated, patch)
             changed.append(updated)
+            await append_maxwell_workbench_log(
+                plan_day_id=updated.get("id"),
+                event="完成延期重排",
+                detail=f"{original.get('plan_date')} 调整到 {updated.get('plan_date')}；原因：{patch.get('reschedule_reason') or '用户请求秘书重排'}",
+            )
     changed_count = len(changed)
     calendar_events = []
     if auto_project_calendar:

@@ -2417,7 +2417,7 @@ async def delete_plan_day_item(day_id: str) -> dict[str, Any]:
 
 @router.post("/plan-days/{day_id}/move")
 async def move_plan_day_item(day_id: str, req: PlanDayMoveRequest) -> dict[str, Any]:
-    from app.jarvis.persistence import list_jarvis_plan_days, update_jarvis_plan_day
+    from app.jarvis.persistence import append_maxwell_workbench_log, list_jarvis_plan_days, update_jarvis_plan_day
     from app.jarvis.planner_guard import validate_plan_day_move
 
     patch = {"plan_date": req.plan_date[:10], "start_time": req.start_time, "end_time": req.end_time, "status": "rescheduled", "reschedule_reason": req.reason or "??????/??"}
@@ -2436,6 +2436,11 @@ async def move_plan_day_item(day_id: str, req: PlanDayMoveRequest) -> dict[str, 
     if updated is None:
         raise HTTPException(status_code=404, detail=f"Plan day {day_id!r} not found")
     calendar_event = _sync_plan_day_calendar_event(updated, patch)
+    await append_maxwell_workbench_log(
+        plan_day_id=updated.get("id"),
+        event="移动到新时间",
+        detail=f"{existing.get('plan_date')} 调整到 {updated.get('plan_date')}；原因：{patch.get('reschedule_reason')}",
+    )
     return {"plan_day": updated, "calendar_event": calendar_event}
 
 
@@ -2820,16 +2825,18 @@ async def delete_calendar_event(event_id: str) -> dict[str, Any]:
 
 @router.put("/calendar/events/{event_id}")
 async def update_calendar_event(event_id: str, req: CalendarEventUpdate) -> dict[str, Any]:
-    from app.mcp.adapters.calendar_adapter import compute_schedule_density, update_event
+    from app.mcp.adapters.calendar_adapter import compute_schedule_density, get_upcoming_events, update_event
+    from app.jarvis.persistence import sync_plan_day_from_calendar_event
     patch = req.model_dump(exclude_unset=True)
     event = update_event(event_id, **patch)
     if event is None:
         raise HTTPException(status_code=404, detail=f"Event {event_id!r} not found")
+    plan_day = await sync_plan_day_from_calendar_event(event.model_dump())
     density = compute_schedule_density()
     await get_life_context_bus().update_fields(
-        {"schedule_density": density}, source="user_ui"
+        {"schedule_density": density, "active_events": get_upcoming_events(hours_ahead=24)}, source="user_ui"
     )
-    return {"event": event.model_dump(), "new_schedule_density": density}
+    return {"event": event.model_dump(), "new_schedule_density": density, "plan_day": plan_day}
 
 
 @router.get("/messages/stream")
