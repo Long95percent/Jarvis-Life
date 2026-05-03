@@ -177,7 +177,7 @@ export interface MaxwellWorkbenchItem {
   plan_date?: string | null;
   due_at?: string | null;
   status: "todo" | "doing" | "done" | "cancelled" | string;
-  work_logs?: Array<{ at: string; actor: string; event: string; detail?: string | null }>;
+  work_logs?: Array<{ at: string; actor: string; event: string; detail?: string | null; category?: string; source?: string }>;
   live_state?: {
     source_status?: string | null;
     source_title?: string | null;
@@ -192,6 +192,29 @@ export interface MaxwellWorkbenchItem {
   pushed_at?: number | null;
   created_at: number;
   updated_at: number;
+}
+
+export interface MaxwellRescheduleRequest {
+  item_type: "plan_day" | "background_task_day" | string;
+  item_id: string;
+  action?: "postpone_one_day" | string;
+  reason?: string | null;
+  today?: string | null;
+}
+
+export interface MaxwellRescheduleResult {
+  item_type: string;
+  action: string;
+  changed: JarvisPlanDay | BackgroundTaskDay | Record<string, unknown>;
+  message: string;
+  work_logs?: Array<{ at: string; actor: string; event: string; detail?: string | null; category?: string; source?: string }>;
+  pressure_review?: {
+    reviewed_by?: string;
+    consulted_roles?: string[];
+    level?: string;
+    summary?: string;
+  };
+  warnings?: string[];
 }
 
 export interface ChatResponse {
@@ -1356,6 +1379,16 @@ export const jarvisApi = {
     const suffix = query.toString() ? `?${query.toString()}` : "";
     const res = await fetch(`${BASE}/maxwell/workbench-items${suffix}`);
     if (!res.ok) throw await errorFromResponse(res, `list maxwell workbench items HTTP ${res.status}`);
+    return res.json();
+  },
+
+  async requestMaxwellReschedule(payload: MaxwellRescheduleRequest): Promise<MaxwellRescheduleResult> {
+    const res = await fetch(`${BASE}/maxwell/reschedule-task`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw await errorFromResponse(res, `request maxwell reschedule HTTP ${res.status}`);
     return res.json();
   },
 

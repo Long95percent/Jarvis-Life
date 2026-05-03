@@ -77,10 +77,10 @@ def delete_event(event_id: str) -> bool:
     global _events
     before = len(_events)
     _events = [e for e in _events if e.id != event_id]
-    from app.jarvis.persistence import delete_calendar_event_sync
+    from app.jarvis.persistence import hard_delete_calendar_event_sync
 
-    persisted = delete_calendar_event_sync(event_id)
-    return len(_events) < before or persisted
+    persisted = hard_delete_calendar_event_sync(event_id)
+    return len(_events) < before or persisted is not None
 
 
 def update_event(

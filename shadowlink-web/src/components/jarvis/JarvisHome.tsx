@@ -89,8 +89,8 @@ export const JarvisHome: React.FC = () => {
     <div className="relative flex-1 min-h-0 overflow-hidden bg-[radial-gradient(circle_at_top_left,rgba(224,231,255,0.72),transparent_30%),linear-gradient(180deg,#f8fafc,#f3f5fb_48%,#eef2ff)]">
       <CalendarPanel open={calendarOpen} onClose={() => setCalendarOpen(false)} />
 
-      <div className="grid h-full min-h-0 gap-4 p-4 lg:grid-cols-[304px_minmax(0,1fr)] xl:grid-cols-[304px_minmax(0,1fr)_332px]">
-        <aside className="min-h-0 rounded-[32px] border border-white/70 bg-white/82 p-4 shadow-sm shadow-slate-200/70 backdrop-blur lg:row-span-2 xl:row-span-1">
+      <div className="grid h-full min-h-0 gap-3 overflow-hidden p-3 lg:grid-cols-[clamp(240px,21vw,272px)_minmax(0,1fr)] xl:grid-cols-[clamp(240px,19vw,272px)_minmax(0,1fr)_minmax(280px,clamp(280px,23vw,320px))]">
+        <aside className="min-h-0 rounded-[28px] border border-white/70 bg-white/82 p-3 shadow-sm shadow-slate-200/70 backdrop-blur lg:row-span-2 xl:row-span-1">
           <div className="flex h-full min-h-0 flex-col">
             <div className="flex items-start justify-between gap-3">
               <div>
@@ -109,7 +109,7 @@ export const JarvisHome: React.FC = () => {
               </button>
             </div>
 
-            <div className="mt-4 min-h-0 flex-1 space-y-1.5 pr-0.5">
+            <div className="mt-3 min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-0.5">
               {agents.map((agent) => (
                 <AgentCard
                   key={agent.id}
@@ -128,7 +128,7 @@ export const JarvisHome: React.FC = () => {
                 closeSidePanel();
                 resetToScenarioGrid();
               }}
-              className={`mt-3 inline-flex min-h-[62px] items-center justify-center gap-2.5 rounded-[22px] border px-5 py-3.5 text-base font-semibold shadow-[0_18px_36px_-28px_rgba(79,70,229,0.5)] transition duration-200 ${
+              className={`mt-3 inline-flex min-h-[54px] items-center justify-center gap-2 rounded-[20px] border px-4 py-3 text-sm font-semibold shadow-[0_18px_36px_-28px_rgba(79,70,229,0.5)] transition duration-200 ${
                 interactionMode === "scenario_grid"
                   ? "border-indigo-300 bg-indigo-50 text-indigo-700"
                   : "border-indigo-300 bg-white text-indigo-700 hover:-translate-y-0.5 hover:border-indigo-400 hover:bg-indigo-50"
@@ -141,7 +141,7 @@ export const JarvisHome: React.FC = () => {
         </aside>
 
         <section
-          className={`min-h-0 overflow-hidden rounded-[36px] border border-white/70 bg-white/92 shadow-[0_24px_60px_-32px_rgba(15,23,42,0.28)] backdrop-blur ${
+          className={`min-h-0 overflow-hidden rounded-[30px] border border-white/70 bg-white/92 shadow-[0_24px_60px_-32px_rgba(15,23,42,0.28)] backdrop-blur ${
             isRoundtable ? "lg:row-span-2 xl:col-span-2" : ""
           }`}
         >
@@ -185,7 +185,7 @@ export const JarvisHome: React.FC = () => {
         </section>
 
         {!isRoundtable ? (
-          <aside className="min-h-0 space-y-4 lg:col-start-2 xl:col-start-3">
+          <aside className="min-h-0 min-w-0 space-y-3 overflow-visible lg:col-start-2 xl:col-start-3">
             <TodayScheduleCard onOpenCalendar={() => setCalendarOpen(true)} />
 
             <CareTrendsPanel
@@ -195,27 +195,27 @@ export const JarvisHome: React.FC = () => {
               onOpenDetails={() => openSidePanel("care")}
             />
 
-            <section className="rounded-[28px] border border-white/70 bg-white/95 p-5 shadow-sm shadow-slate-200/60">
-              <div className="mb-4 flex items-center justify-between gap-3">
+            <section className="min-w-0 rounded-[20px] border border-white/70 bg-white/95 p-3 shadow-sm shadow-slate-200/60">
+              <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
                 <div>
-                  <div className="text-base font-semibold text-slate-800">
+                  <div className="text-[0.92rem] font-semibold text-slate-800">
                     主动提醒
                   </div>
-                  <div className="mt-1 text-xs text-slate-400">
+                  <div className="mt-0.5 text-[10px] text-slate-400">
                     来自各位 Agent 的及时提醒
                   </div>
                 </div>
                 <button
                   type="button"
                   onClick={() => openSidePanel("proactive")}
-                  className="inline-flex items-center gap-1 text-sm font-medium text-indigo-600 transition hover:text-indigo-700"
+                  className="inline-flex shrink-0 items-center gap-1 text-[11px] font-medium text-indigo-600 transition hover:text-indigo-700"
                 >
                   查看更多
-                  <ChevronRight size={16} />
+                  <ChevronRight size={14} />
                 </button>
               </div>
 
-              <div className="max-h-[340px] overflow-y-auto pr-1">
+              <div className="max-h-[clamp(170px,22vh,230px)] min-w-0 overflow-y-auto pr-1">
                 <ProactiveMessageFeed
                   messages={proactiveMessages}
                   onRead={(id) => void markMessageRead(id)}

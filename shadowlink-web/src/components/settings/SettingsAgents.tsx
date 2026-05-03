@@ -59,9 +59,7 @@ export function SettingsAgents() {
     })()
     ;(async () => {
       try {
-        const res = await fetch('/api/v1/jarvis/shadow/profile')
-        if (!res.ok) return
-        const data: ShadowProfile = await res.json()
+        const data = await jarvisSettingsApi.getShadowProfile()
         if (alive) setShadowProfile(data)
       } catch {
         // silent — profile is best-effort
@@ -87,12 +85,7 @@ export function SettingsAgents() {
 
   const saveAgent = async (agentId: string, patch: Partial<AgentCfg>) => {
     try {
-      const res = await fetch(`/api/v1/jarvis/agent-config/${agentId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(patch),
-      })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      await jarvisSettingsApi.updateAgentConfig(agentId, patch)
       setSavedAgent(agentId)
       setError(null)
     } catch (e) {
@@ -125,12 +118,8 @@ export function SettingsAgents() {
   const toggleShadow = async (enabled: boolean) => {
     setCfg((c) => ({ ...c, shadow_learner_enabled: enabled }))
     try {
-      const res = await fetch('/api/v1/jarvis/agent-config/shadow/toggle', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled }),
-      })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await jarvisSettingsApi.toggleShadowLearner(enabled)
+      setCfg(data)
       setShadowSaved(true)
       setError(null)
     } catch (e) {

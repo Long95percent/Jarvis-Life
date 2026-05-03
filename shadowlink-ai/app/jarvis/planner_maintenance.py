@@ -12,6 +12,7 @@ from app.jarvis.persistence import (
     append_maxwell_workbench_log,
     get_jarvis_plan,
     has_proactive_routine_run,
+    list_background_task_days,
     list_jarvis_plan_days,
     mark_overdue_planner_days_missed,
     push_planner_days_to_workbench,
@@ -19,6 +20,7 @@ from app.jarvis.persistence import (
     save_proactive_message,
     save_proactive_routine_run,
     save_care_trigger_and_intervention,
+    update_background_task_day,
     update_jarvis_plan_day,
 )
 from app.mcp.adapters.calendar_adapter import get_event, update_event
@@ -27,6 +29,7 @@ logger = structlog.get_logger("jarvis.planner_maintenance")
 
 PLANNER_MAINTENANCE_ROUTINE_ID = "planner_daily_maintenance"
 ACTIVE_PLAN_DAY_STATUSES = {"pending", "scheduled", "pushed", "rescheduled"}
+ACTIVE_BACKGROUND_TASK_DAY_STATUSES = {"pending", "pushed", "rescheduled"}
 
 
 def _json_from_text(text: str) -> dict[str, Any]:
@@ -205,6 +208,8 @@ async def reschedule_plan_after_missed(plan_id: str, missed_days: list[dict[str,
             plan_day_id=updated.get("id"),
             event="逾期后自动重排",
             detail=f"{original.get('plan_date')} 调整到 {updated.get('plan_date')}；原因：{patch.get('reschedule_reason')}",
+            category="auto_maintenance",
+            source="planner_daily_maintenance",
         )
     await record_agent_event(
         event_type="plan.rescheduled",
@@ -239,6 +244,46 @@ async def reschedule_plan_after_missed(plan_id: str, missed_days: list[dict[str,
     return {"plan_id": plan_id, "changed_count": len(changed), "changed": changed, "message": generated.get("message"), "fallback": generated.get("fallback", False)}
 
 
+async def reschedule_background_task_after_missed(task_id: str, missed_days: list[dict[str, Any]], today: str) -> dict[str, Any]:
+    all_days = await list_background_task_days(task_id=task_id, limit=2000)
+    future_days = [
+        day for day in all_days
+        if str(day.get("plan_date") or "")[:10] >= today[:10]
+        and str(day.get("status") or "") in ACTIVE_BACKGROUND_TASK_DAY_STATUSES
+    ]
+    if not future_days:
+        return {"task_id": task_id, "changed_count": 0, "changed": [], "skipped": "no_future_days"}
+
+    missed_count = max(1, len(missed_days))
+    base = datetime.fromisoformat(f"{today[:10]}T00:00:00").date()
+    changed: list[dict[str, Any]] = []
+    for index, day in enumerate(future_days):
+        original = datetime.fromisoformat(f"{str(day.get('plan_date'))[:10]}T00:00:00").date()
+        target = max(original + timedelta(days=missed_count), base + timedelta(days=index))
+        updated = await update_background_task_day(day["id"], {
+            "plan_date": target.isoformat(),
+            "start_time": day.get("start_time"),
+            "end_time": day.get("end_time"),
+            "status": "rescheduled",
+        })
+        if updated:
+            await append_maxwell_workbench_log(
+                task_day_id=updated["id"],
+                event="自动延期整理",
+                detail=f"{day.get('plan_date')} 调整到 {updated.get('plan_date')}；原因：前序 {len(missed_days)} 项逾期未完成",
+                category="auto_maintenance",
+                source="planner_daily_maintenance",
+            )
+            changed.append(updated)
+    if changed:
+        await record_agent_event(
+            event_type="background_task.rescheduled",
+            agent_id="maxwell",
+            payload={"task_id": task_id, "today": today[:10], "missed_count": len(missed_days), "changed_count": len(changed)},
+        )
+    return {"task_id": task_id, "changed_count": len(changed), "changed": changed, "message": f"Maxwell 已整理长期任务，顺延 {len(changed)} 个后续执行日。"}
+
+
 async def run_planner_daily_maintenance(
     *,
     today: str,
@@ -257,8 +302,17 @@ async def run_planner_daily_maintenance(
     if auto_reschedule:
         for plan_id, days in by_plan.items():
             rescheduled.append(await reschedule_plan_after_missed(plan_id, days, today, llm_client=llm_client))
+    background_by_task: dict[str, list[dict[str, Any]]] = {}
+    for day in missed.get("background_task_days", []):
+        task_id = day.get("task_id")
+        if isinstance(task_id, str) and task_id:
+            background_by_task.setdefault(task_id, []).append(day)
+    background_rescheduled = []
+    if auto_reschedule:
+        for task_id, days in background_by_task.items():
+            background_rescheduled.append(await reschedule_background_task_after_missed(task_id, days, today))
     pushed = await push_planner_days_to_workbench(today) if push_today else []
-    return {"today": today[:10], "missed": missed, "rescheduled": rescheduled, "pushed_count": len(pushed), "pushed": pushed}
+    return {"today": today[:10], "missed": missed, "rescheduled": rescheduled, "background_rescheduled": background_rescheduled, "pushed_count": len(pushed), "pushed": pushed}
 
 
 async def run_planner_daily_maintenance_once(

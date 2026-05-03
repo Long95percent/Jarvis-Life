@@ -250,11 +250,14 @@ export const TodayScheduleCard: React.FC<DashboardCardsProps> = ({
   onOpenCalendar,
 }) => {
   const context = useJarvisStore((state) => state.context);
+  const todayKey = new Date().toLocaleDateString("sv-SE");
   const events = useMemo(
-    () => [...(context?.active_events ?? [])].sort((left, right) => {
-      return +new Date(left.start) - +new Date(right.start);
-    }),
-    [context?.active_events],
+    () => [...(context?.active_events ?? [])]
+      .filter((event) => new Date(event.start).toLocaleDateString("sv-SE") === todayKey)
+      .sort((left, right) => {
+        return +new Date(left.start) - +new Date(right.start);
+      }),
+    [context?.active_events, todayKey],
   );
 
   return (

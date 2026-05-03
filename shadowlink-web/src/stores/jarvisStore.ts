@@ -16,6 +16,7 @@ interface PersistedUiState {
   activeRoundtableSourceSessionId?: string | null;
   activeRoundtableSourceAgentId?: string | null;
   sessionId?: string;
+  privateSessionByAgent?: Record<string, string>;
 }
 
 function readPersistedUiState(): {
@@ -152,7 +153,9 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
   activeRoundtableInput: persistedUiState.activeRoundtableInput ?? "",
   activeRoundtableSourceSessionId: persistedUiState.activeRoundtableSourceSessionId ?? null,
   activeRoundtableSourceAgentId: persistedUiState.activeRoundtableSourceAgentId ?? null,
-  sessionId: persistedUiState.sessionId ?? (hasPersistedUiState ? `jarvis-${Date.now()}` : `private-alfred-${Date.now()}`),
+  sessionId: persistedUiState.sessionId
+    ?? persistedUiState.privateSessionByAgent?.[persistedUiState.activeAgentId ?? "alfred"]
+    ?? (hasPersistedUiState ? `jarvis-${Date.now()}` : `private-alfred-${Date.now()}`),
 
   loadContext: async () => {
     const context = await jarvisApi.getContext();
@@ -211,6 +214,15 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
   },
 
   sendMessage: async (agentId, message, sessionId, options) => {
+    writePersistedUiState({
+      activeAgentId: agentId,
+      interactionMode: "private_chat",
+      sessionId,
+      privateSessionByAgent: {
+        ...(readPersistedUiState().state.privateSessionByAgent ?? {}),
+        [agentId]: sessionId,
+      },
+    });
     set((s) => ({
       chatHistory: {
         ...s.chatHistory,
@@ -269,7 +281,15 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
       },
     }));
     if (routedAgentId !== agentId) {
-      writePersistedUiState({ activeAgentId: routedAgentId, interactionMode: "private_chat", sessionId });
+      writePersistedUiState({
+        activeAgentId: routedAgentId,
+        interactionMode: "private_chat",
+        sessionId,
+        privateSessionByAgent: {
+          ...(readPersistedUiState().state.privateSessionByAgent ?? {}),
+          [routedAgentId]: sessionId,
+        },
+      });
       set({ activeAgentId: routedAgentId, interactionMode: "private_chat", sessionId });
     }
     window.dispatchEvent(new Event("jarvis:conversation-history-changed"));
@@ -353,12 +373,19 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
   },
 
   openPrivateChat: (agentId) => {
-    const sessionId = `private-${agentId}-${Date.now()}`;
-    writePersistedUiState({ activeAgentId: agentId, interactionMode: "private_chat", sessionId });
+    const privateSessionByAgent = readPersistedUiState().state.privateSessionByAgent ?? {};
+    const sessionId = privateSessionByAgent[agentId] ?? `private-${agentId}-${Date.now()}`;
+    writePersistedUiState({
+      activeAgentId: agentId,
+      interactionMode: "private_chat",
+      sessionId,
+      privateSessionByAgent: { ...privateSessionByAgent, [agentId]: sessionId },
+    });
     set({ activeAgentId: agentId, interactionMode: "private_chat", sessionId });
   },
 
   openExistingPrivateChat: async (agentId, sessionId) => {
+    const privateSessionByAgent = readPersistedUiState().state.privateSessionByAgent ?? {};
     writePersistedUiState({
       activeAgentId: agentId,
       interactionMode: "private_chat",
@@ -367,6 +394,7 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
       activeRoundtableSourceSessionId: null,
       activeRoundtableSourceAgentId: null,
       sessionId,
+      privateSessionByAgent: { ...privateSessionByAgent, [agentId]: sessionId },
     });
     set({
       activeAgentId: agentId,
@@ -415,10 +443,12 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     await jarvisConversationApi.openConversationHistory(conversation.id).catch(() => {});
     const payload = conversation.route_payload ?? {};
     if (conversation.conversation_type === "private_chat" && conversation.agent_id) {
+      const privateSessionByAgent = readPersistedUiState().state.privateSessionByAgent ?? {};
       writePersistedUiState({
         interactionMode: "private_chat",
         activeAgentId: conversation.agent_id,
         sessionId: conversation.session_id,
+        privateSessionByAgent: { ...privateSessionByAgent, [conversation.agent_id]: conversation.session_id },
       });
       set({ interactionMode: "private_chat", activeAgentId: conversation.agent_id, sessionId: conversation.session_id });
       await get().loadChatHistory(conversation.agent_id, conversation.session_id);

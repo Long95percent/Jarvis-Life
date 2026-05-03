@@ -49,6 +49,7 @@ from app.jarvis.stress_observation import aggregate_schedule_pressure_signals
 from app.jarvis.planner_maintenance import run_planner_daily_maintenance, run_planner_daily_maintenance_once
 from app.mcp.adapters import calendar_adapter
 from app.tools.jarvis_tools import JarvisCalendarAddTool
+from app.tools.jarvis_tools import JarvisScheduleEditorTool
 
 
 @pytest.fixture(autouse=True)
@@ -1106,3 +1107,401 @@ def test_calendar_tool_accepts_timezone_aware_trip_events_without_naive_aware_cr
     assert first["ok"] is True
     assert second["ok"] is True
     assert len(events) == 2
+
+
+def test_schedule_editor_can_query_update_and_delete_calendar_events():
+    async def scenario():
+        tool = JarvisScheduleEditorTool()
+        first = calendar_adapter.add_event(
+            "daily reading",
+            datetime.fromisoformat("2026-05-18T09:00:00"),
+            datetime.fromisoformat("2026-05-18T10:00:00"),
+            source="planner_projection",
+        )
+        second = calendar_adapter.add_event(
+            "daily reading",
+            datetime.fromisoformat("2026-05-19T09:00:00"),
+            datetime.fromisoformat("2026-05-19T10:00:00"),
+            source="planner_projection",
+        )
+        queried = await tool._arun(operation="query", scope="range", start="2026-05-18T00:00:00", end="2026-05-20T00:00:00", keyword="reading")
+        updated = await tool._arun(
+            operation="update",
+            scope="range",
+            start="2026-05-18T00:00:00",
+            end="2026-05-20T00:00:00",
+            patches=[
+                {
+                    "event_id": first.id,
+                    "start": "2026-05-18T10:00:00",
+                    "end": "2026-05-18T11:00:00",
+                },
+            ],
+        )
+        deleted = await tool._arun(operation="delete", event_ids=[second.id])
+        return queried, updated, deleted, calendar_adapter.get_event(first.id), calendar_adapter.get_event(second.id)
+
+    queried, updated, deleted, first_event, second_event = asyncio.run(scenario())
+
+    assert queried["ok"] is True
+    assert queried["matched_count"] >= 2
+    assert updated["ok"] is True
+    assert updated["updated_count"] == 1
+    assert first_event is not None
+    assert first_event.start.isoformat().startswith("2026-05-18T10:00")
+    assert deleted["ok"] is True
+    assert deleted["deleted_count"] == 1
+    assert second_event is None
+
+
+def test_schedule_editor_deletes_matching_keyword_without_event_ids():
+    async def scenario():
+        tool = JarvisScheduleEditorTool()
+        python_event = calendar_adapter.add_event(
+            "Python 学习",
+            datetime.fromisoformat("2026-05-20T09:00:00"),
+            datetime.fromisoformat("2026-05-20T10:00:00"),
+            source="planner_projection",
+        )
+        tea_event = calendar_adapter.add_event(
+            "奶茶",
+            datetime.fromisoformat("2026-05-20T11:00:00"),
+            datetime.fromisoformat("2026-05-20T12:00:00"),
+            source="planner_projection",
+        )
+        deleted = await tool._arun(operation="delete", scope="all", keyword="python", limit=1000)
+        return deleted, calendar_adapter.get_event(python_event.id), calendar_adapter.get_event(tea_event.id)
+
+    deleted, python_event, tea_event = asyncio.run(scenario())
+
+    assert deleted["ok"] is True
+    assert deleted["matched_count"] == 1
+    assert deleted["deleted_count"] == 1
+    assert python_event is None
+    assert tea_event is not None
+
+
+def test_schedule_editor_updates_unique_keyword_match_without_patch_event_id():
+    async def scenario():
+        tool = JarvisScheduleEditorTool()
+        meeting = calendar_adapter.add_event(
+            "team meeting",
+            datetime.fromisoformat("2026-05-22T09:00:00"),
+            datetime.fromisoformat("2026-05-22T10:00:00"),
+            source="planner_projection",
+        )
+        calendar_adapter.add_event(
+            "coffee break",
+            datetime.fromisoformat("2026-05-22T11:00:00"),
+            datetime.fromisoformat("2026-05-22T11:30:00"),
+            source="planner_projection",
+        )
+        updated = await tool._arun(
+            operation="update",
+            scope="all",
+            keyword="meeting",
+            title="team meeting updated",
+            start="2026-05-22T15:00:00",
+            end="2026-05-22T16:00:00",
+        )
+        return updated, calendar_adapter.get_event(meeting.id)
+
+    updated, meeting = asyncio.run(scenario())
+
+    assert updated["ok"] is True
+    assert updated["updated_count"] == 1
+    assert updated["auto_resolved"] is True
+    assert meeting is not None
+    assert meeting.title == "team meeting updated"
+    assert meeting.start.isoformat().startswith("2026-05-22T15:00")
+
+
+def test_schedule_editor_requires_disambiguation_for_multiple_update_matches():
+    async def scenario():
+        tool = JarvisScheduleEditorTool()
+        calendar_adapter.add_event(
+            "team meeting A",
+            datetime.fromisoformat("2026-05-22T09:00:00"),
+            datetime.fromisoformat("2026-05-22T10:00:00"),
+            source="planner_projection",
+        )
+        calendar_adapter.add_event(
+            "team meeting B",
+            datetime.fromisoformat("2026-05-23T09:00:00"),
+            datetime.fromisoformat("2026-05-23T10:00:00"),
+            source="planner_projection",
+        )
+        return await tool._arun(
+            operation="update",
+            scope="all",
+            keyword="meeting",
+            title="team meeting updated",
+        )
+
+    updated = asyncio.run(scenario())
+
+    assert updated["ok"] is False
+    assert updated["code"] == "needs_disambiguation"
+    assert updated["candidate_count"] == 2
+
+
+def test_schedule_editor_bulk_shifts_multiple_keyword_matches_when_allowed():
+    async def scenario():
+        tool = JarvisScheduleEditorTool()
+        first = calendar_adapter.add_event(
+            "reading block",
+            datetime.fromisoformat("2026-05-24T09:00:00"),
+            datetime.fromisoformat("2026-05-24T10:00:00"),
+            source="planner_projection",
+        )
+        second = calendar_adapter.add_event(
+            "reading block",
+            datetime.fromisoformat("2026-05-25T09:00:00"),
+            datetime.fromisoformat("2026-05-25T10:00:00"),
+            source="planner_projection",
+        )
+        updated = await tool._arun(
+            operation="update",
+            scope="all",
+            keyword="reading",
+            allow_multiple=True,
+            shift_minutes=60,
+        )
+        return updated, calendar_adapter.get_event(first.id), calendar_adapter.get_event(second.id)
+
+    updated, first, second = asyncio.run(scenario())
+
+    assert updated["ok"] is True
+    assert updated["bulk"] is True
+    assert updated["updated_count"] == 2
+    assert first is not None
+    assert second is not None
+    assert first.start.isoformat().startswith("2026-05-24T10:00")
+    assert first.end.isoformat().startswith("2026-05-24T11:00")
+    assert second.start.isoformat().startswith("2026-05-25T10:00")
+    assert second.end.isoformat().startswith("2026-05-25T11:00")
+
+
+def test_schedule_editor_delete_requires_disambiguation_for_multiple_matches_without_allow_multiple():
+    async def scenario():
+        tool = JarvisScheduleEditorTool()
+        first = calendar_adapter.add_event(
+            "meeting A",
+            datetime.fromisoformat("2026-05-26T09:00:00"),
+            datetime.fromisoformat("2026-05-26T10:00:00"),
+            source="planner_projection",
+        )
+        second = calendar_adapter.add_event(
+            "meeting B",
+            datetime.fromisoformat("2026-05-27T09:00:00"),
+            datetime.fromisoformat("2026-05-27T10:00:00"),
+            source="planner_projection",
+        )
+        deleted = await tool._arun(operation="delete", scope="all", keyword="meeting")
+        return deleted, calendar_adapter.get_event(first.id), calendar_adapter.get_event(second.id)
+
+    deleted, first, second = asyncio.run(scenario())
+
+    assert deleted["ok"] is False
+    assert deleted["code"] == "needs_disambiguation"
+    assert deleted["candidate_count"] == 2
+    assert first is not None
+    assert second is not None
+
+
+def test_schedule_editor_bulk_deletes_multiple_keyword_matches_when_allowed():
+    async def scenario():
+        tool = JarvisScheduleEditorTool()
+        first = calendar_adapter.add_event(
+            "reading block",
+            datetime.fromisoformat("2026-05-28T09:00:00"),
+            datetime.fromisoformat("2026-05-28T10:00:00"),
+            source="planner_projection",
+        )
+        second = calendar_adapter.add_event(
+            "reading block",
+            datetime.fromisoformat("2026-05-29T09:00:00"),
+            datetime.fromisoformat("2026-05-29T10:00:00"),
+            source="planner_projection",
+        )
+        other = calendar_adapter.add_event(
+            "coffee break",
+            datetime.fromisoformat("2026-05-29T11:00:00"),
+            datetime.fromisoformat("2026-05-29T11:30:00"),
+            source="planner_projection",
+        )
+        deleted = await tool._arun(operation="delete", scope="all", keyword="reading", allow_multiple=True)
+        return deleted, calendar_adapter.get_event(first.id), calendar_adapter.get_event(second.id), calendar_adapter.get_event(other.id)
+
+    deleted, first, second, other = asyncio.run(scenario())
+
+    assert deleted["ok"] is True
+    assert deleted["bulk"] is True
+    assert deleted["deleted_count"] == 2
+    assert first is None
+    assert second is None
+    assert other is not None
+
+
+def test_schedule_editor_deletes_matching_keyword_background_task_tree():
+    async def scenario():
+        tool = JarvisScheduleEditorTool()
+        task = await persistence.save_background_task(
+            task_id="task_python_bulk_delete",
+            title="Learn Python in two weeks",
+            task_type="long_term",
+            source_agent="maxwell",
+            original_user_request="learn python every day",
+            status="active",
+            goal="learn python",
+            time_horizon={},
+            milestones=[],
+            subtasks=[],
+            calendar_candidates=[],
+        )
+        await persistence.save_background_task_days(
+            task_id=task["id"],
+            daily_plan=[
+                {
+                    "date": "2026-05-04",
+                    "title": "Python day 1",
+                    "description": "practice basics",
+                    "start_time": "20:00",
+                    "end_time": "20:45",
+                    "estimated_minutes": 45,
+                    "status": "pending",
+                    "sort_order": 0,
+                }
+            ],
+        )
+        await persistence.save_jarvis_plan(
+            plan_id="plan_python_bulk_delete",
+            title="Python learning plan",
+            plan_type="long_term",
+            status="active",
+            source_agent="maxwell",
+            source_background_task_id=task["id"],
+            original_user_request="learn python every day",
+            goal="learn python",
+            days=[
+                {
+                    "id": "pland_python_bulk_delete_1",
+                    "plan_date": "2026-05-04",
+                    "title": "Python plan day 1",
+                    "description": "practice basics",
+                    "start_time": "21:00",
+                    "end_time": "21:45",
+                    "estimated_minutes": 45,
+                    "status": "pending",
+                    "sort_order": 0,
+                }
+            ],
+        )
+
+        queried = await tool._arun(operation="query", scope="all", keyword="python", limit=1000)
+        deleted = await tool._arun(operation="delete", scope="all", keyword="python", limit=1000)
+        tasks = await persistence.list_background_tasks(limit=1000)
+        task_days = await persistence.list_background_task_days(limit=1000)
+        plans = await persistence.list_jarvis_plans(limit=1000)
+        plan_days = await persistence.list_jarvis_plan_days(limit=1000)
+        calendar = await list_planner_calendar_items(
+            start=datetime.fromisoformat("2026-05-03T00:00:00"),
+            end=datetime.fromisoformat("2026-05-18T00:00:00"),
+        )
+        return queried, deleted, tasks, task_days, plans, plan_days, calendar
+
+    queried, deleted, tasks, task_days, plans, plan_days, calendar = asyncio.run(scenario())
+
+    assert queried["matched_count"] >= 4
+    assert len(queried["background_tasks"]) == 1
+    assert len(queried["plans"]) == 1
+    assert deleted["ok"] is True
+    assert deleted["matched_count"] >= 4
+    assert deleted["deleted_count"] == 1
+    assert all("python" not in str(item).lower() for item in tasks)
+    assert all("python" not in str(item).lower() for item in task_days)
+    assert all("python" not in str(item).lower() for item in plans)
+    assert all("python" not in str(item).lower() for item in plan_days)
+    assert all("python" not in str(item).lower() for item in calendar["items"])
+
+
+def test_schedule_editor_deletes_calendar_event_and_single_day_parent_plan_by_id():
+    async def scenario():
+        tool = JarvisScheduleEditorTool()
+        event = calendar_adapter.add_event(
+            "Wuxi friend visit",
+            datetime.fromisoformat("2026-05-04T03:00:00+00:00"),
+            datetime.fromisoformat("2026-05-04T01:30:00+00:00"),
+            location="Wuxi",
+            source="user_ui",
+            created_reason="manual calendar event",
+        )
+        await persistence.sync_plan_day_from_calendar_event(event.model_dump())
+
+        deleted = await tool._arun(operation="delete", event_ids=[event.id], limit=1000)
+        calendar = await list_planner_calendar_items(
+            start=datetime.fromisoformat("2026-05-04T00:00:00+00:00"),
+            end=datetime.fromisoformat("2026-05-05T00:00:00+00:00"),
+        )
+        plans = await persistence.list_jarvis_plans(limit=1000)
+        plan_days = await persistence.list_jarvis_plan_days(limit=1000)
+        return deleted, calendar_adapter.get_event(event.id), calendar, plans, plan_days
+
+    deleted, event, calendar, plans, plan_days = asyncio.run(scenario())
+
+    assert deleted["ok"] is True
+    assert deleted["deleted_count"] == 1
+    assert event is None
+    assert all("wuxi" not in str(item).lower() for item in calendar["items"])
+    assert all("wuxi" not in str(item).lower() for item in plans)
+    assert all("wuxi" not in str(item).lower() for item in plan_days)
+
+
+def test_calendar_delete_and_update_tools_execute_without_pending_confirmation():
+    async def scenario():
+        from app.core.dependencies import set_resource
+        from app.mcp.registry import ToolRegistry
+        from app.tools.jarvis_tools import JarvisCalendarDeleteTool, JarvisCalendarUpdateTool
+        from app.jarvis.tool_runtime import execute_tool_calls
+
+        delete_tool = JarvisCalendarDeleteTool()
+        update_tool = JarvisCalendarUpdateTool()
+        registry = ToolRegistry()
+        registry.register(delete_tool.to_tool_info(), delete_tool)
+        registry.register(update_tool.to_tool_info(), update_tool)
+        set_resource("tool_registry", registry)
+
+        event = calendar_adapter.add_event(
+            "legacy edit target",
+            datetime.fromisoformat("2026-05-21T09:00:00"),
+            datetime.fromisoformat("2026-05-21T10:00:00"),
+            source="planner_projection",
+        )
+        updated = await execute_tool_calls(
+            "maxwell",
+            [
+                {
+                    "tool_name": "jarvis_calendar_update",
+                    "arguments": {"event_id": event.id, "title": "updated target"},
+                }
+            ],
+        )
+        after_update = calendar_adapter.get_event(event.id)
+        deleted = await execute_tool_calls(
+            "maxwell",
+            [{"tool_name": "jarvis_calendar_delete", "arguments": {"event_id": event.id}}],
+        )
+        after_delete = calendar_adapter.get_event(event.id)
+        return updated, after_update, deleted, after_delete
+
+    updated, after_update, deleted, after_delete = asyncio.run(scenario())
+
+    assert updated[0]["success"] is True
+    assert updated[0]["requires_confirmation"] is False
+    assert updated[0]["output"]["ok"] is True
+    assert after_update is not None
+    assert after_update.title == "updated target"
+    assert deleted[0]["success"] is True
+    assert deleted[0]["requires_confirmation"] is False
+    assert deleted[0]["output"]["ok"] is True
+    assert after_delete is None

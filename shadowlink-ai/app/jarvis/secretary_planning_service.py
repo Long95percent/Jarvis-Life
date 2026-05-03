@@ -204,6 +204,8 @@ async def _run_reschedule(*, parsed: dict[str, Any], message: str, today: str, p
                 plan_day_id=updated.get("id"),
                 event="完成延期重排",
                 detail=f"{original.get('plan_date')} 调整到 {updated.get('plan_date')}；原因：{patch.get('reschedule_reason') or '用户请求秘书重排'}",
+                category="secretary_reschedule",
+                source="maxwell_skill",
             )
     changed_count = len(changed)
     calendar_events = []

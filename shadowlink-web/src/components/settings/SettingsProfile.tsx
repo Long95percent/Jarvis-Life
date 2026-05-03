@@ -108,13 +108,7 @@ export function SettingsProfile() {
   }, [savedAt])
 
   const saveProfile = async (nextProfile: UserProfile): Promise<UserProfile> => {
-    const res = await fetch('/api/v1/jarvis/profile', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(nextProfile),
-    })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const saved = await res.json()
+    const saved = await jarvisSettingsApi.updateProfile(nextProfile)
     const normalized = {
       ...EMPTY_PROFILE,
       ...saved,
@@ -159,23 +153,16 @@ export function SettingsProfile() {
           timezone_source: 'browser',
         }
         try {
-          const res = await fetch('/api/v1/jarvis/time/browser-location', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              lat,
-              lng,
-              browser_timezone: browserTimezone,
-              current_label: profile.location.label,
-            }),
+          const data = await jarvisSettingsApi.resolveBrowserLocation({
+            lat,
+            lng,
+            browser_timezone: browserTimezone,
+            current_label: profile.location.label,
           })
-          if (res.ok) {
-            const data = await res.json()
-            const { weather, label_error, ...location } = data
-            suggestedLocation = { ...suggestedLocation, ...location }
-            setWeatherPreview(weather ?? null)
-            setLocationHint(label_error ? `城市名解析失败：${label_error}` : null)
-          }
+          const { weather, label_error, ...location } = data
+          suggestedLocation = { ...suggestedLocation, ...location }
+          setWeatherPreview(weather ?? null)
+          setLocationHint(label_error ? `城市名解析失败：${label_error}` : null)
         } catch {
           // Keep the browser-derived fallback above.
           setLocationHint('城市名解析失败：网络或地理编码服务不可用')
@@ -211,13 +198,7 @@ export function SettingsProfile() {
     setCityResolving(true)
     setError(null)
     try {
-      const res = await fetch('/api/v1/jarvis/time/city-location', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ city_name: cityName, browser_timezone: browserTimezone }),
-      })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
+      const data = await jarvisSettingsApi.resolveCityLocation({ city_name: cityName, browser_timezone: browserTimezone })
       const { weather, ...location } = data
       setWeatherPreview(weather ?? null)
       await saveProfile({

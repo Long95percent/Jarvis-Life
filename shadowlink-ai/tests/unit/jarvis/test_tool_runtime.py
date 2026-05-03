@@ -23,6 +23,30 @@ def test_strip_tool_like_blocks_accepts_model_tool_calls_xml():
     }]
 
 
+def test_strip_tool_like_blocks_accepts_invoke_xml():
+    text = '''好的，我先安排更新。
+<invoke name="jarvis_schedule_editor">
+  <parameter name="operation">update</parameter>
+  <parameter name="scope">all</parameter>
+  <parameter name="keyword">reading</parameter>
+  <parameter name="shift_minutes">60</parameter>
+</invoke>'''
+
+    clean, calls = strip_tool_like_blocks(text)
+
+    assert "<invoke" not in clean
+    assert clean == "好的，我先安排更新。"
+    assert calls == [{
+        "tool_name": "jarvis_schedule_editor",
+        "arguments": {
+            "operation": "update",
+            "scope": "all",
+            "keyword": "reading",
+            "shift_minutes": "60",
+        },
+    }]
+
+
 def test_run_agent_turn_executes_model_tool_calls_xml(monkeypatch):
     import asyncio
 

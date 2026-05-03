@@ -171,6 +171,23 @@ def _plan_local_life(agent_id: str, text: str, now: datetime) -> AgentIntentDeci
 
 
 def _plan_maxwell(agent_id: str, text: str, now: datetime) -> AgentIntentDecision:
+    if _has_any(text, ["删除", "删掉", "移除", "清掉", "取消", "delete", "remove", "clear", "cancel"]) and _has_any(text, ["日程", "安排", "提醒", "事件", "calendar", "schedule", "event"]):
+        keyword = _extract_schedule_edit_keyword(text)
+        return _decision(
+            agent_id,
+            intent="calendar_bulk_delete",
+            tool_name="jarvis_schedule_editor",
+            confidence=0.86 if keyword else 0.72,
+            slots={
+                "operation": "delete",
+                "scope": "all",
+                "keyword": keyword,
+                "limit": 1000,
+            },
+            reason="calendar_bulk_delete_request",
+            missing_slots=[] if keyword else ["keyword"],
+        )
+
     if _has_any(text, ["一个月", "一周", "几周", "长期", "第一轮", "备考", "准备完", "项目", "计划"]) and _has_any(
         text,
         ["准备", "复习", "完成", "做完", "推进", "搞定"],
@@ -490,6 +507,25 @@ def _extract_calendar_title(text: str) -> str:
     title = re.sub(r"[，。！？,.!?]", " ", title)
     title = re.sub(r"\s+", " ", title).strip()
     return title or "待安排事项"
+
+
+def _extract_schedule_edit_keyword(text: str) -> str | None:
+    patterns = [
+        r"有关\s*([^，。！？,.!?\s]+)\s*的?(?:所有|全部)?(?:日程|安排|提醒|事件)",
+        r"(?:所有|全部)?\s*([^，。！？,.!?\s]+)\s*(?:相关|有关)\s*的?(?:日程|安排|提醒|事件)",
+        r"(?:删除|删掉|移除|清掉|取消)\s*(?:所有|全部)?\s*([^，。！？,.!?\s]+)\s*(?:日程|安排|提醒|事件)?",
+        r"(?:delete|remove|clear|cancel)\s+(?:all\s+)?([A-Za-z][A-Za-z0-9_+-]{1,})\s+(?:calendar|schedule|event)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            keyword = match.group(1).strip(" 的有关相关所有全部")
+            if keyword and keyword not in {"日程", "安排", "提醒", "事件"}:
+                return keyword
+    ascii_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_+-]{1,}", text)
+    if ascii_tokens:
+        return max(ascii_tokens, key=len)
+    return None
 
 
 def _extract_datetime(text: str, now: datetime) -> datetime | None:

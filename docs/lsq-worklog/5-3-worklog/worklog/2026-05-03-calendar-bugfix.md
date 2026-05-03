@@ -34,3 +34,31 @@
 - 已在 `CALENDAR_MODULE_INTERFACE_CONTRACT.md` 的 `Calendar Event Update Sync` 下补充前端接入注意事项。
 - 正式前端需要复用现有后端更新接口，保存后重新查询后端 calendar/planner items，不要只改本地状态。
 - 正式前端不要在打开日历时自动展示无关 pending actions，应放到显式确认入口。
+
+## 新增方案文档
+- 已创建：`docs/lsq-worklog/5-3/接收文件.md`
+- 该文档按“第 1 点”整理了邮件秘书、多智能体后台协调、数据库回写、主动消息和最小架构改造建议。
+
+## 追加说明：MCP / Skill / Tool 扩展闭环
+- 已在 `docs/lsq-worklog/5-3/接收文件.md` 增加“第二点：系统要具备可扩展 MCP / Skill / Tool / API 闭环”。
+- 重点说明了管理界面新增 tool / MCP / skill、权限分级、工具注册器、多智能体白名单、调用日志和写操作必须落后端模块。
+
+## 追加说明：第二点当前完成度盘点
+- 已在 `docs/lsq-worklog/5-3/接收文件.md` 增加“第二点当前完成度：已做到什么、还缺什么”。
+- 盘点了当前已有 MCP client/server/registry、`/v1/mcp/tools`、`/v1/mcp/tools/call`、agent tool whitelist 等基础能力。
+- 标注了缺口：UI 新增 tool/skill/MCP、运行时配置加载、权限校验、调用日志、后台多智能体协商任务等。
+
+## 新增方案文档：MCP 协议轻量接入
+- 已创建：`docs/lsq-worklog/5-3/MCP协议轻量接入方案.md`
+- 内容包括：目标、当前基础、最小闭环、MCP server 配置、权限分级、agent 白名单、生活安排样例、文件改动建议、最小实施计划和验收标准。
+- 方案原则：用成熟 MCP 框架，不重复造轮子；第一版只做能连接、能发现、能注册、能调用、能记录、能给智能体用于生活安排。
+
+## 追加索引：私聊引擎化设计
+- 已新增：`docs/lsq-worklog/5-3/worklog/2026-05-03-private-chat-engine-design.md`
+- 记录了“角色边界不变、引擎只做执行增强”的私聊升级方向。
+- 后续如果开始实现私聊引擎化，所有接口变化都要同步写入 `docs/解耦接口说明/private-chat-real-steps-interface.md`。
+
+## 新版 MCP 方案已覆盖
+- 已将 `docs/lsq-worklog/5-3/MCP协议轻量接入方案.md` 改成“闭环优先”版本。
+- 原先只强调接入 MCP / discover tools 的思路已弃用。
+- 新方案明确了外部结果 -> ActionProposal -> 业务写入 -> 投影刷新 -> 主动消息 的闭环。

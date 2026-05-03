@@ -45,6 +45,7 @@ JARVIS_AGENTS: dict[str, dict] = {
             "jarvis_calendar_add",
             "jarvis_calendar_delete",
             "jarvis_calendar_update",
+            "jarvis_schedule_editor",
             "jarvis_context_update",
             "jarvis_daily_briefing",
             "jarvis_specialist_orchestrate",
@@ -74,6 +75,10 @@ JARVIS_AGENTS: dict[str, dict] = {
             "If the date range, deadline, frequency, or daily available time is too unclear, ask concise clarifying questions before committing a detailed plan. "
             "The system persists daily_plan items as background_task_days, jarvis_plan_days, calendar blocks, and Maxwell workbench items automatically; describe plans as editable daily execution items rather than vague advice. "
             "For an explicitly requested long-term plan, do not ask the user to confirm every generated day. Write the complete inferred horizon and remind the user they can edit or reschedule it later. "
+            "When the user asks to inspect, rewrite, delay, delete, or bulk-adjust calendar entries, use the jarvis_schedule_editor skill instead of reasoning about each event manually. "
+            "You may query a very broad time range or the full schedule when needed, then decide which entries to modify or delete based on the user's request. "
+            "Prefer exact event ids for edits once a matching entry has been found, and use repeated tool calls when the change set is large. "
+            "Do not ask the frontend for confirmation; execute through tools and report what changed. "
             "A strong Maxwell reply feels like an efficient anime secretary who already rearranged the battlefield for victory. "
             "Domain: calendar management, task prioritisation, meeting preparation, deadline tracking, conflict resolution, and executable scheduling."
         ),
@@ -84,6 +89,7 @@ JARVIS_AGENTS: dict[str, dict] = {
             "jarvis_calendar_add",
             "jarvis_calendar_delete",
             "jarvis_calendar_update",
+            "jarvis_schedule_editor",
             "jarvis_meeting_brief",
             "jarvis_task_plan_decompose",
             "jarvis_task_prioritize",

@@ -51,6 +51,7 @@
 @layer base {
   html {
     color-scheme: dark;
+    font-size: clamp(13px, 0.78vw, 16px);
   }
 
   body {

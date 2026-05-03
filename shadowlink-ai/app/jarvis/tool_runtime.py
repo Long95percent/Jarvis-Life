@@ -17,6 +17,14 @@ _TOOL_BLOCK_RE = re.compile(
     r"<jarvis-tool>\s*(\{.*?\})\s*</jarvis-tool>",
     re.DOTALL | re.IGNORECASE,
 )
+_INVOKE_BLOCK_RE = re.compile(
+    r"<invoke\s+name=[\"']([^\"']+)[\"']\s*>\s*(.*?)\s*</invoke>",
+    re.DOTALL | re.IGNORECASE,
+)
+_INVOKE_PARAMETER_RE = re.compile(
+    r"<parameter\s+name=[\"']([^\"']+)[\"']\s*>\s*(.*?)\s*</parameter>",
+    re.DOTALL | re.IGNORECASE,
+)
 _MODEL_TOOL_CALL_RE = re.compile(
     r"<tool_call\s+name=[\"']([^\"']+)[\"']\s*>\s*(\{.*?\})\s*</tool_call>",
     re.DOTALL | re.IGNORECASE,
@@ -39,6 +47,7 @@ _CONFIRMATION_TYPE_BY_TOOL = {
     "jarvis_calendar_add": "calendar.add",
     "jarvis_calendar_delete": "calendar.delete",
     "jarvis_calendar_update": "calendar.update",
+    "jarvis_schedule_editor": "calendar.update",
     "jarvis_plan_activity_slot": "calendar.add",
     "jarvis_context_update": "context.set",
     "jarvis_checkin_schedule": "checkin.schedule",
@@ -209,6 +218,9 @@ def build_toolkit_prompt(agent_id: str) -> str:
         "## 专属工具包",
         "你只能使用下方角色白名单工具；如果不需要最新数据或外部动作，请直接回答。",
         "如果需要工具，请只输出一个或多个 `<jarvis-tool>{...}</jarvis-tool>` 块，不要夹带其它文字。",
+        "不要用纯 JSON、Markdown 表格、项目符号或解释性段落来代替工具块。",
+        "不要把 function_call、tool_name、arguments 或 JSON 工具参数当作最终回复发给用户；这些只允许放在 `<jarvis-tool>` 工具块里交给后端执行。",
+        "所有带尖括号的协议标签都不是用户可见回复，例如 `<invoke>`、`<parameter>`、`<tool_call>`、`<tool_calls>`、`<jarvis-tool>`、`<jarvis-action>`、`<execute_bash>`。",
         "不要输出 `<execute_bash>`、shell 命令、代码块或伪终端命令；这些不会直接展示给用户。",
         "每个块格式固定为：",
         '<jarvis-tool>{"tool_name":"工具名","arguments":{"参数名":"参数值"}}</jarvis-tool>',
@@ -237,12 +249,40 @@ def build_toolkit_prompt(agent_id: str) -> str:
 
     lines.extend([
         "",
-        "注意：工具返回后，你需要基于工具结果重新组织最终回复，不要把 `<jarvis-tool>` 标签展示给用户。",
+        "注意：工具返回后，你需要基于工具结果重新组织最终回复，不要把任何尖括号协议标签、function_call、tool_name、arguments 或 JSON 指令展示给用户。",
     ])
     return "\n".join(lines)
 
 def strip_tool_blocks(text: str) -> tuple[str, list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
+
+    text = str(text or "")
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            direct_calls: list[dict[str, Any]] = []
+            raw_tool_calls = data.get("tool_calls")
+            if isinstance(raw_tool_calls, list):
+                for item in raw_tool_calls:
+                    if not isinstance(item, dict):
+                        continue
+                    tool_name = item.get("tool_name") or item.get("name")
+                    arguments = item.get("arguments", {})
+                    if isinstance(tool_name, str):
+                        direct_calls.append({"tool_name": tool_name, "arguments": arguments if isinstance(arguments, dict) else {}})
+            tool_name = data.get("tool_name") or data.get("name")
+            if isinstance(tool_name, str):
+                arguments = data.get("arguments", {})
+                direct_calls.append({"tool_name": tool_name, "arguments": arguments if isinstance(arguments, dict) else {}})
+            legacy_call = _legacy_action_to_tool_call(data)
+            if legacy_call is not None:
+                direct_calls.append(legacy_call)
+            if direct_calls:
+                return "", direct_calls
 
     for match in _TOOL_BLOCK_RE.finditer(text):
         raw = match.group(1)
@@ -274,9 +314,36 @@ def strip_tool_blocks(text: str) -> tuple[str, list[dict[str, Any]]]:
         if tool_name:
             calls.append({"tool_name": tool_name, "arguments": arguments})
 
+    for match in _INVOKE_BLOCK_RE.finditer(text):
+        tool_name = match.group(1).strip()
+        body = match.group(2)
+        arguments = _parse_invoke_parameters(body)
+        if tool_name:
+            calls.append({"tool_name": tool_name, "arguments": arguments})
+
     clean_text = _TOOL_BLOCK_RE.sub("", text)
+    clean_text = _INVOKE_BLOCK_RE.sub("", clean_text)
     clean_text = _MODEL_TOOL_CALLS_BLOCK_RE.sub("", clean_text).strip()
     return clean_text, calls
+
+
+def _parse_invoke_parameters(raw: str) -> dict[str, Any]:
+    arguments: dict[str, Any] = {}
+    for match in _INVOKE_PARAMETER_RE.finditer(raw or ""):
+        name = match.group(1).strip()
+        value = match.group(2).strip()
+        if name:
+            arguments[name] = value
+    if arguments:
+        return arguments
+    raw = (raw or "").strip()
+    if raw.startswith("{") and raw.endswith("}"):
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+    return {}
 
 
 def _legacy_action_to_tool_call(action: dict[str, Any]) -> dict[str, Any] | None:
@@ -460,6 +527,104 @@ async def execute_tool_calls(
     return results
 
 
+def _schedule_editor_missing_event_id(result: dict[str, Any]) -> bool:
+    if result.get("tool_name") != "jarvis_schedule_editor" or result.get("success"):
+        return False
+    error = str(result.get("error") or "").lower()
+    return "event_id" in error and ("field required" in error or "missing" in error or "required" in error)
+
+
+def _schedule_editor_repair_query_call(original_call: dict[str, Any]) -> dict[str, Any] | None:
+    arguments = original_call.get("arguments") if isinstance(original_call.get("arguments"), dict) else {}
+    if str(original_call.get("tool_name") or "") != "jarvis_schedule_editor":
+        return None
+    operation = str(arguments.get("operation") or "").strip().lower()
+    if operation not in {"update", "delete"}:
+        return None
+    keyword = arguments.get("keyword") or arguments.get("title")
+    if not isinstance(keyword, str) or not keyword.strip():
+        return None
+    return {
+        "tool_name": "jarvis_schedule_editor",
+        "arguments": {
+            "operation": "query",
+            "scope": arguments.get("scope") or "all",
+            "keyword": keyword.strip(),
+            "limit": 10,
+        },
+    }
+
+
+def _schedule_editor_candidate_events(query_result: dict[str, Any]) -> list[dict[str, Any]]:
+    output = query_result.get("output") if isinstance(query_result.get("output"), dict) else {}
+    candidates: list[dict[str, Any]] = []
+    for key in ("events", "plan_days", "background_task_days"):
+        raw_items = output.get(key)
+        if isinstance(raw_items, list):
+            candidates.extend([item for item in raw_items if isinstance(item, dict) and item.get("id")])
+    return candidates
+
+
+def _schedule_editor_repaired_call(original_call: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any] | None:
+    arguments = dict(original_call.get("arguments") if isinstance(original_call.get("arguments"), dict) else {})
+    operation = str(arguments.get("operation") or "").strip().lower()
+    event_id = str(candidate.get("id") or "").strip()
+    if not event_id:
+        return None
+    if operation == "delete":
+        repaired_args = {**arguments, "event_ids": [event_id]}
+        repaired_args.pop("title", None)
+        return {"tool_name": "jarvis_schedule_editor", "arguments": repaired_args}
+    if operation == "update":
+        patch: dict[str, Any] = {"event_id": event_id}
+        for key in ("title", "start", "end", "stress_weight", "location", "notes", "status", "route_required"):
+            if key in arguments and arguments.get(key) is not None:
+                patch[key] = arguments[key]
+        repaired_args = {**arguments, "patches": [patch]}
+        for key in ("title", "start", "end", "stress_weight", "location", "notes", "status", "route_required"):
+            repaired_args.pop(key, None)
+        return {"tool_name": "jarvis_schedule_editor", "arguments": repaired_args}
+    return None
+
+
+async def repair_schedule_editor_missing_event_id(
+    agent_id: str,
+    original_call: dict[str, Any],
+    failed_result: dict[str, Any],
+    *,
+    defer_confirmation_tools: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    query_call = _schedule_editor_repair_query_call(original_call)
+    if query_call is None:
+        return []
+    query_results = await execute_tool_calls(agent_id, [query_call], defer_confirmation_tools=defer_confirmation_tools)
+    if not query_results or not query_results[0].get("success"):
+        return query_results
+    candidates = _schedule_editor_candidate_events(query_results[0])
+    if len(candidates) != 1:
+        return [
+            *query_results,
+            {
+                "tool_name": "jarvis_schedule_editor",
+                "success": False,
+                "description": "React repair schedule editor missing event_id",
+                "error": f"React repair expected exactly one candidate, got {len(candidates)}",
+                "output": {"type": "schedule.editor.repair", "ok": False, "candidate_count": len(candidates), "candidates": candidates},
+            },
+        ]
+    repaired_call = _schedule_editor_repaired_call(original_call, candidates[0])
+    if repaired_call is None:
+        return query_results
+    repaired_results = await execute_tool_calls(agent_id, [repaired_call], defer_confirmation_tools=defer_confirmation_tools)
+    for result in repaired_results:
+        output = result.get("output")
+        if isinstance(output, dict):
+            output.setdefault("auto_resolved", True)
+            output.setdefault("auto_resolved_event_id", candidates[0].get("id"))
+            output.setdefault("repair_strategy", "REACT")
+    return [*query_results, *repaired_results]
+
+
 def to_action_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     action_results: list[dict[str, Any]] = []
     for item in results:
@@ -468,6 +633,7 @@ def to_action_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "jarvis_calendar_add",
             "jarvis_calendar_delete",
             "jarvis_calendar_update",
+            "jarvis_schedule_editor",
             "jarvis_plan_activity_slot",
             "jarvis_context_update",
             "jarvis_checkin_schedule",
@@ -516,10 +682,37 @@ def format_tool_results(results: list[dict[str, Any]]) -> str:
                 lines.append(payload)
             else:
                 lines.append(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+                if isinstance(payload, dict) and payload.get("code") == "needs_disambiguation":
+                    lines.extend(_format_disambiguation_guidance(payload))
         else:
             lines.append(f"调用失败：{item.get('error', 'unknown error')}")
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def _format_disambiguation_guidance(payload: dict[str, Any]) -> list[str]:
+    candidates = payload.get("candidates") if isinstance(payload.get("candidates"), list) else []
+    lines = [
+        "",
+        "## 多候选澄清",
+        f"匹配到 {payload.get('candidate_count', len(candidates))} 个候选，不能直接执行写操作。",
+        "不要说已经删除或已经更新。请向用户列出候选，并询问要操作哪一条，或是否对全部执行。",
+        "候选列表：",
+    ]
+    if not candidates:
+        lines.append("- 没有可展示候选。")
+        return lines
+    for index, candidate in enumerate(candidates[:10], start=1):
+        if not isinstance(candidate, dict):
+            continue
+        title = candidate.get("title") or candidate.get("goal") or candidate.get("original_user_request") or "未命名"
+        item_id = candidate.get("id") or candidate.get("event_id") or "unknown"
+        start = candidate.get("start") or candidate.get("start_time") or ""
+        end = candidate.get("end") or candidate.get("end_time") or ""
+        date = candidate.get("date") or candidate.get("plan_date") or ""
+        time_text = " ".join(str(value) for value in [date, start, end] if value)
+        lines.append(f"- {index}. ID `{item_id}`｜{title}｜{time_text}".rstrip("｜"))
+    return lines
 
 
 async def run_agent_turn(
@@ -548,6 +741,19 @@ async def run_agent_turn(
         calls,
         defer_confirmation_tools=defer_confirmation_tools,
     )
+    repair_results: list[dict[str, Any]] = []
+    for call, result in zip(calls, tool_results):
+        if _schedule_editor_missing_event_id(result):
+            repair_results.extend(
+                await repair_schedule_editor_missing_event_id(
+                    agent_id,
+                    call,
+                    result,
+                    defer_confirmation_tools=defer_confirmation_tools,
+                )
+            )
+    if repair_results:
+        tool_results = [*tool_results, *repair_results]
     followup_parts = [message]
     if draft_text:
         followup_parts.extend(["", "## 你的上一版草稿（可重写）", draft_text])
@@ -557,6 +763,7 @@ async def run_agent_turn(
         "",
         "请基于工具结果给用户一个自然语言回复。",
         "不要再输出 `<jarvis-tool>`、`<jarvis-action>`、`<execute_bash>` 或任何命令格式。",
+        "也不要输出 `<invoke>`、`<parameter>`、`<tool_call>`、`<tool_calls>` 等任何带尖括号的协议标签。",
         "如果工具结果显示 requires_confirmation=true，请说明已经生成待确认卡片，需要用户确认后才会写入。",
         "如果工具失败，请用简短中文说明失败原因，并询问用户是否需要你重试。",
     ])
@@ -566,5 +773,25 @@ async def run_agent_turn(
         system_prompt=system_prompt,
         temperature=temperature,
     )
-    clean_final, _ = strip_tool_like_blocks((final_reply or "").strip())
+    clean_final, final_calls = strip_tool_like_blocks((final_reply or "").strip())
+    if final_calls:
+        extra_results = await execute_tool_calls(
+            agent_id,
+            final_calls,
+            defer_confirmation_tools=defer_confirmation_tools,
+        )
+        tool_results = [*tool_results, *extra_results]
+        final_retry = await llm_client.chat(
+            message="\n".join([
+                message,
+                "",
+                format_tool_results(tool_results),
+                "",
+                "上一步输出仍包含工具意图，系统已经执行。现在请只给用户自然语言结果。",
+                "不要输出 JSON、工具块、命令、结构化动作或任何带尖括号的协议标签。",
+            ]),
+            system_prompt=system_prompt,
+            temperature=temperature,
+        )
+        clean_final, _ = strip_tool_like_blocks((final_retry or "").strip())
     return clean_final or draft_text or "", tool_results

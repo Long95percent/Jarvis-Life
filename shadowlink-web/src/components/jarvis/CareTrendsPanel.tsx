@@ -145,19 +145,19 @@ export const CareTrendsPanel: React.FC<Props> = ({
 
   if (variant === "compact") {
     return (
-      <section className="rounded-[28px] border border-emerald-100 bg-[linear-gradient(180deg,#ffffff,rgba(240,253,250,0.92))] p-5 shadow-sm shadow-emerald-100/70">
+      <section className="rounded-[20px] border border-emerald-100 bg-[linear-gradient(180deg,#ffffff,rgba(240,253,250,0.92))] p-3 shadow-sm shadow-emerald-100/70">
         <div className="flex items-start justify-between gap-3">
           <div className="flex items-center gap-2">
-            <span className="text-2xl">💗</span>
+            <span className="text-xl">💗</span>
             <div>
-              <h3 className="text-base font-semibold text-slate-800">心理中心</h3>
-              <p className="mt-1 text-xs text-slate-400">
+              <h3 className="text-[0.92rem] font-semibold text-slate-800">心理中心</h3>
+              <p className="mt-0.5 text-[10px] text-slate-400">
                 今日状态与最近关怀
               </p>
             </div>
           </div>
           <span
-            className={`rounded-full px-2.5 py-1 text-xs font-medium ${
+            className={`rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
               compactStatus === "正常"
                 ? "bg-emerald-100 text-emerald-700"
                 : "bg-amber-100 text-amber-700"
@@ -168,12 +168,12 @@ export const CareTrendsPanel: React.FC<Props> = ({
         </div>
 
         {error ? (
-          <div className="mt-4 rounded-2xl bg-red-50 px-3 py-2 text-xs text-red-700">
+          <div className="mt-2.5 rounded-xl bg-red-50 px-2.5 py-1.5 text-[10px] text-red-700">
             {error}
           </div>
         ) : null}
 
-        <div className="mt-4 grid grid-cols-3 gap-3">
+        <div className="mt-2.5 grid grid-cols-3 gap-1.5">
           {[
             {
               label: "心情",
@@ -191,38 +191,38 @@ export const CareTrendsPanel: React.FC<Props> = ({
               tone: "bg-sky-50 text-sky-700",
             },
           ].map((item) => (
-            <div key={item.label} className={`rounded-2xl p-3 ${item.tone}`}>
-              <div className="text-[11px] opacity-70">{item.label}</div>
-              <div className="mt-1 text-[1.7rem] font-semibold leading-none">
+            <div key={item.label} className={`rounded-lg p-1.5 ${item.tone}`}>
+              <div className="text-[10px] opacity-70">{item.label}</div>
+              <div className="mt-0.5 text-[1rem] font-semibold leading-none">
                 {item.value}
               </div>
             </div>
           ))}
         </div>
 
-        <div className="mt-4 rounded-2xl border border-emerald-100 bg-emerald-50/60 p-4 text-sm text-emerald-950">
-          <div className="mb-2 font-semibold">最近关怀</div>
+        <div className="mt-2.5 rounded-lg border border-emerald-100 bg-emerald-50/60 p-2.5 text-[11px] text-emerald-950">
+          <div className="mb-1 font-semibold">最近关怀</div>
           {careMessages.length > 0 ? (
             <div className="space-y-2">
               {careMessages.slice(0, 1).map((message) => (
-                <div key={message.id} className="leading-7">
+                <div key={message.id} className="line-clamp-2 break-words leading-4.5">
                   • {message.content}
                 </div>
               ))}
             </div>
           ) : (
-            <div className="text-sm text-emerald-700/75">
+            <div className="text-[10px] text-emerald-700/75">
               当前还没有新的关怀提醒，继续保持现在的节奏就很好。
             </div>
           )}
         </div>
 
-        <div className="mt-4 flex items-center justify-center">
+        <div className="mt-2.5 flex items-center justify-center">
           {onOpenDetails ? (
             <button
               type="button"
               onClick={onOpenDetails}
-              className="flex w-full items-center justify-center rounded-2xl border border-indigo-100 bg-indigo-50 px-4 py-3 text-sm font-medium text-indigo-700 transition hover:bg-indigo-100"
+              className="flex w-full items-center justify-center rounded-lg border border-indigo-100 bg-indigo-50 px-2.5 py-1.5 text-[11px] font-medium text-indigo-700 transition hover:bg-indigo-100"
             >
               查看详情
             </button>
@@ -233,11 +233,11 @@ export const CareTrendsPanel: React.FC<Props> = ({
   }
 
   return (
-    <section className="rounded-2xl border border-emerald-100 bg-white p-4 shadow-sm">
+    <section className="rounded-xl border border-emerald-100 bg-white p-3 shadow-sm">
       <div className="flex items-start justify-between gap-2">
         <div>
-          <h3 className="text-sm font-semibold text-gray-800">心理中心</h3>
-          <p className="mt-0.5 text-[11px] text-gray-500">今日状态、趋势、关怀提醒和来源解释</p>
+          <h3 className="text-[0.92rem] font-semibold text-gray-800">心理中心</h3>
+          <p className="mt-0.5 text-[10px] text-gray-500">今日状态、趋势、关怀提醒和来源解释</p>
         </div>
         <select value={range} onChange={(event) => setRange(event.target.value as TrendRange)} className="rounded-lg border border-emerald-100 bg-emerald-50 px-2 py-1 text-xs text-emerald-800">
           <option value="week">本周</option>
@@ -248,15 +248,15 @@ export const CareTrendsPanel: React.FC<Props> = ({
 
       <div className="mt-3 flex flex-wrap gap-1.5">
         {METRICS.map((item) => (
-          <button key={item.key} type="button" onClick={() => setMetric(item.key)} className={`rounded-full px-2 py-1 text-[11px] ${metric === item.key ? item.bg : "bg-gray-100 text-gray-600"}`}>{item.label}</button>
+          <button key={item.key} type="button" onClick={() => setMetric(item.key)} className={`rounded-full px-1.5 py-0.5 text-[10px] ${metric === item.key ? item.bg : "bg-gray-100 text-gray-600"}`}>{item.label}</button>
         ))}
       </div>
 
       {latest ? (
-        <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
-          <div className="rounded-xl bg-emerald-50 p-2 text-emerald-800"><div className="text-[11px] opacity-70">心情</div><div className="text-lg font-semibold">{scoreText(latest.mood_score)}</div></div>
-          <div className="rounded-xl bg-amber-50 p-2 text-amber-800"><div className="text-[11px] opacity-70">压力</div><div className="text-lg font-semibold">{scoreText(latest.stress_score)}</div></div>
-          <div className="rounded-xl bg-sky-50 p-2 text-sky-800"><div className="text-[11px] opacity-70">能量</div><div className="text-lg font-semibold">{scoreText(latest.energy_score)}</div></div>
+        <div className="mt-2.5 grid grid-cols-3 gap-1.5 text-xs">
+          <div className="rounded-xl bg-emerald-50 p-2 text-emerald-800"><div className="text-[10px] opacity-70">心情</div><div className="text-[0.95rem] font-semibold">{scoreText(latest.mood_score)}</div></div>
+          <div className="rounded-xl bg-amber-50 p-2 text-amber-800"><div className="text-[10px] opacity-70">压力</div><div className="text-[0.95rem] font-semibold">{scoreText(latest.stress_score)}</div></div>
+          <div className="rounded-xl bg-sky-50 p-2 text-sky-800"><div className="text-[10px] opacity-70">能量</div><div className="text-[0.95rem] font-semibold">{scoreText(latest.energy_score)}</div></div>
         </div>
       ) : <div className="mt-3 rounded-xl bg-gray-50 p-3 text-xs text-gray-500">今天还没有足够信号，正常聊天或完成计划后会自动形成状态。</div>}
 
@@ -287,7 +287,7 @@ export const CareTrendsPanel: React.FC<Props> = ({
           })}
         </div>
       ) : (
-        <div className="mt-3 flex h-28 items-end gap-1 overflow-x-auto rounded-xl border border-gray-100 bg-gray-50 px-2 py-2">
+        <div className="mt-2.5 flex h-24 items-end gap-1 overflow-x-auto rounded-lg border border-gray-100 bg-gray-50 px-1.5 py-1.5">
           {(data?.series ?? []).map((item) => {
             const active = item.date === selectedDate;
             const value = scoreValue(item, metric);
@@ -300,10 +300,10 @@ export const CareTrendsPanel: React.FC<Props> = ({
           })}
         </div>
       )}
-      <div className="mt-1 text-[11px] text-gray-500">当前指标：{selectedMetric.label}；点击日期查看来源解释。</div>
+      <div className="mt-1 text-[10px] text-gray-500">当前指标：{selectedMetric.label}；点击日期查看来源解释。</div>
 
       {selectedDetail ? (
-        <div className="mt-3 max-h-56 overflow-y-auto rounded-xl border border-gray-100 bg-gray-50 p-3 text-xs text-gray-700">
+        <div className="mt-3 max-h-48 overflow-y-auto rounded-lg border border-gray-100 bg-gray-50 p-2.5 text-[11px] text-gray-700">
           <div className="flex items-center justify-between">
             <div className="font-semibold text-gray-800">{dayLabel(selectedDetail.snapshot.date)} 来源解释</div>
             <div className="text-gray-500">{selectedMetric.label} {scoreText(scoreValue(selectedDetail.snapshot, metric))}</div>
@@ -312,10 +312,10 @@ export const CareTrendsPanel: React.FC<Props> = ({
             {(selectedDetail.explanations.length ? selectedDetail.explanations : [selectedDetail.snapshot.summary || "暂无解释数据。"]).slice(0, 6).map((item, index) => <div key={index}>• {item}</div>)}
           </div>
           {detailLoading ? <div className="mt-2 text-[11px] text-gray-400">正在刷新当天解释...</div> : null}
-          {selectedDetail.stress_signals.length > 0 ? <div className="mt-2 text-[11px] text-gray-500">压力信号：{selectedDetail.stress_signals.map((item) => item.signal_type).join("、")}</div> : null}
-          {selectedDetail.behavior_observations.length > 0 ? <div className="mt-1 text-[11px] text-gray-500">行为信号：{selectedDetail.behavior_observations.slice(0, 5).map((item) => item.observation_type).join("、")}</div> : null}
-          {selectedDetail.emotion_observations?.length > 0 ? <div className="mt-1 text-[11px] text-gray-500">情绪证据：{selectedDetail.emotion_observations.slice(0, 5).map((item) => item.primary_emotion).join("、")}</div> : null}
-          {selectedDetail.care_triggers?.length > 0 ? <div className="mt-1 text-[11px] text-gray-500">关怀触发：{selectedDetail.care_triggers.slice(0, 5).map((item) => `${item.trigger_type}/${item.severity}`).join("、")}</div> : null}
+          {selectedDetail.stress_signals.length > 0 ? <div className="mt-2 text-[10px] text-gray-500">压力信号：{selectedDetail.stress_signals.map((item) => item.signal_type).join("、")}</div> : null}
+          {selectedDetail.behavior_observations.length > 0 ? <div className="mt-1 text-[10px] text-gray-500">行为信号：{selectedDetail.behavior_observations.slice(0, 5).map((item) => item.observation_type).join("、")}</div> : null}
+          {selectedDetail.emotion_observations?.length > 0 ? <div className="mt-1 text-[10px] text-gray-500">情绪证据：{selectedDetail.emotion_observations.slice(0, 5).map((item) => item.primary_emotion).join("、")}</div> : null}
+          {selectedDetail.care_triggers?.length > 0 ? <div className="mt-1 text-[10px] text-gray-500">关怀触发：{selectedDetail.care_triggers.slice(0, 5).map((item) => `${item.trigger_type}/${item.severity}`).join("、")}</div> : null}
           {selectedDetail.positive_events?.length > 0 ? <div className="mt-1 text-[11px] text-emerald-700">正向事件：{selectedDetail.positive_events.slice(0, 3).join("、")}</div> : null}
           {selectedDetail.negative_events?.length > 0 ? <div className="mt-1 text-[11px] text-amber-700">负向事件：{selectedDetail.negative_events.slice(0, 3).join("、")}</div> : null}
           {selectedDetail.snapshot.risk_flags.length > 0 ? <div className="mt-2 flex flex-wrap gap-1">{selectedDetail.snapshot.risk_flags.slice(0, 8).map((flag) => <span key={flag} className="rounded-full bg-white px-2 py-0.5 text-[11px] text-gray-600">{flag}</span>)}</div> : null}

@@ -17,6 +17,8 @@ ACTIVE_SOURCE_AGENTS = {"user", "user_chat", "user_ui"}
 ACTIVE_WINDOW_MINUTES = 120
 QUIET_START = time(0, 0)
 QUIET_END = time(6, 30)
+MAINTENANCE_START = time(1, 0)
+MAINTENANCE_END = time(2, 0)
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,11 @@ class RoutineRule:
 def _is_quiet_hour(now: datetime) -> bool:
     current = now.time()
     return QUIET_START <= current < QUIET_END
+
+
+def _is_maintenance_window(now: datetime) -> bool:
+    current = now.time()
+    return MAINTENANCE_START <= current < MAINTENANCE_END
 
 
 def _is_user_recently_active(ctx: LifeContext, now_utc: datetime) -> bool:
@@ -170,7 +177,24 @@ class ProactiveRoutineScheduler:
         now_utc = (now_utc or now or datetime.utcnow()).replace(tzinfo=None)
         local_now = (now or (now_utc + timedelta(hours=8))).replace(tzinfo=None)
         maintenance_created: list[dict] = []
-        if local_now.time() >= time(1, 0):
+        if _is_maintenance_window(local_now):
+            from app.core.dependencies import get_resource
+            from app.jarvis.mood_snapshot_maintenance import ensure_mood_snapshots
+            from app.jarvis.planner_maintenance import run_planner_daily_maintenance_once
+
+            mood_maintenance = await ensure_mood_snapshots(today=local_now.date().isoformat(), backfill_days=3, include_today=True)
+            if not mood_maintenance.get("skipped"):
+                maintenance_created.append({"routine_id": "mood_snapshot_maintenance", "result": mood_maintenance})
+
+            maintenance = await run_planner_daily_maintenance_once(
+                today=local_now.date().isoformat(),
+                llm_client=get_resource("llm_client"),
+                auto_reschedule=True,
+                push_today=True,
+            )
+            if not maintenance.get("skipped"):
+                maintenance_created.append({"routine_id": "planner_daily_maintenance", "result": maintenance})
+        elif local_now.time() > MAINTENANCE_END:
             from app.core.dependencies import get_resource
             from app.jarvis.mood_snapshot_maintenance import ensure_mood_snapshots
             from app.jarvis.planner_maintenance import run_planner_daily_maintenance_once

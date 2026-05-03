@@ -27,8 +27,19 @@ from app.mcp.adapters.calendar_adapter import (
     add_event,
     compute_schedule_density,
     delete_event,
+    get_events_between,
     get_upcoming_events,
     update_event,
+)
+from app.jarvis.persistence import (
+    hard_delete_background_task_day,
+    hard_delete_background_task,
+    hard_delete_jarvis_plan_day,
+    hard_delete_jarvis_plan,
+    list_background_task_days,
+    list_background_tasks,
+    list_jarvis_plan_days,
+    list_jarvis_plans,
 )
 from app.mcp.adapters.news_adapter import fetch_news
 from app.mcp.adapters.weather_adapter import get_current_weather
@@ -929,7 +940,7 @@ class JarvisCalendarDeleteTool(ShadowLinkTool):
     description: str = "Delete a calendar event by id and refresh life context schedule density."
     args_schema: type[BaseModel] = JarvisCalendarDeleteInput
     category: ToolCategory = ToolCategory.SYSTEM
-    requires_confirmation: bool = True
+    requires_confirmation: bool = False
 
     def _run(self, event_id: str) -> dict:
         raise NotImplementedError("Use async version")
@@ -974,7 +985,7 @@ class JarvisCalendarUpdateTool(ShadowLinkTool):
     description: str = "Update an existing calendar event and refresh life context schedule density."
     args_schema: type[BaseModel] = JarvisCalendarUpdateInput
     category: ToolCategory = ToolCategory.SYSTEM
-    requires_confirmation: bool = True
+    requires_confirmation: bool = False
 
     def _run(
         self,
@@ -1050,6 +1061,395 @@ class JarvisCalendarUpdateTool(ShadowLinkTool):
             "start": event.start.isoformat(),
             "end": event.end.isoformat(),
             "new_schedule_density": density,
+        }
+
+
+class JarvisScheduleEditorPatch(BaseModel):
+    event_id: str = Field(description="Existing calendar event id to edit")
+    title: str | None = Field(default=None, description="Optional new title")
+    start: str | None = Field(default=None, description="Optional new start time in ISO8601 format")
+    end: str | None = Field(default=None, description="Optional new end time in ISO8601 format")
+    stress_weight: float | None = Field(default=None, description="Optional stress weight")
+    location: str | None = Field(default=None, description="Optional location")
+    notes: str | None = Field(default=None, description="Optional notes")
+    status: str | None = Field(default=None, description="Optional status")
+    route_required: bool | None = Field(default=None, description="Whether route planning may be needed")
+
+
+class JarvisScheduleEditorInput(BaseModel):
+    operation: str = Field(description="query, update, delete")
+    scope: str = Field(default="upcoming", description="upcoming, range, all")
+    hours_ahead: int = Field(default=720, ge=1, le=8760, description="Query horizon for upcoming scope")
+    start: str | None = Field(default=None, description="Range start in ISO8601 format; for update without patches, also used as the new event start")
+    end: str | None = Field(default=None, description="Range end in ISO8601 format; for update without patches, also used as the new event end")
+    keyword: str | None = Field(default=None, description="Optional title/location/notes keyword filter")
+    status: str | None = Field(default=None, description="Optional status filter")
+    limit: int = Field(default=200, ge=1, le=1000, description="Maximum returned query rows")
+    event_ids: list[str] = Field(default_factory=list, description="Event ids to delete or query exactly")
+    patches: list[JarvisScheduleEditorPatch] = Field(default_factory=list, description="Event patches for update")
+    title: str | None = Field(default=None, description="Convenience update title when a unique keyword match can be resolved")
+    stress_weight: float | None = Field(default=None, description="Convenience update stress weight")
+    location: str | None = Field(default=None, description="Convenience update location")
+    notes: str | None = Field(default=None, description="Convenience update notes")
+    route_required: bool | None = Field(default=None, description="Convenience update route flag")
+    allow_multiple: bool = Field(default=False, description="Allow update to apply to all matched events")
+    shift_minutes: int | None = Field(default=None, description="Shift matched event start/end times by this many minutes")
+
+
+class JarvisScheduleEditorTool(ShadowLinkTool):
+    name: str = "jarvis_schedule_editor"
+    description: str = "Maxwell's schedule database skill: query, update, or delete calendar events through the calendar adapter."
+    args_schema: type[BaseModel] = JarvisScheduleEditorInput
+    category: ToolCategory = ToolCategory.SYSTEM
+
+    def _run(self, **kwargs) -> dict:
+        raise NotImplementedError("Use async version")
+
+    async def _arun(
+        self,
+        operation: str,
+        scope: str = "upcoming",
+        hours_ahead: int = 720,
+        start: str | None = None,
+        end: str | None = None,
+        keyword: str | None = None,
+        status: str | None = None,
+        limit: int = 200,
+        event_ids: list[str] | None = None,
+        patches: list[JarvisScheduleEditorPatch | dict] | None = None,
+        title: str | None = None,
+        stress_weight: float | None = None,
+        location: str | None = None,
+        notes: str | None = None,
+        route_required: bool | None = None,
+        allow_multiple: bool = False,
+        shift_minutes: int | None = None,
+    ) -> dict:
+        operation = operation.strip().lower()
+        event_ids = [str(item).strip() for item in (event_ids or []) if str(item).strip()]
+        events = self._query_events(scope=scope, hours_ahead=hours_ahead, start=start, end=end)
+        if event_ids:
+            id_set = set(event_ids)
+            events = [event for event in events if event.id in id_set]
+        events = self._filter_events(events, keyword=keyword, status=status)
+
+        if operation == "query":
+            plan_days = await self._query_matching_plan_days(scope=scope, start=start, end=end, keyword=keyword, status=status)
+            background_days = await self._query_matching_background_days(scope=scope, start=start, end=end, keyword=keyword, status=status)
+            background_tasks = await self._query_matching_background_tasks(scope=scope, keyword=keyword, status=status)
+            plans = await self._query_matching_plans(scope=scope, keyword=keyword, status=status)
+            matched_count = len(events) + len(plan_days) + len(background_days) + len(background_tasks) + len(plans)
+            return {
+                "type": "schedule.editor.query",
+                "ok": True,
+                "matched_count": matched_count,
+                "returned_count": min(matched_count, limit),
+                "events": [self._compact_event(event) for event in events[:limit]],
+                "plan_days": plan_days[:limit],
+                "background_task_days": background_days[:limit],
+                "background_tasks": background_tasks[:limit],
+                "plans": plans[:limit],
+            }
+
+        if operation == "delete":
+            deleted: list[str] = []
+            skipped: list[dict[str, str]] = []
+            plan_days = await self._query_matching_plan_days(scope=scope, start=start, end=end, keyword=keyword, status=status)
+            background_days = await self._query_matching_background_days(scope=scope, start=start, end=end, keyword=keyword, status=status)
+            background_tasks = await self._query_matching_background_tasks(scope=scope, keyword=keyword, status=status)
+            plans = await self._query_matching_plans(scope=scope, keyword=keyword, status=status)
+            matched_count = len(events) + len(plan_days) + len(background_days) + len(background_tasks) + len(plans)
+            if event_ids:
+                target_ids = event_ids
+            else:
+                if matched_count > 1 and not allow_multiple:
+                    return {
+                        "type": "schedule.editor.delete",
+                        "ok": False,
+                        "code": "needs_disambiguation",
+                        "candidate_count": matched_count,
+                        "candidates": [
+                            *[self._compact_event(event) for event in events[:10]],
+                            *plan_days[:10],
+                            *background_days[:10],
+                            *background_tasks[:10],
+                            *plans[:10],
+                        ][:10],
+                        "message": "Delete matched multiple records. Pass allow_multiple=true or provide exact event_ids.",
+                    }
+                matched_task_ids = {str(task.get("id")) for task in background_tasks if task.get("id")}
+                matched_plan_ids = {str(plan.get("id")) for plan in plans if plan.get("id")}
+                target_ids = [
+                    *matched_task_ids,
+                    *[plan["id"] for plan in plans if plan.get("id") and str(plan.get("source_background_task_id") or "") not in matched_task_ids],
+                    *[event.id for event in events],
+                    *[
+                        day["id"]
+                        for day in plan_days
+                        if day.get("id") and str(day.get("plan_id") or "") not in matched_plan_ids
+                    ],
+                    *[
+                        day["id"]
+                        for day in background_days
+                        if day.get("id") and str(day.get("task_id") or "") not in matched_task_ids
+                    ],
+                ]
+            target_ids = list(dict.fromkeys(target_ids))
+            for event_id in target_ids:
+                ok = delete_event(event_id)
+                if not ok:
+                    ok = await hard_delete_background_task_day(event_id)
+                if not ok:
+                    ok = await hard_delete_jarvis_plan_day(event_id)
+                if not ok:
+                    ok = await hard_delete_background_task(event_id)
+                if not ok:
+                    ok = await hard_delete_jarvis_plan(event_id)
+                if ok:
+                    deleted.append(event_id)
+                else:
+                    skipped.append({"event_id": event_id, "reason": "not_found"})
+            await self._refresh_context()
+            return {
+                "type": "schedule.editor.delete",
+                "ok": True,
+                "bulk": bool(len(deleted) > 1),
+                "matched_count": matched_count if not event_ids else len(target_ids),
+                "deleted_count": len(deleted),
+                "deleted_event_ids": deleted,
+                "skipped": skipped,
+                "new_schedule_density": compute_schedule_density(),
+            }
+
+        if operation == "update":
+            if not patches:
+                patches_or_response = self._build_auto_resolved_patches(
+                    events,
+                    title=title,
+                    start=start,
+                    end=end,
+                    stress_weight=stress_weight,
+                    location=location,
+                    notes=notes,
+                    status=status,
+                    route_required=route_required,
+                    allow_multiple=allow_multiple,
+                    shift_minutes=shift_minutes,
+                )
+                if isinstance(patches_or_response, dict):
+                    return patches_or_response
+                patches = patches_or_response
+            updated: list[dict] = []
+            skipped: list[dict[str, str]] = []
+            auto_resolved = bool(patches) and not event_ids
+            bulk = bool(patches) and len(patches) > 1
+            for raw_patch in patches or []:
+                patch = raw_patch if isinstance(raw_patch, JarvisScheduleEditorPatch) else JarvisScheduleEditorPatch(**raw_patch)
+                update_kwargs, error = self._build_update_kwargs(patch)
+                if error:
+                    skipped.append({"event_id": patch.event_id, "reason": error})
+                    continue
+                event = update_event(patch.event_id.strip(), **update_kwargs)
+                if event is None:
+                    skipped.append({"event_id": patch.event_id, "reason": "not_found"})
+                    continue
+                try:
+                    from app.jarvis.persistence import sync_plan_day_from_calendar_event
+
+                    await sync_plan_day_from_calendar_event(event.model_dump())
+                except Exception:
+                    pass
+                updated.append(self._compact_event(event))
+            await self._refresh_context()
+            return {
+                "type": "schedule.editor.update",
+                "ok": True,
+                "auto_resolved": auto_resolved,
+                "bulk": bulk,
+                "updated_count": len(updated),
+                "updated_events": updated,
+                "skipped": skipped,
+                "new_schedule_density": compute_schedule_density(),
+            }
+
+        return {"type": "schedule.editor", "ok": False, "error": "operation must be query, update, or delete"}
+
+    def _query_events(self, *, scope: str, hours_ahead: int, start: str | None, end: str | None) -> list:
+        normalized_scope = scope.strip().lower()
+        if normalized_scope == "range" and start and end:
+            return get_events_between(datetime.fromisoformat(start.replace("Z", "+00:00")), datetime.fromisoformat(end.replace("Z", "+00:00")))
+        if normalized_scope == "all":
+            now = datetime.utcnow()
+            return get_events_between(now - timedelta(days=3650), now + timedelta(days=3650))
+        if start and end:
+            return get_events_between(datetime.fromisoformat(start.replace("Z", "+00:00")), datetime.fromisoformat(end.replace("Z", "+00:00")))
+        return get_upcoming_events(hours_ahead=hours_ahead)
+
+    def _filter_events(self, events: list, *, keyword: str | None, status: str | None) -> list:
+        filtered = events
+        if status:
+            wanted = status.strip().lower()
+            filtered = [event for event in filtered if str(getattr(event, "status", "")).lower() == wanted]
+        if keyword:
+            needle = keyword.strip().lower()
+            filtered = [event for event in filtered if needle in " ".join([
+                str(getattr(event, "title", "")),
+                str(getattr(event, "location", "") or ""),
+                str(getattr(event, "notes", "") or ""),
+                str(getattr(event, "created_reason", "") or ""),
+            ]).lower()]
+        return filtered
+
+    def _build_auto_resolved_patches(
+        self,
+        events: list,
+        *,
+        title: str | None,
+        start: str | None,
+        end: str | None,
+        stress_weight: float | None,
+        location: str | None,
+        notes: str | None,
+        status: str | None,
+        route_required: bool | None,
+        allow_multiple: bool,
+        shift_minutes: int | None,
+    ) -> list[dict] | dict:
+        update_fields = {
+            "title": title,
+            "start": start,
+            "end": end,
+            "stress_weight": stress_weight,
+            "location": location,
+            "notes": notes,
+            "status": status,
+            "route_required": route_required,
+        }
+        update_fields = {key: value for key, value in update_fields.items() if value is not None}
+        if shift_minutes is None and not update_fields:
+            return []
+        if len(events) != 1 and not allow_multiple:
+            return {
+                "type": "schedule.editor.update",
+                "ok": False,
+                "code": "needs_disambiguation",
+                "candidate_count": len(events),
+                "candidates": [self._compact_event(event) for event in events[:10]],
+                "message": "Update needs exactly one matched event. Query first or provide event_id.",
+            }
+        patches: list[dict] = []
+        for event in events:
+            patch = {"event_id": event.id, **update_fields}
+            if shift_minutes is not None:
+                patch["start"] = (event.start + timedelta(minutes=shift_minutes)).isoformat()
+                patch["end"] = (event.end + timedelta(minutes=shift_minutes)).isoformat()
+            patches.append(patch)
+        return patches
+
+    async def _query_matching_plan_days(self, *, scope: str, start: str | None, end: str | None, keyword: str | None, status: str | None) -> list[dict]:
+        if not keyword and not status:
+            return []
+        kwargs: dict[str, object] = {"limit": 5000}
+        if status:
+            kwargs["status"] = status
+        if start:
+            kwargs["start"] = start[:10]
+        if end:
+            kwargs["end"] = end[:10]
+        days = await list_jarvis_plan_days(**kwargs)
+        if scope.strip().lower() == "upcoming" and not start:
+            today = datetime.utcnow().date().isoformat()
+            days = [day for day in days if str(day.get("plan_date") or "")[:10] >= today]
+        return self._filter_day_records(days, keyword=keyword)
+
+    async def _query_matching_background_days(self, *, scope: str, start: str | None, end: str | None, keyword: str | None, status: str | None) -> list[dict]:
+        if not keyword and not status:
+            return []
+        days = await list_background_task_days(status=status, limit=5000)
+        if start:
+            days = [day for day in days if str(day.get("plan_date") or "")[:10] >= start[:10]]
+        if end:
+            days = [day for day in days if str(day.get("plan_date") or "")[:10] <= end[:10]]
+        if scope.strip().lower() == "upcoming" and not start:
+            today = datetime.utcnow().date().isoformat()
+            days = [day for day in days if str(day.get("plan_date") or "")[:10] >= today]
+        return self._filter_day_records(days, keyword=keyword)
+
+    def _filter_day_records(self, days: list[dict], *, keyword: str | None) -> list[dict]:
+        if not keyword:
+            return days
+        needle = keyword.strip().lower()
+        return [
+            day for day in days
+            if needle in " ".join([
+                str(day.get("title") or ""),
+                str(day.get("description") or ""),
+                str(day.get("plan_date") or ""),
+            ]).lower()
+        ]
+
+    async def _query_matching_background_tasks(self, *, scope: str, keyword: str | None, status: str | None) -> list[dict]:
+        if not keyword and not status:
+            return []
+        tasks = await list_background_tasks(status=status, limit=5000)
+        if scope.strip().lower() == "upcoming":
+            tasks = [task for task in tasks if str(task.get("status") or "").lower() not in {"deleted", "archived"}]
+        return self._filter_task_records(tasks, keyword=keyword)
+
+    async def _query_matching_plans(self, *, scope: str, keyword: str | None, status: str | None) -> list[dict]:
+        if not keyword and not status:
+            return []
+        plans = await list_jarvis_plans(status=status, limit=5000)
+        if scope.strip().lower() == "upcoming":
+            plans = [plan for plan in plans if str(plan.get("status") or "").lower() not in {"deleted", "archived"}]
+        return self._filter_task_records(plans, keyword=keyword)
+
+    def _filter_task_records(self, items: list[dict], *, keyword: str | None) -> list[dict]:
+        if not keyword:
+            return items
+        needle = keyword.strip().lower()
+        return [
+            item for item in items
+            if needle in " ".join([
+                str(item.get("title") or ""),
+                str(item.get("goal") or ""),
+                str(item.get("original_user_request") or ""),
+            ]).lower()
+        ]
+
+    def _build_update_kwargs(self, patch: JarvisScheduleEditorPatch) -> tuple[dict, str | None]:
+        kwargs: dict[str, object] = {}
+        for key in ("title", "stress_weight", "location", "notes", "status", "route_required"):
+            value = getattr(patch, key)
+            if value is not None:
+                kwargs[key] = value
+        for key in ("start", "end"):
+            value = getattr(patch, key)
+            if value:
+                try:
+                    kwargs[key] = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                except ValueError as exc:
+                    return {}, f"invalid_{key}: {exc}"
+        return kwargs, None
+
+    async def _refresh_context(self) -> None:
+        await get_life_context_bus().update_fields(
+            {"schedule_density": compute_schedule_density(), "active_events": get_upcoming_events(hours_ahead=24)},
+            source="agent_tool",
+        )
+
+    def _compact_event(self, event) -> dict:
+        return {
+            "id": event.id,
+            "title": event.title,
+            "start": event.start.isoformat(),
+            "end": event.end.isoformat(),
+            "status": getattr(event, "status", "confirmed"),
+            "stress_weight": getattr(event, "stress_weight", 1.0),
+            "location": getattr(event, "location", None),
+            "notes": getattr(event, "notes", None),
+            "source": getattr(event, "source", None),
+            "source_agent": getattr(event, "source_agent", None),
         }
 
 

@@ -34,6 +34,8 @@ def _raise_planner_guard_violation(exc: ValueError) -> None:
         status_code=422,
         detail={"code": "planner_guard_violation", "message": str(exc), "recoverable": True},
     ) from exc
+
+
 from app.jarvis.memory_recall import build_bounded_memory_recall_prefix
 from app.jarvis.preference_learner import build_preference_profile_prefix
 from app.jarvis.intent_router import plan_agent_intent, plan_roundtable_intent
@@ -42,6 +44,151 @@ from app.llm.background_client import get_background_llm_client
 
 logger = structlog.get_logger("jarvis.api")
 router = APIRouter(prefix="/jarvis", tags=["jarvis"])
+
+
+def _build_private_chat_strategy_prompt(
+    *,
+    agent_id: str,
+    message: str,
+    local_now: datetime,
+    memory_text: str = "",
+    preference_text: str = "",
+    collaboration_text: str = "",
+    local_life_context: str = "",
+) -> str:
+    return (
+        "## 私聊策略路由\n"
+        f"当前角色: {agent_id}\n"
+        f"当前时间: {local_now.isoformat()}\n"
+        "请根据用户意图选择最合适的执行策略，必须只输出 JSON。\n"
+        "可选 strategy: direct / react / plan_execute。\n"
+        "规则：\n"
+        "1. 普通闲聊、解释、轻量建议 -> direct\n"
+        "2. 需要查询、验证、调用一个或少量工具 -> react\n"
+        "3. 涉及复杂日程、长期计划、批量修改/删除、需要多轮推理或重排 -> plan_execute\n"
+        "4. 涉及日程类意图时，优先不要选 direct。\n"
+        "5. 如果不确定，优先选 react；如果明显是复杂日程，优先选 plan_execute。\n"
+        "返回格式：{\"domain\":\"schedule|chat|care|study|other\",\"strategy\":\"direct|react|plan_execute\",\"confidence\":0-1,\"needs_tool\":true/false,\"reason\":\"...\"}\n\n"
+        f"用户消息: {message}\n\n"
+        f"{local_life_context}"
+        f"{collaboration_text}"
+        f"{memory_text}"
+        f"{preference_text}"
+    )
+
+
+def _parse_private_chat_strategy_router(raw: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty_llm_strategy_response")
+    start = text.find("{")
+    end = text.rfind("}")
+    payload = text[start : end + 1] if start != -1 and end != -1 and end > start else text
+    data = json.loads(payload)
+    strategy = str(data.get("strategy") or "react").strip()
+    if strategy not in {"direct", "react", "plan_execute"}:
+        strategy = "react"
+    domain = str(data.get("domain") or "other").strip() or "other"
+    confidence = data.get("confidence")
+    try:
+        confidence_value = float(confidence)
+    except Exception:
+        confidence_value = 0.5
+    confidence_value = max(0.0, min(1.0, confidence_value))
+    needs_tool = bool(data.get("needs_tool"))
+    reason = str(data.get("reason") or "").strip()
+    return {
+        "domain": domain,
+        "strategy": strategy,
+        "confidence": confidence_value,
+        "needs_tool": needs_tool,
+        "reason": reason,
+    }
+
+
+async def _select_private_chat_strategy(
+    *,
+    llm_client: Any,
+    agent_id: str,
+    message: str,
+    local_now: datetime,
+    memory_text: str = "",
+    preference_text: str = "",
+    collaboration_text: str = "",
+    local_life_context: str = "",
+) -> dict[str, Any]:
+    prompt = _build_private_chat_strategy_prompt(
+        agent_id=agent_id,
+        message=message,
+        local_now=local_now,
+        memory_text=memory_text,
+        preference_text=preference_text,
+        collaboration_text=collaboration_text,
+        local_life_context=local_life_context,
+    )
+    try:
+        raw = await llm_client.chat(
+            message=prompt,
+            system_prompt="你是一个只负责路由策略的控制器，必须输出严格 JSON。",
+            temperature=0.0,
+        )
+        parsed = _parse_private_chat_strategy_router(raw)
+    except Exception as exc:
+        logger.warning("jarvis.chat.strategy_router_failed", agent_id=agent_id, error=str(exc))
+        parsed = {
+            "domain": "other",
+            "strategy": "react",
+            "confidence": 0.0,
+            "needs_tool": False,
+            "reason": "router_fallback",
+        }
+
+    intent_text = _normalize_private_chat_intent_text(message)
+    if _force_complex_schedule_strategy(intent_text, agent_id):
+        parsed.update({"domain": "schedule", "strategy": "plan_execute", "needs_tool": True, "reason": "complex_schedule_guard"})
+    elif parsed["strategy"] == "direct" and _is_schedule_intent(intent_text):
+        parsed["strategy"] = "react"
+        parsed["domain"] = parsed.get("domain") or "schedule"
+        parsed["needs_tool"] = True
+        parsed["reason"] = parsed.get("reason") or "schedule_prefers_react"
+    return parsed
+
+
+def _normalize_private_chat_intent_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _is_schedule_intent(text: str) -> bool:
+    markers = ["日程", "安排", "计划", "日历", "时间", "修改", "删除", "延后", "重排", "replan", "calendar", "schedule"]
+    return any(marker in text for marker in markers)
+
+
+def _force_complex_schedule_strategy(text: str, agent_id: str) -> bool:
+    if agent_id != "maxwell":
+        return False
+    complex_markers = ["一个月", "长期", "多天", "批量", "全部", "重排", "延期", "推迟", "删除所有", "修改所有", "重构", "长期任务"]
+    return _is_schedule_intent(text) and any(marker in text for marker in complex_markers)
+
+
+def _build_user_visible_reply_contract() -> str:
+    return (
+        "## 用户可见回复契约\n"
+        "主人反复强调：不要把 function_call、tool_name、arguments、JSON 指令、<tool_call>、<jarvis-tool> "
+        "等内部工具调用内容直接发到聊天框。\n"
+        "所有带尖括号的协议标签都不是用户可见回复，例如 <invoke>、<parameter>、<tool_call>、<tool_calls>、"
+        "<jarvis-tool>、<jarvis-action>、<execute_bash>；这些只能交给后端解析执行，不能原样发给用户。\n"
+        "如果需要操作，必须通过后端工具协议执行；最终给用户看的回复只能是自然语言总结。\n"
+        "如果工具没有真实执行成功，不要说已经完成；如果需要继续调用工具，请输出后端可解析的工具协议，而不是给用户看的 JSON。\n"
+        "回复前自检：1）我有没有把内部工具参数暴露给用户；2）我有没有声称完成但没有工具结果；"
+        "3）我有没有把 function_call JSON 当成最终回复。\n\n"
+    )
+
+
+def _mentions_tool_json_leakage(message: str) -> bool:
+    text = _normalize_private_chat_intent_text(message)
+    leak_markers = ["function_call", "tool_name", "arguments", "json", "工具调用", "指令", "前端返回", "聊天框"]
+    complaint_markers = ["不要", "别", "错误", "不小心", "总是", "根本没有实际执行", "返回给我", "发给我"]
+    return any(marker in text for marker in leak_markers) and any(marker in text for marker in complaint_markers)
 
 
 async def _fetch_weather_for_location(lat: float, lng: float) -> dict[str, Any]:
@@ -218,6 +365,11 @@ async def _run_chat_background_tasks(
         try:
             if is_user_constraint(user_message):
                 await remember_user_constraint(user_message, source_agent=source_agent)
+            if _mentions_tool_json_leakage(user_message):
+                await remember_user_constraint(
+                    "主人反复强调：不要把 function_call、tool_name、arguments、JSON 指令或任何带尖括号的协议标签（例如 <invoke>、<parameter>、<tool_call>、<tool_calls>、<jarvis-tool>、<jarvis-action>、<execute_bash>）直接发到聊天框。需要操作时必须通过后端工具协议执行；最终回复只给用户自然语言总结，并且只能基于真实工具结果说明已完成。",
+                    source_agent=source_agent,
+                )
             await remember_tool_actions(source_agent, tool_results)
             saved = await extract_and_save_chat_memories(
                 user_message=user_message,
@@ -313,6 +465,7 @@ def _build_schedule_intent(message: str, agent_id: str) -> dict[str, Any] | None
     schedule_action_keywords = [
         "日程", "安排", "提醒", "预约", "开会", "会议", "deadline", "schedule", "待办",
         "帮我", "记得", "加入", "写进", "放到", "规划", "定个", "约",
+        "删除", "删掉", "移除", "清掉", "取消", "delete", "remove", "clear", "cancel",
     ]
     schedule_time_keywords = [
         "明天", "后天", "今天", "今晚", "下午", "上午", "晚上", "几点", "周一", "周二",
@@ -375,6 +528,7 @@ class AgentChatResponse(BaseModel):
     actions: list[dict] | None = None  # structured actions agent executed (calendar etc)
     routing: dict | None = None
     timing: dict | None = None
+    metadata: dict[str, Any] | None = None
 
 
 _CHAT_STEP_LABELS = {
@@ -385,6 +539,7 @@ _CHAT_STEP_LABELS = {
     "memory_context": "检索长期记忆、偏好和协作记忆",
     "consult": "判断是否需要其他智能体协助",
     "local_life_context": "读取本地生活上下文",
+    "llm_strategy": "选择私聊执行策略",
     "local_intent": "判断是否需要调用工具",
     "llm_turn": "生成智能体回复并执行工具",
     "actions_built": "整理工具执行结果",
@@ -523,6 +678,14 @@ class PlanDayBulkUpdateRequest(BaseModel):
 class BackgroundTaskUpdateRequest(BaseModel):
     status: str | None = None
     notes: str | None = None
+
+
+class MaxwellRescheduleRequest(BaseModel):
+    item_type: str
+    item_id: str
+    action: str = "postpone_one_day"
+    reason: str | None = None
+    today: str | None = None
 
 
 class PlanRescheduleRequest(BaseModel):
@@ -1158,8 +1321,8 @@ async def chat_with_agent(
             step_callback(_chat_step_from_span(span))
 
     route_started = start_span("route_decided")
-    schedule_intent = None
-    routed_agent_id = req.agent_id
+    schedule_intent = _build_schedule_intent(req.message, req.agent_id)
+    routed_agent_id = str(schedule_intent.get("target_agent") or req.agent_id) if schedule_intent else req.agent_id
     try:
         agent = get_agent(routed_agent_id)
     except KeyError:
@@ -1285,6 +1448,7 @@ async def chat_with_agent(
         "用户要求规划日程时，应尽量根据当前时间给出开始和结束时间；如果用户没有给时间，请由你先做合理规划，不要强迫用户提供严格格式。\n"
         "如果不需要工具，直接回答。\n\n"
     )
+    user_visible_reply_contract = _build_user_visible_reply_contract()
     intent_context = ""
     planned_tool_results: list[dict[str, Any]] = []
     intent_started = start_span("local_intent")
@@ -1330,10 +1494,44 @@ async def chat_with_agent(
         logger.warning("jarvis.chat.local_intent_failed", agent_id=routed_agent_id, error=str(exc))
         mark_span("local_intent", intent_started, intent="error", planned_tools=0)
 
+    strategy_started = start_span("llm_strategy")
+    llm_strategy = await _select_private_chat_strategy(
+        llm_client=llm_client,
+        agent_id=routed_agent_id,
+        message=req.message,
+        local_now=local_now,
+        memory_text=memory_text,
+        preference_text=preference_text,
+        collaboration_text=collaboration_text,
+        local_life_context=local_life_context,
+    )
+    strategy_context = (
+        "## 私聊执行策略\n"
+        f"domain: {llm_strategy['domain']}\n"
+        f"strategy: {llm_strategy['strategy']}\n"
+        f"needs_tool: {json.dumps(llm_strategy['needs_tool'], ensure_ascii=False)}\n"
+        f"confidence: {llm_strategy['confidence']}\n"
+        f"reason: {llm_strategy['reason']}\n"
+        "执行要求：\n"
+        "- direct：直接回答，不要伪造工具结果。\n"
+        "- react：先观察可用上下文，必要时调用工具，基于真实结果回复。\n"
+        "- plan_execute：先制定简短执行计划，再分步调用工具查询/修改/校验，最后汇总真实结果。\n"
+        "- 日程领域必须先查询或调用工具确认真实状态；不要只凭语言承诺已完成。\n\n"
+    )
+    mark_span(
+        "llm_strategy",
+        strategy_started,
+        domain=llm_strategy.get("domain"),
+        strategy=llm_strategy.get("strategy"),
+        confidence=llm_strategy.get("confidence"),
+    )
+
     full_message = (
         f"{profile_prefix}{context_summary}\n\n"
         f"{time_context}"
         f"{common_rules}"
+        f"{user_visible_reply_contract}"
+        f"{strategy_context}"
         f"{intent_context}"
         f"{mood_context}"
         f"{consult_result.prompt_prefix}"
@@ -1495,6 +1693,7 @@ async def chat_with_agent(
         actions=action_results if action_results else None,
         routing=schedule_intent,
         timing=timing_payload,
+        metadata={"llm_strategy": llm_strategy},
     )
 
 
@@ -1955,6 +2154,24 @@ async def delete_background_task_day_item(day_id: str) -> dict[str, Any]:
     if updated is None:
         raise HTTPException(status_code=404, detail=f"Background task day {day_id!r} not found")
     return {"task_day": updated}
+
+
+@router.post("/maxwell/reschedule-task")
+async def maxwell_reschedule_task(req: MaxwellRescheduleRequest) -> dict[str, Any]:
+    from app.jarvis.persistence import request_maxwell_task_reschedule
+
+    try:
+        return await request_maxwell_task_reschedule(
+            item_type=req.item_type,
+            item_id=req.item_id,
+            action=req.action,
+            reason=req.reason,
+            today=req.today,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": "maxwell_reschedule_invalid", "message": str(exc), "recoverable": False}) from exc
 
 
 @router.get("/maxwell/workbench-items")
@@ -2440,6 +2657,8 @@ async def move_plan_day_item(day_id: str, req: PlanDayMoveRequest) -> dict[str, 
         plan_day_id=updated.get("id"),
         event="移动到新时间",
         detail=f"{existing.get('plan_date')} 调整到 {updated.get('plan_date')}；原因：{patch.get('reschedule_reason')}",
+        category="manual_edit",
+        source="schedule_api",
     )
     return {"plan_day": updated, "calendar_event": calendar_event}
 

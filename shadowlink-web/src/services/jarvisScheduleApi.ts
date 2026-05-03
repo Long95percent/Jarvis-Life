@@ -7,6 +7,8 @@ import {
   type JarvisPlan,
   type JarvisPlanDay,
   type MaxwellWorkbenchItem,
+  type MaxwellRescheduleRequest,
+  type MaxwellRescheduleResult,
   type PendingAction,
   type PlanDayBulkUpdateResult,
   type PlannerCalendarResponse,
@@ -30,6 +32,8 @@ export type {
   JarvisPlan,
   JarvisPlanDay,
   MaxwellWorkbenchItem,
+  MaxwellRescheduleRequest,
+  MaxwellRescheduleResult,
   PendingAction,
   PlanDayBulkUpdateResult,
   PlannerCalendarItem,
@@ -93,5 +97,6 @@ export const jarvisScheduleApi = {
   createSecretaryPlan: (payload: SecretaryPlanRequest): Promise<SecretaryPlanResult> => jarvisApi.createSecretaryPlan(payload),
 
   listMaxwellWorkbenchItems: (params?: Parameters<typeof jarvisApi.listMaxwellWorkbenchItems>[0]): Promise<MaxwellWorkbenchItem[]> => jarvisApi.listMaxwellWorkbenchItems(params),
+  requestMaxwellReschedule: (payload: MaxwellRescheduleRequest): Promise<MaxwellRescheduleResult> => jarvisApi.requestMaxwellReschedule(payload),
   pushDailyTasksToMaxwellWorkbench: (planDate?: string): Promise<{ plan_date: string; pushed_count: number; items: MaxwellWorkbenchItem[] }> => jarvisApi.pushDailyTasksToMaxwellWorkbench(planDate),
 }

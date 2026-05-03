@@ -1,4 +1,9 @@
 ﻿import React, { useEffect, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import "katex/dist/katex.min.css";
 import { useJarvisStore } from "@/stores/jarvisStore";
 import { SendHorizontal, Trash2 } from "lucide-react";
 import { jarvisApi, type ActionResult, type BehaviorEventType, type ChatExecutionStep, type EscalationHint } from "@/services/jarvisApi";
@@ -70,6 +75,54 @@ function formatEndTime(value: string): string {
   return new Date(value).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
 }
 
+function MarkdownMessage({ content }: { content: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeKatex]}
+      components={{
+        p: ({ children }) => <p className="my-0 whitespace-pre-wrap">{children}</p>,
+        ul: ({ children }) => <ul className="my-2 list-disc space-y-1 pl-5">{children}</ul>,
+        ol: ({ children }) => <ol className="my-2 list-decimal space-y-1 pl-5">{children}</ol>,
+        li: ({ children }) => <li className="pl-1">{children}</li>,
+        a: ({ children, href }) => (
+          <a className="font-medium text-indigo-600 underline underline-offset-2" href={href} target="_blank" rel="noreferrer">
+            {children}
+          </a>
+        ),
+        code: ({ children, className }) => {
+          const isBlock = Boolean(className);
+          return isBlock ? (
+            <code className={`${className ?? ""} block overflow-x-auto rounded-2xl bg-slate-900 px-4 py-3 text-xs leading-6 text-slate-50`}>
+              {children}
+            </code>
+          ) : (
+            <code className="rounded-md bg-white/70 px-1.5 py-0.5 text-[0.86em] text-slate-800">
+              {children}
+            </code>
+          );
+        },
+        pre: ({ children }) => <pre className="my-3 overflow-x-auto">{children}</pre>,
+        blockquote: ({ children }) => (
+          <blockquote className="my-2 border-l-4 border-slate-300 pl-3 text-slate-600">{children}</blockquote>
+        ),
+        table: ({ children }) => (
+          <div className="my-3 overflow-x-auto rounded-2xl border border-slate-200 bg-white/70">
+            <table className="min-w-full border-collapse text-left text-xs">{children}</table>
+          </div>
+        ),
+        th: ({ children }) => <th className="border-b border-slate-200 px-3 py-2 font-semibold text-slate-700">{children}</th>,
+        td: ({ children }) => <td className="border-b border-slate-100 px-3 py-2 align-top">{children}</td>,
+        h1: ({ children }) => <h1 className="mb-2 mt-1 text-lg font-semibold text-slate-900">{children}</h1>,
+        h2: ({ children }) => <h2 className="mb-2 mt-1 text-base font-semibold text-slate-900">{children}</h2>,
+        h3: ({ children }) => <h3 className="mb-1 mt-1 text-sm font-semibold text-slate-900">{children}</h3>,
+      }}
+    >
+      {content}
+    </ReactMarkdown>
+  );
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
@@ -89,6 +142,14 @@ function routingTitle(routing: Record<string, unknown>): string {
   return type === "task_intent"
     ? `${source} 已把长期任务规划交给 ${target}`
     : `${source} 已把日程安排交给 ${target}`;
+}
+
+function consultationSummary(action: ActionResult): string {
+  const args = asRecord(action.arguments);
+  const consultations = asList(args.consultations);
+  if (consultations.length === 0) return "已请求其他智能体协助";
+  const names = consultations.map((item) => toText(item.to_agent_name, toText(item.to_agent, "其他智能体"))).filter(Boolean);
+  return `已协助咨询：${Array.from(new Set(names)).join("、")}`;
 }
 
 function isHttpStatus(error: unknown, status: number): boolean {
@@ -512,7 +573,23 @@ export const AgentChatPanel: React.FC<Props> = ({
     }
 
     if (action.type === "agent.consult") {
-      return null;
+      const args = asRecord(action.arguments);
+      const consultations = asList(args.consultations);
+      return (
+        <div key={key} className="w-full rounded-2xl border border-sky-200 bg-sky-50 p-3 text-xs text-sky-900">
+          <div className="text-sm font-semibold">{consultationSummary(action)}</div>
+          {consultations.length > 0 ? (
+            <div className="mt-2 space-y-1">
+              {consultations.map((item, consultationIndex) => (
+                <div key={consultationIndex}>
+                  <span className="font-medium">{toText(item.to_agent_name, toText(item.to_agent, "其他智能体"))}</span>
+                  {toText(item.summary) ? <span>：{toText(item.summary)}</span> : null}
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      );
     }
 
     if (action.pending_confirmation && action.type === "calendar.add") {
@@ -780,7 +857,7 @@ export const AgentChatPanel: React.FC<Props> = ({
                         borderColor: `color-mix(in srgb, ${agent.color} 20%, transparent)`,
                       }}
                     >
-                      {message.content}
+                      <MarkdownMessage content={message.content} />
                     </div>
                     {message.actions && message.actions.length > 0 ? (
                       <div className="mt-2 flex w-full flex-col gap-1.5">

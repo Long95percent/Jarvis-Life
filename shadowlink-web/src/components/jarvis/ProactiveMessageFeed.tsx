@@ -56,7 +56,7 @@ export const ProactiveMessageFeed: React.FC<Props> = ({
                     })}
                   </span>
                 </div>
-                <p className="mt-1 line-clamp-2 text-sm leading-6 text-slate-600">
+              <p className="mt-1 line-clamp-2 break-words text-sm leading-6 text-slate-600">
                   {msg.content}
                 </p>
               </div>
@@ -71,7 +71,7 @@ export const ProactiveMessageFeed: React.FC<Props> = ({
   }
 
   return (
-    <div className="space-y-2">
+      <div className="min-w-0 space-y-2">
       {visibleMessages.map((msg) => {
         const meta = JARVIS_AGENTS[msg.agent_id];
         if (msg.trigger?.startsWith("care") || msg.trigger?.includes("risk") || msg.trigger?.includes("overload") || msg.trigger?.includes("streak")) {
@@ -87,7 +87,7 @@ export const ProactiveMessageFeed: React.FC<Props> = ({
           <div
             key={msg.id}
             onClick={() => onRead(msg.id)}
-            className={`flex gap-3 p-3 rounded-xl cursor-pointer transition-all
+            className={`flex min-w-0 gap-3 p-3 rounded-xl cursor-pointer transition-all
               ${msg.read ? "bg-gray-50 opacity-60" : "bg-white border border-gray-200 shadow-sm"}`}
           >
             <span className="text-2xl flex-shrink-0">{meta?.icon ?? "🤖"}</span>
@@ -96,7 +96,7 @@ export const ProactiveMessageFeed: React.FC<Props> = ({
                 <span className="text-xs font-semibold" style={{ color: meta?.color }}>{msg.agent_name}</span>
                 {!msg.read && <span className="w-1.5 h-1.5 rounded-full bg-red-500" />}
               </div>
-              <p className="text-sm text-gray-700 leading-snug">{msg.content}</p>
+              <p className="break-words text-sm leading-snug text-gray-700">{msg.content}</p>
               <p className="text-[10px] text-gray-400 mt-1">
                 {new Date(msg.created_at).toLocaleTimeString()}
               </p>

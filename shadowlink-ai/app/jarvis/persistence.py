@@ -13,7 +13,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -3648,6 +3648,40 @@ async def hard_delete_background_task_day(day_id: str) -> dict[str, Any] | None:
     return await asyncio.to_thread(_hard_delete_background_task_day_sync, day_id)
 
 
+def _hard_delete_calendar_event_sync(event_id: str) -> dict[str, Any] | None:
+    with _conn() as con:
+        row = con.execute("SELECT * FROM jarvis_calendar_events WHERE id = ?", (event_id,)).fetchone()
+        if row is None:
+            return None
+        event = _row_to_calendar_event_dict(row)
+        related_plan_days = con.execute("SELECT id, plan_id FROM jarvis_plan_days WHERE calendar_event_id = ?", (event_id,)).fetchall()
+        related_task_days = con.execute("SELECT id FROM background_task_days WHERE calendar_event_id = ?", (event_id,)).fetchall()
+        related_plan_ids = [str(plan_day["plan_id"]) for plan_day in related_plan_days if plan_day["plan_id"]]
+        for plan_day in related_plan_days:
+            con.execute("DELETE FROM maxwell_workbench_items WHERE plan_day_id = ?", (plan_day["id"],))
+            con.execute("DELETE FROM jarvis_agent_events WHERE plan_day_id = ?", (plan_day["id"],))
+            con.execute("DELETE FROM jarvis_plan_days WHERE id = ?", (plan_day["id"],))
+        for task_day in related_task_days:
+            con.execute("DELETE FROM maxwell_workbench_items WHERE task_day_id = ?", (task_day["id"],))
+            con.execute("DELETE FROM background_task_days WHERE id = ?", (task_day["id"],))
+        con.execute("DELETE FROM jarvis_calendar_events WHERE id = ?", (event_id,))
+        for plan_id in related_plan_ids:
+            remaining = con.execute("SELECT 1 FROM jarvis_plan_days WHERE plan_id = ? LIMIT 1", (plan_id,)).fetchone()
+            if remaining is None:
+                con.execute("DELETE FROM jarvis_agent_events WHERE plan_id = ?", (plan_id,))
+                con.execute("DELETE FROM jarvis_plans WHERE id = ?", (plan_id,))
+        con.commit()
+    return {**event, "status": "deleted"}
+
+
+def hard_delete_calendar_event_sync(event_id: str) -> dict[str, Any] | None:
+    return _hard_delete_calendar_event_sync(event_id)
+
+
+async def hard_delete_calendar_event(event_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_hard_delete_calendar_event_sync, event_id)
+
+
 def _normalize_task_identity(value: str | None) -> str:
     text = str(value or "").strip().lower()
     text = re.sub(r"\s+", "", text)
@@ -3942,6 +3976,24 @@ def _update_background_task_day_status_sync(day_id: str, status: str) -> dict[st
 
 async def update_background_task_day_status(day_id: str, status: str) -> dict[str, Any] | None:
     return await asyncio.to_thread(_update_background_task_day_status_sync, day_id, status)
+
+
+def _update_background_task_day_sync(day_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+    allowed = {"plan_date", "title", "description", "start_time", "end_time", "estimated_minutes", "status", "calendar_event_id", "workbench_item_id"}
+    updates = {key: value for key, value in patch.items() if key in allowed}
+    if not updates:
+        return None
+    updates["updated_at"] = time.time()
+    assignments = ", ".join(f"{key} = ?" for key in updates)
+    with _conn() as con:
+        con.execute(f"UPDATE background_task_days SET {assignments} WHERE id = ?", (*updates.values(), day_id))
+        con.commit()
+        row = con.execute("SELECT * FROM background_task_days WHERE id = ?", (day_id,)).fetchone()
+    return _row_to_background_task_day(row) if row else None
+
+
+async def update_background_task_day(day_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
+    return await asyncio.to_thread(_update_background_task_day_sync, day_id, patch)
 
 
 def _calendar_dt_to_iso(value: Any) -> str:
@@ -4542,17 +4594,30 @@ def _parse_workbench_logs(value: Any) -> list[dict[str, Any]]:
             "actor": str(item.get("actor") or "maxwell"),
             "event": event[:80],
             "detail": str(item.get("detail") or "")[:240] or None,
+            "category": str(item.get("category") or "general")[:40],
+            "source": str(item.get("source") or "maxwell")[:40],
         })
     return cleaned
 
 
-def _append_workbench_log_json(existing: Any, *, event: str, detail: str | None = None, actor: str = "maxwell", at: float | None = None) -> str:
+def _append_workbench_log_json(
+    existing: Any,
+    *,
+    event: str,
+    detail: str | None = None,
+    actor: str = "maxwell",
+    at: float | None = None,
+    category: str = "general",
+    source: str = "maxwell",
+) -> str:
     logs = _parse_workbench_logs(existing)
     logs.append({
         "at": _iso_now_from_ts(at),
         "actor": actor,
         "event": event[:80],
         "detail": (detail or "")[:240] or None,
+        "category": category[:40],
+        "source": source[:40],
     })
     return json.dumps(logs[-50:], ensure_ascii=False)
 
@@ -4638,7 +4703,7 @@ def _list_maxwell_workbench_items_sync(
             """,
             (*params, limit),
         ).fetchall()
-    return [_row_to_maxwell_workbench_item(row, con) for row in rows]
+        return [_row_to_maxwell_workbench_item(row, con) for row in rows]
 
 
 async def list_maxwell_workbench_items(
@@ -4663,6 +4728,8 @@ def _append_maxwell_workbench_log_sync(
     event: str,
     detail: str | None = None,
     actor: str = "maxwell",
+    category: str = "general",
+    source: str = "maxwell",
 ) -> dict[str, Any] | None:
     clauses: list[str] = []
     params: list[Any] = []
@@ -4685,7 +4752,7 @@ def _append_maxwell_workbench_log_sync(
         ).fetchone()
         if row is None:
             return None
-        logs_json = _append_workbench_log_json(row["work_logs_json"], event=event, detail=detail, actor=actor, at=now)
+        logs_json = _append_workbench_log_json(row["work_logs_json"], event=event, detail=detail, actor=actor, at=now, category=category, source=source)
         con.execute(
             "UPDATE maxwell_workbench_items SET work_logs_json = ?, updated_at = ? WHERE id = ?",
             (logs_json, now, row["id"]),
@@ -4703,6 +4770,8 @@ async def append_maxwell_workbench_log(
     event: str,
     detail: str | None = None,
     actor: str = "maxwell",
+    category: str = "general",
+    source: str = "maxwell",
 ) -> dict[str, Any] | None:
     return await asyncio.to_thread(
         _append_maxwell_workbench_log_sync,
@@ -4712,7 +4781,115 @@ async def append_maxwell_workbench_log(
         event=event,
         detail=detail,
         actor=actor,
+        category=category,
+        source=source,
     )
+
+
+def _next_day(date_value: str) -> str:
+    return (datetime.fromisoformat(str(date_value)[:10]) + timedelta(days=1)).date().isoformat()
+
+
+async def request_maxwell_task_reschedule(
+    *,
+    item_type: str,
+    item_id: str,
+    action: str = "postpone_one_day",
+    reason: str | None = None,
+    today: str | None = None,
+) -> dict[str, Any]:
+    normalized_type = str(item_type or "").strip()
+    normalized_action = str(action or "postpone_one_day").strip()
+    if normalized_action != "postpone_one_day":
+        raise ValueError(f"unsupported Maxwell reschedule action: {normalized_action}")
+    if normalized_type not in {"plan_day", "background_task_day"}:
+        raise ValueError(f"unsupported Maxwell reschedule item_type: {normalized_type}")
+
+    effective_today = (today or datetime.now().date().isoformat())[:10]
+    user_reason = reason or "用户点击延后一天，交给 Maxwell 重排"
+    warnings: list[str] = []
+    pressure_review = {
+        "reviewed_by": "maxwell",
+        "consulted_roles": ["mira"],
+        "level": "medium",
+        "summary": "本次先延后一天，并提醒后续需要观察负载；长期计划如连续逾期，应触发更完整的学习量重排。",
+    }
+
+    if normalized_type == "plan_day":
+        existing = next((day for day in await list_jarvis_plan_days(limit=5000) if day.get("id") == item_id), None)
+        if existing is None:
+            raise LookupError(f"Plan day {item_id!r} not found")
+        target_date = _next_day(existing.get("plan_date") or effective_today)
+        patch = {
+            "plan_date": target_date,
+            "start_time": existing.get("start_time"),
+            "end_time": existing.get("end_time"),
+            "status": "rescheduled",
+            "reschedule_reason": user_reason,
+        }
+        updated = await update_jarvis_plan_day(item_id, patch, event_type="plan.rescheduled")
+        if updated is None:
+            raise LookupError(f"Plan day {item_id!r} not found")
+        log = await append_maxwell_workbench_log(
+            plan_day_id=item_id,
+            event="Maxwell 接收延期重排",
+            detail=f"{existing.get('plan_date')} 延后到 {target_date}；原因：{user_reason}",
+            category="user_reschedule",
+            source="user_action",
+        )
+        plan_siblings = await list_jarvis_plan_days(plan_id=updated.get("plan_id"), limit=2000) if updated.get("plan_id") else []
+        unfinished_after = [day for day in plan_siblings if str(day.get("status")) in {"pending", "scheduled", "pushed", "rescheduled", "missed"}]
+        if len(unfinished_after) >= 5:
+            pressure_review["level"] = "high"
+            pressure_review["summary"] = "这个长期计划剩余未完成项较多，Maxwell 建议后续进一步评估是否压缩学习量或拉长截止日期。"
+            warnings.append("当前 MVP 先移动选中的计划日；连续逾期后的整组学习量重排建议走完整计划重排。")
+        return {
+            "item_type": normalized_type,
+            "action": normalized_action,
+            "changed": updated,
+            "message": f"Maxwell 已将「{updated.get('title')}」延后到 {target_date}。",
+            "work_logs": [log] if log else [],
+            "pressure_review": pressure_review,
+            "warnings": warnings,
+        }
+
+    existing_task_day = next((day for day in await list_background_task_days(limit=5000) if day.get("id") == item_id), None)
+    if existing_task_day is None:
+        raise LookupError(f"Background task day {item_id!r} not found")
+    target_date = _next_day(existing_task_day.get("plan_date") or effective_today)
+    updated_task_day = await update_background_task_day(
+        item_id,
+        {
+            "plan_date": target_date,
+            "start_time": existing_task_day.get("start_time"),
+            "end_time": existing_task_day.get("end_time"),
+            "status": "rescheduled",
+        },
+    )
+    if updated_task_day is None:
+        raise LookupError(f"Background task day {item_id!r} not found")
+    log = await append_maxwell_workbench_log(
+        task_day_id=item_id,
+        event="Maxwell 接收长期任务日延期",
+        detail=f"{existing_task_day.get('plan_date')} 延后到 {target_date}；原因：{user_reason}",
+        category="user_reschedule",
+        source="user_action",
+    )
+    siblings = await list_background_task_days(task_id=updated_task_day.get("task_id"), limit=2000) if updated_task_day.get("task_id") else []
+    unfinished_siblings = [day for day in siblings if str(day.get("status")) in {"pending", "pushed", "rescheduled", "missed"}]
+    if len(unfinished_siblings) >= 5:
+        pressure_review["level"] = "high"
+        pressure_review["summary"] = "这个长期任务剩余未完成项较多，Maxwell 建议后续提高后续学习量或重新分配周期。"
+        warnings.append("当前 MVP 先移动选中的任务日；整组学习量压缩将在完整计划重排中继续增强。")
+    return {
+        "item_type": normalized_type,
+        "action": normalized_action,
+        "changed": updated_task_day,
+        "message": f"Maxwell 已将「{updated_task_day.get('title')}」延后到 {target_date}。",
+        "work_logs": [log] if log else [],
+        "pressure_review": pressure_review,
+        "warnings": warnings,
+    }
 
 
 def _due_at_for_task_day(day: sqlite3.Row | dict[str, Any]) -> str | None:
@@ -4757,7 +4934,7 @@ def _push_background_task_days_to_workbench_sync(plan_date: str) -> list[dict[st
                         day["title"],
                         day["description"],
                         _due_at_for_task_day(day),
-                        _append_workbench_log_json([], event="接收今日执行项", detail=f"从长期任务日推送：{day['title']}", at=now),
+                        _append_workbench_log_json([], event="接收今日执行项", detail=f"从长期任务日推送：{day['title']}", at=now, category="daily_push", source="routine"),
                         now,
                         now,
                         now,
@@ -4816,7 +4993,7 @@ def _push_jarvis_plan_days_to_workbench_sync(plan_date: str) -> list[dict[str, A
                         day["title"],
                         day["description"],
                         _due_at_for_task_day(day),
-                        _append_workbench_log_json([], event="接收今日执行项", detail=f"从计划日推送：{day['title']}", at=now),
+                        _append_workbench_log_json([], event="接收今日执行项", detail=f"从计划日推送：{day['title']}", at=now, category="daily_push", source="routine"),
                         now,
                         now,
                         now,

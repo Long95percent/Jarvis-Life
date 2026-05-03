@@ -167,6 +167,70 @@ jarvisScheduleApi.pushDailyTasksToMaxwellWorkbench(planDate?)
 
 - 日程、计划、后台任务、Maxwell 工作台都走 `jarvisScheduleApi`。
 - `CalendarPanel.tsx` 可以改 UI，但不要把 API 路径写回组件里。
+- `CalendarPanel.tsx` 只做日程投影和用户显式编辑入口，不再展示“冲突处理 / Free window”区域；冲突判断和重排决策交给 Maxwell 后端工具链处理。
+- `getPlannerCalendar()` 后端仍可能返回 `conflicts` / `free_windows`，这是给后端/智能体/兼容接口保留的数据，普通前端不要自行展示或处理冲突。
+
+#### Maxwell 秘书日程编辑 skill（2026-05-03）
+
+用途：让 Maxwell/Alfred 在聊天中接管日程查询、修改、删除，支持大范围甚至全量查询后再按 `event_id` 精确执行。
+
+后端工具：`jarvis_schedule_editor`
+
+所在文件：
+
+- `shadowlink-ai/app/tools/jarvis_tools.py`
+- `shadowlink-ai/app/core/lifespan.py`
+- `shadowlink-ai/app/jarvis/agents.py`
+
+前端是否新增接口：否。
+
+前端接入方式：
+
+- 用户仍然通过 `AgentChatPanel.tsx` 的聊天接口和 Maxwell/Alfred 对话。
+- 前端不要直接调用 `jarvis_schedule_editor`，也不要直接写新的日程数据库接口。
+- 这个 skill 是后端 Tool Runtime 给智能体用的外部工具 API，前端只展示聊天回复和 `actions` 结果。
+
+工具能力：
+
+```json
+{
+  "operation": "query | update | delete",
+  "scope": "upcoming | range | all",
+  "hours_ahead": 720,
+  "start": "2026-05-01T00:00:00+08:00",
+  "end": "2026-06-01T00:00:00+08:00",
+  "keyword": "阅读",
+  "status": "confirmed",
+  "limit": 200,
+  "event_ids": ["event_id_1"],
+  "patches": [
+    {
+      "event_id": "event_id_1",
+      "title": "新的标题",
+      "start": "2026-05-18T10:00:00+08:00",
+      "end": "2026-05-18T11:00:00+08:00",
+      "location": "图书馆",
+      "notes": "由 Maxwell 批量调整",
+      "status": "confirmed",
+      "stress_weight": 1.0,
+      "route_required": false
+    }
+  ]
+}
+```
+
+返回结果：
+
+- `query` 返回 `matched_count`、`returned_count`、压缩后的 `events`。
+- `update` 返回 `updated_count`、`updated_events`、`skipped`、`new_schedule_density`。
+- `delete` 返回 `deleted_count`、`deleted_event_ids`、`skipped`、`new_schedule_density`。
+
+解耦边界：
+
+- 前端组件不能直连这个 skill，也不能绕过 `jarvisScheduleApi` 改普通日程接口。
+- Maxwell 修改/删除日程必须经 Tool Runtime 调 `jarvis_schedule_editor` 或现有 `jarvis_calendar_*` 工具。
+- 用户聊天里明确要求执行时，后端 skill 可以直接修改，不再走前端确认弹窗。
+- 如果后续要把这个能力做成按钮或面板，必须先在 `jarvisScheduleApi.ts` 增加 service 方法，再由组件调用 service。
 
 #### Maxwell 工作台新增返回字段（2026-05-03）
 
@@ -184,6 +248,8 @@ work_logs?: Array<{
   actor: string
   event: string
   detail?: string | null
+  category?: 'daily_push' | 'auto_maintenance' | 'user_reschedule' | 'secretary_reschedule' | 'manual_edit' | string
+  source?: 'routine' | 'planner_daily_maintenance' | 'user_action' | 'maxwell_skill' | 'schedule_api' | string
 }>
 
 live_state?: {
@@ -202,6 +268,8 @@ live_state?: {
 字段含义：
 
 - `work_logs`：后端真实记录的 Maxwell 工作过程，例如“接收今日执行项”“完成延期重排”“逾期后自动重排”“移动到新时间”。前端只负责展示，不要自己编造日志。
+- `work_logs.category`：可选分类，方便区分 `daily_push`（今日推送）、`auto_maintenance`（固定维护自动整理）、`user_reschedule`（用户点击延后）、`secretary_reschedule`（秘书 skill 重排）、`manual_edit`（日程接口手动编辑）。旧前端不使用也不影响。
+- `work_logs.source`：可选来源，说明日志由 `routine`、`planner_daily_maintenance`、`user_action`、`maxwell_skill`、`schedule_api` 等哪条链路写入。
 - `live_state`：后端实时查询关联任务得到的状态。前端展示“仍未完成 / 已超时 / 已完成”等文案时，必须依据这个字段，不要只靠前端时间判断。
 - `live_state.basis`：说明实时状态来自哪里，可能是 `jarvis_plan_days`、`background_task_days` 或仅工作台自身记录。
 
@@ -222,6 +290,57 @@ for (const item of items) {
 - `shadowlink-web/src/components/jarvis/CalendarPanel.tsx`：Maxwell 工作台卡片会展示实时状态和工作记录。
 
 注意：如果后续还要新增“更新工作台状态”“追加工作台日志”等写接口，必须继续写在 `jarvisScheduleApi`，不要让组件直接 `fetch('/api/v1/jarvis/maxwell/...')`。
+
+#### Maxwell 单任务重排接口（2026-05-03）
+
+接口：`POST /api/v1/jarvis/maxwell/reschedule-task`
+
+前端 service：`shadowlink-web/src/services/jarvisApi.ts` -> `jarvisScheduleApi.requestMaxwellReschedule()`
+
+用途：用户在日/周/月视图点开某个任务后，点击“延后一天”时使用。前端只表达“把这个条目交给 Maxwell 重排”，不自己计算新日期。
+
+请求体：
+
+```ts
+{
+  item_type: 'plan_day' | 'background_task_day' | string
+  item_id: string
+  action?: 'postpone_one_day' | string
+  reason?: string | null
+  today?: string | null
+}
+```
+
+响应体：
+
+```ts
+{
+  item_type: string
+  action: string
+  changed: unknown
+  message: string
+  work_logs?: Array<{
+    at: string
+    actor: string
+    event: string
+    detail?: string | null
+  }>
+  pressure_review?: {
+    reviewed_by?: string
+    consulted_roles?: string[]
+    level?: string
+    summary?: string
+  }
+  warnings?: string[]
+}
+```
+
+前端使用规则：
+
+- `CalendarPanel.tsx` 里只能调用 `jarvisScheduleApi.requestMaxwellReschedule()`，不能直接写 `fetch('/api/v1/jarvis/maxwell/reschedule-task')`。
+- 这类重排只用于 `plan_day` 和 `background_task_day`，不处理外部 `calendar_event`。
+- `message` 用于提示结果；`work_logs` 用于显示 Maxwell 的真实操作记录；`pressure_review` 用于展示 Maxell 对压力/负载的简要判断。
+- 如果后续要扩展“改成具体某天某时”或“重排整组长期任务”，仍然沿用这个接口，后端通过 `action` 扩展，不要再单独在组件里拼 URL。
 
 ---
 
@@ -582,6 +701,21 @@ rg "fetch\(" shadowlink-web/src/components shadowlink-web/src/pages -n --glob "*
 - 接口开发人员主要改 service 文件。
 - 圆桌开发人员主要改 `RoundtableStage.tsx` 内部。
 - 主维护者负责 `JarvisHome.tsx`、`jarvisStore.ts`、入口跳转和跨模块状态。
+
+### 私聊真实执行步骤说明
+
+如果你要看私聊智能体如何展示真实执行步骤、如何理解角色边界 + 引擎能力，请优先看：
+
+```text
+docs/解耦接口说明/private-chat-real-steps-interface.md
+```
+
+这个文档说明：
+
+- 角色边界不变
+- 引擎只是执行层增强
+- 前端如何展示 `strategy`、`steps`、`tool_results`、`retry_count`
+- 缺参写操作如何自动补参并继续执行
 ---
 
 ## 8. 防止中文乱码的要求
