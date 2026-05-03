@@ -374,6 +374,73 @@ class AgentChatResponse(BaseModel):
     timing: dict | None = None
 
 
+_CHAT_STEP_LABELS = {
+    "route_decided": "确认负责的智能体",
+    "activity_marked": "记录本次用户活动",
+    "conversation_persisted": "保存会话入口",
+    "base_context": "读取基础上下文和历史对话",
+    "memory_context": "检索长期记忆、偏好和协作记忆",
+    "consult": "判断是否需要其他智能体协助",
+    "local_life_context": "读取本地生活上下文",
+    "local_intent": "判断是否需要调用工具",
+    "llm_turn": "生成智能体回复并执行工具",
+    "actions_built": "整理工具执行结果",
+    "background_scheduled": "安排旁路记忆和偏好学习",
+    "persist_final_turns": "保存最终对话记录",
+    "escalation_eval": "评估是否需要进入圆桌",
+}
+
+
+def _chat_step_from_name(name: str, *, status: str = "running") -> dict[str, Any]:
+    return {
+        "id": name,
+        "label": _CHAT_STEP_LABELS.get(name, name.replace("_", " ")),
+        "status": status,
+        "duration_ms": None,
+        "detail": None,
+        "metadata": {},
+    }
+
+
+def _chat_step_from_span(span: dict[str, Any]) -> dict[str, Any]:
+    name = str(span.get("name") or "step")
+    return {
+        "id": name,
+        "label": _CHAT_STEP_LABELS.get(name, name.replace("_", " ")),
+        "status": "done",
+        "duration_ms": span.get("duration_ms"),
+        "detail": _chat_step_detail(name, span),
+        "metadata": {key: value for key, value in span.items() if key not in {"name", "duration_ms"}},
+    }
+
+
+def _chat_step_detail(name: str, span: dict[str, Any]) -> str | None:
+    if name == "route_decided":
+        agent_id = span.get("routed_agent_id")
+        return f"由 {agent_id} 处理" if agent_id else None
+    if name == "base_context":
+        return f"读取 {span.get('history_turns', 0)} 条历史对话"
+    if name == "memory_context":
+        return (
+            f"记忆 {span.get('memory_chars', 0)} 字，"
+            f"偏好 {span.get('preference_chars', 0)} 字，"
+            f"协作记忆 {span.get('collaboration_chars', 0)} 字"
+        )
+    if name == "consult":
+        return f"收集 {span.get('actions', 0)} 条协作建议"
+    if name == "local_intent":
+        intent = span.get("intent")
+        planned_tools = span.get("planned_tools", 0)
+        return f"意图 {intent}，计划工具 {planned_tools} 个" if intent else None
+    if name == "llm_turn":
+        return f"工具调用 {span.get('tool_calls', 0)} 个，预计划工具 {span.get('planned_tool_calls', 0)} 个"
+    if name == "actions_built":
+        return f"整理 {span.get('actions', 0)} 个动作，待确认 {span.get('pending', 0)} 个"
+    if name == "escalation_eval":
+        return "建议进入圆桌" if span.get("escalated") else "无需进入圆桌"
+    return None
+
+
 class BehaviorEventRequest(BaseModel):
     session_id: str | None = None
     agent_id: str
@@ -1068,17 +1135,26 @@ async def get_care_day_detail(day: str) -> dict[str, Any]:
 async def chat_with_agent(
     req: AgentChatRequest,
     llm_client=Depends(get_llm_client),
+    step_callback: Any | None = None,
 ) -> AgentChatResponse:
     timing_started = time.perf_counter()
     timing_spans: list[dict[str, Any]] = []
+
+    def start_span(name: str) -> float:
+        started = time.perf_counter()
+        if step_callback is not None:
+            step_callback(_chat_step_from_name(name, status="running"))
+        return started
 
     def mark_span(name: str, started: float, **extra: Any) -> None:
         span = {"name": name, "duration_ms": round((time.perf_counter() - started) * 1000, 1)}
         if extra:
             span.update(extra)
         timing_spans.append(span)
+        if step_callback is not None:
+            step_callback(_chat_step_from_span(span))
 
-    route_started = time.perf_counter()
+    route_started = start_span("route_decided")
     schedule_intent = None
     routed_agent_id = req.agent_id
     try:
@@ -1097,14 +1173,14 @@ async def chat_with_agent(
         )
     mark_span("route_decided", route_started, routed_agent_id=routed_agent_id, routed=bool(schedule_intent))
 
-    activity_started = time.perf_counter()
+    activity_started = start_span("activity_marked")
     try:
         await get_life_context_bus().update_fields({}, source="user_chat")
     except Exception as exc:
         logger.warning("jarvis.chat.activity_mark_failed", agent_id=req.agent_id, error=str(exc))
     mark_span("activity_marked", activity_started)
 
-    conversation_started = time.perf_counter()
+    conversation_started = start_span("conversation_persisted")
     try:
         from app.jarvis.persistence import save_conversation
 
@@ -1123,7 +1199,7 @@ async def chat_with_agent(
     try:
         from app.jarvis.user_settings import build_profile_prefix
         from app.jarvis.persistence import get_chat_history, save_chat_turn
-        context_started = time.perf_counter()
+        context_started = start_span("base_context")
         profile_prefix = build_profile_prefix()
         from app.jarvis.mood_care import detect_mood_snapshot_enhanced
 
@@ -1154,7 +1230,7 @@ async def chat_with_agent(
             history_text = "## 最近对话\n" + "\n".join(lines) + "\n\n"
         mark_span("base_context", context_started, history_turns=len(history or []))
 
-        memory_started = time.perf_counter()
+        memory_started = start_span("memory_context")
         collaboration_text, memory_text, preference_text = await asyncio.gather(
             build_collaboration_memory_prefix(routed_agent_id, limit=6),
             build_bounded_memory_recall_prefix(routed_agent_id, req.message, limit=6),
@@ -1167,7 +1243,7 @@ async def chat_with_agent(
             preference_chars=len(preference_text),
             collaboration_chars=len(collaboration_text),
         )
-        consult_started = time.perf_counter()
+        consult_started = start_span("consult")
         consult_result = await run_agent_consultations(
             source_agent=routed_agent_id,
             user_message=req.message,
@@ -1190,7 +1266,7 @@ async def chat_with_agent(
             f"{build_time_prompt_line(profile=profile, browser_timezone=req.browser_timezone)}"
             "制定今天/明天/几点到几点的计划时，必须参考这个当前时间；不要安排已经过去的时间段。\n\n"
         )
-        local_life_started = time.perf_counter()
+        local_life_started = start_span("local_life_context")
         local_life_context = await _build_local_life_context_prefix(now=local_now, limit=5)
         mark_span("local_life_context", local_life_started, chars=len(local_life_context))
     except Exception as exc:
@@ -1208,7 +1284,7 @@ async def chat_with_agent(
     )
     intent_context = ""
     planned_tool_results: list[dict[str, Any]] = []
-    intent_started = time.perf_counter()
+    intent_started = start_span("local_intent")
     try:
         intent_decision = plan_agent_intent(routed_agent_id, req.message, local_now=local_now)
         if intent_decision.next_action in {"call_tool", "pending_confirmation"} and intent_decision.tool_name:
@@ -1266,7 +1342,7 @@ async def chat_with_agent(
         f"User: {req.message}"
     )
 
-    llm_started = time.perf_counter()
+    llm_started = start_span("llm_turn")
     try:
         response, tool_results = await run_agent_turn(
             agent_id=routed_agent_id,
@@ -1286,7 +1362,7 @@ async def chat_with_agent(
     all_tool_results = [*planned_tool_results, *(tool_results or [])]
     mark_span("llm_turn", llm_started, tool_calls=len(tool_results or []), planned_tool_calls=len(planned_tool_results))
 
-    actions_started = time.perf_counter()
+    actions_started = start_span("actions_built")
     clean_reply = (response or "").strip()
     user_turn_id: int | None = None
     care_actions: list[dict[str, Any]] = []
@@ -1338,7 +1414,7 @@ async def chat_with_agent(
             action["error"] = f"待确认动作保存失败：{exc}"
     mark_span("actions_built", actions_started, actions=len(action_results), pending=sum(1 for action in action_results if action.get("pending_confirmation")))
 
-    background_started = time.perf_counter()
+    background_started = start_span("background_scheduled")
     asyncio.create_task(_run_chat_background_tasks(
         user_message=req.message,
         agent_reply=clean_reply,
@@ -1349,7 +1425,7 @@ async def chat_with_agent(
     mark_span("background_scheduled", background_started)
 
     # Persist both sides of the exchange so the next request has history
-    persist_started = time.perf_counter()
+    persist_started = start_span("persist_final_turns")
     try:
         if user_turn_id is None:
             user_turn_id = await save_chat_turn(agent_id=routed_agent_id, role="user", content=req.message, session_id=req.session_id)
@@ -1374,7 +1450,7 @@ async def chat_with_agent(
     # Evaluate whether this message should auto-escalate to a roundtable
     from app.jarvis.escalation import evaluate_escalation
     hint = None
-    escalation_started = time.perf_counter()
+    escalation_started = start_span("escalation_eval")
     try:
         ctx_for_eval = await get_life_context_bus().get_context()
         hint = evaluate_escalation(
@@ -1421,12 +1497,43 @@ async def chat_with_agent(
 
 async def _chat_stream_events(req: AgentChatRequest, llm_client: Any):
     started = time.perf_counter()
+    step_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    def emit_step(step: dict[str, Any]) -> None:
+        step_queue.put_nowait(step)
+
+    async def run_chat() -> AgentChatResponse:
+        try:
+            return await chat_with_agent(req, llm_client=llm_client, step_callback=emit_step)
+        finally:
+            step_queue.put_nowait(None)
+
     yield {
         "event": "chat_status",
         "data": json.dumps({"stage": "accepted", "agent_id": req.agent_id, "session_id": req.session_id}, ensure_ascii=False),
     }
+    yield {
+        "event": "chat_step",
+        "data": json.dumps({
+            "id": "accepted",
+            "label": "后端已接收请求",
+            "status": "done",
+            "duration_ms": round((time.perf_counter() - started) * 1000, 1),
+            "detail": f"会话 {req.session_id}",
+            "metadata": {"agent_id": req.agent_id},
+        }, ensure_ascii=False, default=str),
+    }
+    chat_task = asyncio.create_task(run_chat())
     try:
-        response = await chat_with_agent(req, llm_client=llm_client)
+        while True:
+            step = await step_queue.get()
+            if step is None:
+                break
+            yield {
+                "event": "chat_step",
+                "data": json.dumps(step, ensure_ascii=False, default=str),
+            }
+        response = await chat_task
         yield {
             "event": "chat_result",
             "data": json.dumps(jsonable_encoder(response), ensure_ascii=False),
@@ -1440,6 +1547,8 @@ async def _chat_stream_events(req: AgentChatRequest, llm_client: Any):
             }, ensure_ascii=False),
         }
     except Exception as exc:
+        if not chat_task.done():
+            chat_task.cancel()
         yield {
             "event": "chat_error",
             "data": json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False),
@@ -2141,13 +2250,16 @@ def _find_duplicate_calendar_events(req: "CalendarEventRequest") -> list[dict[st
         return []
     from app.mcp.adapters.calendar_adapter import get_events_between
 
-    window_start = _as_naive_local(req.start) - timedelta(days=30)
-    window_end = _as_naive_local(req.end) + timedelta(days=30)
+    request_day = _as_naive_local(req.start).date()
+    window_start = datetime.combine(request_day, datetime.min.time())
+    window_end = window_start + timedelta(days=1)
     duplicates = []
     for event in get_events_between(window_start, window_end):
         if event.status in {"deleted", "cancelled"}:
             continue
         if _normalize_event_title(event.title) != normalized_title:
+            continue
+        if _as_naive_local(event.start).date() != request_day:
             continue
         duplicates.append({
             "id": event.id,

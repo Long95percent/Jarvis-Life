@@ -192,14 +192,27 @@ export interface ChatResponse {
   timing?: Record<string, unknown> | null;
 }
 
+export interface ChatExecutionStep {
+  id: string;
+  label: string;
+  status: "running" | "done" | "error" | string;
+  duration_ms?: number | null;
+  detail?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface ChatStreamOptions {
+  onStep?: (step: ChatExecutionStep) => void;
+}
+
 function parseSSEFrames(buffer: string): { frames: Array<{ event: string; data: string }>; remainder: string } {
   const frames: Array<{ event: string; data: string }> = [];
-  const parts = buffer.split(/\n\n/);
+  const parts = buffer.split(/\r?\n\r?\n/);
   const remainder = parts.pop() ?? "";
   for (const part of parts) {
     let event = "message";
     const dataLines: string[] = [];
-    for (const line of part.split(/\n/)) {
+    for (const line of part.split(/\r?\n/)) {
       if (line.startsWith("event:")) event = line.slice(6).trim();
       if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
     }
@@ -689,7 +702,13 @@ export const jarvisApi = {
     return res.json();
   },
 
-  async chatStream(agentId: string, message: string, sessionId: string, browserTimezone?: string): Promise<ChatResponse> {
+  async chatStream(
+    agentId: string,
+    message: string,
+    sessionId: string,
+    browserTimezone?: string,
+    options?: ChatStreamOptions,
+  ): Promise<ChatResponse> {
     const res = await fetch(`${BASE}/chat/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
@@ -710,6 +729,9 @@ export const jarvisApi = {
       for (const frame of parsed.frames) {
         if (frame.event === "chat_result") {
           result = JSON.parse(frame.data) as ChatResponse;
+        }
+        if (frame.event === "chat_step") {
+          options?.onStep?.(JSON.parse(frame.data) as ChatExecutionStep);
         }
         if (frame.event === "chat_error") {
           const payload = JSON.parse(frame.data) as { error?: string };

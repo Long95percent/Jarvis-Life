@@ -1,16 +1,15 @@
 /**
- * Sidebar — top-level navigation + mode switcher.
+ * Sidebar - top-level navigation.
  *
- * Streamlined to the three primary destinations: Jarvis, Knowledge, Settings.
+ * Streamlined to the three primary destinations: Jarvis, Persona, Settings.
  * Chat / Brainstorm have been folded into Jarvis (private chat + roundtable).
  */
 
 import { Link, useLocation } from 'react-router-dom'
-import { ModeSwitcher } from '../ambient/ModeSwitcher'
 
 const navItems = [
-  { path: '/jarvis', label: 'Jarvis', icon: '🎩' },
-  { path: '/knowledge', label: '知识库', icon: '📚' },
+  { path: '/jarvis', label: 'Jarvis', icon: '🤖' },
+  { path: '/knowledge', label: '个人画像', icon: '🧠' },
   { path: '/settings', label: '设置', icon: '⚙️' },
 ]
 
@@ -36,13 +35,8 @@ export function Sidebar({ collapsed }: SidebarProps) {
             <span className="font-semibold text-foreground truncate">Jarvis · Be IronMan</span>
           </div>
 
-          {/* Mode Switcher */}
-          <div className="px-3 py-2">
-            <ModeSwitcher />
-          </div>
-
           {/* Top-level Nav */}
-          <nav className="px-2 py-1 flex-1">
+          <nav className="px-2 py-3 flex-1">
             <ul className="space-y-0.5">
               {navItems.map((item) => {
                 const isActive = location.pathname.startsWith(item.path)

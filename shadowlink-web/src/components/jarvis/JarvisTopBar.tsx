@@ -90,7 +90,7 @@ export const JarvisTopBar: React.FC = () => {
         {/* Knowledge + Settings quick access */}
         <Link
           to="/knowledge"
-          title="知识库"
+          title="个人画像"
           className="p-2 rounded-lg hover:bg-gray-100 text-gray-500 hover:text-gray-800 transition-colors"
         >
           <BookOpen size={18} />

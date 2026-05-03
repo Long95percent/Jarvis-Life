@@ -38,6 +38,7 @@ from app.api.v1.jarvis_router import (
     PlanSplitRequest,
     PlanRescheduleRequest,
     _persist_task_plan_result,
+    _find_duplicate_calendar_events,
     reschedule_plan_days,
 )
 from app.jarvis import persistence
@@ -962,19 +963,42 @@ def test_planner_calendar_items_handles_timezone_aware_confirmed_events():
     assert items["free_windows"]
 
 
-def test_calendar_add_rejects_duplicate_title_even_when_time_differs():
+def test_calendar_add_allows_same_title_on_different_days():
+    async def scenario():
+        first = await add_calendar_event(CalendarEventRequest(
+            title="奶茶",
+            start=datetime.fromisoformat("2026-05-16T09:00:00+08:00"),
+            end=datetime.fromisoformat("2026-05-16T10:00:00+08:00"),
+            source="agent_pending_confirmation",
+            source_agent="maxwell",
+        ))
+        second = await add_calendar_event(CalendarEventRequest(
+            title="奶茶",
+            start=datetime.fromisoformat("2026-05-17T20:00:00+08:00"),
+            end=datetime.fromisoformat("2026-05-17T21:00:00+08:00"),
+            source="agent_pending_confirmation",
+            source_agent="maxwell",
+        ))
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first["event_id"] != second["event_id"]
+
+
+def test_calendar_add_rejects_duplicate_title_on_same_day_even_when_time_differs():
     async def scenario():
         await add_calendar_event(CalendarEventRequest(
-            title="雅思听力训练",
+            title="奶茶",
             start=datetime.fromisoformat("2026-05-16T09:00:00+08:00"),
             end=datetime.fromisoformat("2026-05-16T10:00:00+08:00"),
             source="agent_pending_confirmation",
             source_agent="maxwell",
         ))
         return await add_calendar_event(CalendarEventRequest(
-            title="雅思听力训练",
-            start=datetime.fromisoformat("2026-05-17T20:00:00+08:00"),
-            end=datetime.fromisoformat("2026-05-17T21:00:00+08:00"),
+            title="奶茶",
+            start=datetime.fromisoformat("2026-05-16T20:00:00+08:00"),
+            end=datetime.fromisoformat("2026-05-16T21:00:00+08:00"),
             source="agent_pending_confirmation",
             source_agent="maxwell",
         ))
@@ -983,6 +1007,37 @@ def test_calendar_add_rejects_duplicate_title_even_when_time_differs():
         asyncio.run(scenario())
 
     assert "duplicate_calendar_event" in str(exc.value)
+
+
+def test_duplicate_calendar_lookup_only_checks_request_day():
+    async def scenario():
+        await add_calendar_event(CalendarEventRequest(
+            title="奶茶",
+            start=datetime.fromisoformat("2026-05-16T09:00:00+08:00"),
+            end=datetime.fromisoformat("2026-05-16T10:00:00+08:00"),
+            source="agent_pending_confirmation",
+            source_agent="maxwell",
+        ))
+        next_day_req = CalendarEventRequest(
+            title="奶茶",
+            start=datetime.fromisoformat("2026-05-17T20:00:00+08:00"),
+            end=datetime.fromisoformat("2026-05-17T21:00:00+08:00"),
+            source="agent_pending_confirmation",
+            source_agent="maxwell",
+        )
+        same_day_req = CalendarEventRequest(
+            title="奶茶",
+            start=datetime.fromisoformat("2026-05-16T20:00:00+08:00"),
+            end=datetime.fromisoformat("2026-05-16T21:00:00+08:00"),
+            source="agent_pending_confirmation",
+            source_agent="maxwell",
+        )
+        return _find_duplicate_calendar_events(next_day_req), _find_duplicate_calendar_events(same_day_req)
+
+    next_day_duplicates, same_day_duplicates = asyncio.run(scenario())
+
+    assert next_day_duplicates == []
+    assert len(same_day_duplicates) == 1
 
 
 def test_calendar_tool_accepts_timezone_aware_trip_events_without_naive_aware_crash():

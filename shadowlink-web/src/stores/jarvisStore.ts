@@ -1,6 +1,6 @@
 ﻿// shadowlink-web/src/stores/jarvisStore.ts
 import { create } from "zustand";
-import { jarvisApi, type ActionResult, type CalendarEvent, type ConversationHistoryItem, type EscalationHint, type JarvisAgent, type LifeContext, type ProactiveMessage, type TeamCollaborationResponse } from "@/services/jarvisApi";
+import { jarvisApi, type ActionResult, type CalendarEvent, type ChatExecutionStep, type ConversationHistoryItem, type EscalationHint, type JarvisAgent, type LifeContext, type ProactiveMessage, type TeamCollaborationResponse } from "@/services/jarvisApi";
 import { jarvisConversationApi } from "@/services/jarvisConversationApi";
 import { jarvisScheduleApi } from "@/services/jarvisScheduleApi";
 
@@ -70,7 +70,12 @@ interface JarvisState {
   addProactiveMessage: (msg: ProactiveMessage) => void;
   markMessageRead: (id: string) => Promise<void>;
   setActiveAgent: (agentId: string) => void;
-  sendMessage: (agentId: string, message: string, sessionId: string) => Promise<EscalationHint | null>;
+  sendMessage: (
+    agentId: string,
+    message: string,
+    sessionId: string,
+    options?: { onStep?: (step: ChatExecutionStep) => void },
+  ) => Promise<EscalationHint | null>;
   loadChatHistory: (agentId: string, sessionId?: string) => Promise<void>;
   clearChatHistory: (agentId: string, sessionId?: string) => Promise<void>;
 
@@ -191,7 +196,7 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     set({ activeAgentId: agentId });
   },
 
-  sendMessage: async (agentId, message, sessionId) => {
+  sendMessage: async (agentId, message, sessionId, options) => {
     set((s) => ({
       chatHistory: {
         ...s.chatHistory,
@@ -201,7 +206,9 @@ export const useJarvisStore = create<JarvisState>((set, get) => ({
     let response;
     try {
       const browserTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      response = await jarvisApi.chatStream(agentId, message, sessionId, browserTimezone);
+      response = await jarvisApi.chatStream(agentId, message, sessionId, browserTimezone, {
+        onStep: options?.onStep,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Jarvis 对话失败：未知错误";
       set((s) => ({

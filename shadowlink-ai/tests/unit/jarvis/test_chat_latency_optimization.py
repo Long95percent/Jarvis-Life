@@ -117,7 +117,7 @@ async def test_chat_returns_before_background_memory_and_preference_work_finishe
 
 
 @pytest.mark.asyncio
-async def test_chat_stream_events_emit_status_result_and_done(monkeypatch):
+async def test_chat_stream_events_emit_real_step_events_before_result(monkeypatch):
     async def no_consultations(**kwargs):
         return AgentConsultationResult([], "", [])
 
@@ -134,5 +134,15 @@ async def test_chat_stream_events_emit_status_result_and_done(monkeypatch):
     ):
         events.append(event)
 
-    assert [item["event"] for item in events] == ["chat_status", "chat_result", "chat_done"]
-    assert "已处理" in events[1]["data"]
+    event_names = [item["event"] for item in events]
+    assert event_names[0] == "chat_status"
+    assert "chat_step" in event_names
+    assert event_names[-2:] == ["chat_result", "chat_done"]
+    step_events = [item for item in events if item["event"] == "chat_step"]
+    assert '"status": "running"' in step_events[0]["data"]
+    assert '"id": "route_decided"' in step_events[0]["data"]
+    route_done = next(item for item in step_events if '"id": "route_decided"' in item["data"] and '"status": "done"' in item["data"])
+    assert '"duration_ms"' in route_done["data"]
+    assert '"label"' in route_done["data"]
+    result_event = next(item for item in events if item["event"] == "chat_result")
+    assert "已处理" in result_event["data"]

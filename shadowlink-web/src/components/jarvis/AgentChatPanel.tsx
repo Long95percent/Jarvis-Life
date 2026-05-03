@@ -1,6 +1,6 @@
 ﻿import React, { useEffect, useRef, useState } from "react";
 import { useJarvisStore } from "@/stores/jarvisStore";
-import { jarvisApi, type ActionResult, type BehaviorEventType, type EscalationHint } from "@/services/jarvisApi";
+import { jarvisApi, type ActionResult, type BehaviorEventType, type ChatExecutionStep, type EscalationHint } from "@/services/jarvisApi";
 import { jarvisConversationApi } from "@/services/jarvisConversationApi";
 import { jarvisPendingActionApi } from "@/services/jarvisPendingActionApi";
 import { jarvisScheduleApi } from "@/services/jarvisScheduleApi";
@@ -25,14 +25,6 @@ declare global {
 
 type ConfirmationState = "confirmed" | "cancelled";
 type CareActionState = "read" | "dismissed" | "snoozed" | "helpful" | "too_frequent" | "not_needed" | "handled" | string;
-
-const CHAT_PROGRESS_STEPS = [
-  "正在理解你的请求…",
-  "正在判断是否需要查看日程或调用工具…",
-  "正在检查相关上下文和日程冲突…",
-  "正在让秘书整理执行结果…",
-  "正在生成最终回复…",
-];
 
 interface TaskPlanFormState {
   goal?: string;
@@ -115,7 +107,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
 
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
-  const [progressStep, setProgressStep] = useState(0);
+  const [executionSteps, setExecutionSteps] = useState<ChatExecutionStep[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [escalation, setEscalation] = useState<EscalationHint | null>(null);  const [confirmations, setConfirmations] = useState<Record<string, ConfirmationState>>({});
   const [confirmationErrors, setConfirmationErrors] = useState<Record<string, string>>({});
@@ -125,7 +117,6 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
   const [confirmingKey, setConfirmingKey] = useState<string | null>(null);
 
   const escalationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const openedAtRef = useRef(Date.now());
   const lastUserMessageRef = useRef("");
   const endRef = useRef<HTMLDivElement>(null);
@@ -152,24 +143,8 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
   useEffect(() => {
     return () => {
       if (escalationTimerRef.current) clearInterval(escalationTimerRef.current);
-      if (progressTimerRef.current) clearInterval(progressTimerRef.current);
     };
   }, []);
-
-  const stopProgressTimer = () => {
-    if (progressTimerRef.current) {
-      clearInterval(progressTimerRef.current);
-      progressTimerRef.current = null;
-    }
-  };
-
-  const startProgressTimer = () => {
-    stopProgressTimer();
-    setProgressStep(0);
-    progressTimerRef.current = setInterval(() => {
-      setProgressStep((current) => Math.min(current + 1, CHAT_PROGRESS_STEPS.length - 1));
-    }, 1800);
-  };
 
   useEffect(() => {
     openedAtRef.current = Date.now();
@@ -280,12 +255,20 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     const message = input.trim();
     if (!message || sending) return;
     setSending(true);
-    startProgressTimer();
+    setExecutionSteps([]);
     setInput("");
     handleCancelEscalation();
     lastUserMessageRef.current = message;
     try {
-      const hint = await sendMessage(agentId, message, sessionId);
+      const hint = await sendMessage(agentId, message, sessionId, {
+        onStep: (step) => {
+          setExecutionSteps((current) => {
+            const existingIndex = current.findIndex((item) => item.id === step.id);
+            if (existingIndex === -1) return [...current, step];
+            return current.map((item, index) => index === existingIndex ? { ...item, ...step } : item);
+          });
+        },
+      });
       const latestState = useJarvisStore.getState();
       const visibleAgentId = latestState.activeAgentId || agentId;
       const updatedAgentHistory = latestState.chatHistory[visibleAgentId] ?? latestState.chatHistory[agentId] ?? [];
@@ -295,9 +278,7 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
         setEscalation(hint);
       }
     } finally {
-      stopProgressTimer();
       setSending(false);
-      setProgressStep(0);
     }
   };
   const confirmCalendarAction = async (action: ActionResult, index: number) => {
@@ -745,18 +726,35 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
             <div className="max-w-[75%] rounded-2xl px-4 py-3 text-sm" style={{ backgroundColor: `color-mix(in srgb, ${agent.color} 8%, white)`, border: `1px solid color-mix(in srgb, ${agent.color} 20%, transparent)` }}>
               <div className="mb-2 flex items-center gap-2 font-medium text-gray-700">
                 <span className="h-2 w-2 animate-pulse rounded-full" style={{ backgroundColor: agent.color }} />
-                {CHAT_PROGRESS_STEPS[progressStep]}
+                {executionSteps.length > 0 ? executionSteps[executionSteps.length - 1].label : "正在连接智能体…"}
               </div>
               <div className="space-y-1.5 text-xs text-gray-500">
-                {CHAT_PROGRESS_STEPS.slice(0, progressStep + 1).map((step, index) => (
-                  <div key={step} className="flex items-center gap-2">
+                {executionSteps.length === 0 && (
+                  <div className="flex items-center gap-2">
                     <span
                       className="flex h-4 w-4 items-center justify-center rounded-full text-[10px] text-white"
-                      style={{ backgroundColor: index === progressStep ? agent.color : `color-mix(in srgb, ${agent.color} 55%, white)` }}
+                      style={{ backgroundColor: agent.color }}
                     >
-                      {index < progressStep ? "✓" : "…"}
+                      …
                     </span>
-                    <span>{step}</span>
+                    <span>等待后端返回真实执行步骤</span>
+                  </div>
+                )}
+                {executionSteps.map((step) => (
+                  <div key={step.id} className="flex items-start gap-2">
+                    <span
+                      className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] text-white"
+                      style={{ backgroundColor: step.status === "error" ? "#EF4444" : agent.color }}
+                    >
+                      {step.status === "error" ? "!" : step.status === "done" ? "✓" : "…"}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="text-gray-700">{step.label}</span>
+                      {typeof step.duration_ms === "number" && (
+                        <span className="ml-1 text-gray-400">· {Math.round(step.duration_ms)}ms</span>
+                      )}
+                      {step.detail && <span className="block truncate text-gray-400">{step.detail}</span>}
+                    </span>
                   </div>
                 ))}
               </div>
@@ -804,4 +802,3 @@ export const AgentChatPanel: React.FC<Props> = ({ agentId, sessionId, onClose })
     </div>
   );
 };
-
